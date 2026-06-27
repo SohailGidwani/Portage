@@ -1,0 +1,4 @@
+# pnpm 11 records per-project build approvals here. Approve sharp's (optional) native
+# build so `pnpm install` exits cleanly — pnpm runs a deps-status check before commands.
+allowBuilds:
+  sharp: true
