@@ -4,6 +4,21 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+export type TestSummary = {
+  total: number;
+  passed: number;
+  failed: number;
+  errors: number;
+  skipped: number;
+  duration_seconds: number;
+};
+
+export type GraphSummary = {
+  files_parsed: number;
+  total_nodes: number;
+  total_edges: number;
+};
+
 export type Job = {
   id: string;
   repo_url: string;
@@ -11,6 +26,9 @@ export type Job = {
   status: "queued" | "running" | "done" | "failed";
   config: Record<string, unknown>;
   error: string | null;
+  report_path: string | null;
+  test_summary: TestSummary | null;
+  graph_summary: GraphSummary | null;
   created_at: string;
   updated_at: string;
 };

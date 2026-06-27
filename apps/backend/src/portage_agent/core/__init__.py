@@ -3,9 +3,11 @@
 from .interfaces import (
     LLM,
     ClaimedJob,
+    GraphSummary,
     JobQueue,
     LLMMessage,
     LLMResponse,
+    Retrieval,
     Sandbox,
     SandboxResult,
     StorageBackend,
@@ -20,4 +22,6 @@ __all__ = [
     "LLM",
     "LLMMessage",
     "LLMResponse",
+    "Retrieval",
+    "GraphSummary",
 ]

@@ -33,13 +33,19 @@ async def _process(queue: PostgresJobQueue, graph, job: ClaimedJob) -> None:
     log.info("claimed job=%s recipe=%s", job.id, job.migration_recipe)
     hb = asyncio.create_task(_heartbeat_loop(queue, job))
     try:
-        await run_job(
+        final = await run_job(
             graph,
             job_id=job.id,
             repo_url=job.repo_url,
             migration_recipe=job.migration_recipe,
+            job_config=job.config,
         )
-        await queue.complete(job.id)
+        await queue.finish(
+            job.id,
+            report_path=final.get("report_path"),
+            test_summary=final.get("test_summary"),
+            graph_summary=final.get("graph_summary"),
+        )
         log.info("job=%s COMPLETE", job.id)
     except Exception as exc:
         log.exception("job=%s FAILED", job.id)
@@ -63,11 +69,10 @@ async def main() -> None:
     async with open_checkpointer() as checkpointer:
         graph = build_graph(checkpointer)
         log.info(
-            "worker '%s' polling (lease=%ss heartbeat=%ss work_sleep=%ss)",
+            "worker '%s' polling (lease=%ss heartbeat=%ss)",
             settings.worker_id,
             settings.job_lease_seconds,
             settings.heartbeat_interval_seconds,
-            settings.work_sleep_seconds,
         )
         while not stop.is_set():
             job = await queue.claim(

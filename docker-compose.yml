@@ -47,6 +47,13 @@ services:
     environment:
       POSTGRES_HOST: db
     command: ["python", "-m", "portage_agent.worker"]
+    volumes:
+      # Shared per-job workspaces (also mounted into the ephemeral sandbox by name).
+      - workspaces:/workspaces
+      # Docker-out-of-Docker: spawn the sandbox as a sibling via the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The Phase 1 fixture repo, so Ingest can clone it (repo_url=/fixtures/sample_repo).
+      - ./apps/backend/tests/fixtures:/fixtures:ro
     depends_on:
       db:
         condition: service_healthy
@@ -65,5 +72,17 @@ services:
       api:
         condition: service_healthy
 
+  # Ephemeral test-runner image. Behind the `tools` profile so `docker compose up` never
+  # starts it; the worker `docker run`s it per verification. Build it explicitly with:
+  #   docker compose --profile tools build sandbox
+  sandbox:
+    profiles: ["tools"]
+    image: portage-sandbox:latest
+    build:
+      context: ./apps/backend/sandbox
+      dockerfile: Dockerfile.sandbox
+    command: ["true"]
+
 volumes:
   pgdata:
+  workspaces:

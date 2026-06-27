@@ -23,5 +23,8 @@ class JobOut(BaseModel):
     status: str
     config: dict
     error: str | None = None
+    report_path: str | None = None
+    test_summary: dict | None = None
+    graph_summary: dict | None = None
     created_at: datetime
     updated_at: datetime

@@ -20,6 +20,9 @@ dependencies = [
     "langgraph>=0.2.60",
     "langgraph-checkpoint-postgres>=2.0.0",
     "psycopg[binary,pool]>=3.2",
+    # MCP client SDK — talks to code-review-graph's `serve` (stdio) MCP server. The CRG
+    # server itself is installed isolated in the worker image (uv tool), not here.
+    "mcp>=1.2",
 ]
 
 # NOTE: litellm is part of the locked stack (model ladder) but is deliberately
@@ -49,3 +52,6 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# The fixture repo under tests/fixtures is a separate package with its own tests — it is
+# ingested/run by the sandbox, never collected by the backend's own suite.
+addopts = "--ignore=tests/fixtures"
