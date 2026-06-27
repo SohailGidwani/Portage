@@ -36,11 +36,30 @@ class Settings(BaseSettings):
     worker_id: str = "worker-1"
 
     # --- Agent ---
-    # Deliberate sleep in the graph's middle node so we can kill the worker mid-run.
-    work_sleep_seconds: int = 60
+    # Default pre-test delay in the Verify node (seconds). 0 in normal runs; the
+    # crash-recovery demo raises it (via job config) to get a window to kill the worker
+    # mid-Verify and prove resume skips the already-done Ingest.
+    verify_pre_delay_seconds: int = 0
 
     # --- Checkpointer pool ---
     checkpointer_pool_max_size: int = 5
+
+    # --- Phase 1: workspaces / sandbox / retrieval ---
+    # Shared named volume (compose-prefixed) holding per-job workspaces, mounted in both
+    # the worker and the ephemeral sandbox at `workspaces_mount`.
+    workspaces_volume: str = "portage_workspaces"
+    workspaces_mount: str = "/workspaces"
+    # Ephemeral test-runner image (built via the compose `tools` profile).
+    sandbox_image: str = "portage-sandbox:latest"
+    sandbox_cpus: str = "1.0"
+    sandbox_memory: str = "512m"
+    sandbox_pids_limit: int = 256
+    sandbox_timeout_seconds: int = 600
+    # code-review-graph MCP server command (installed isolated in the worker image).
+    crg_command: str = "code-review-graph"
+
+    # Artifact storage (LocalStorage). On the shared volume so reports survive the job.
+    artifacts_dir: str = "/workspaces/_artifacts"
 
     @property
     def _userinfo(self) -> str:

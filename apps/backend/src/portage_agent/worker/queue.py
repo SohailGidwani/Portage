@@ -8,6 +8,7 @@ what lets a restarted worker pick a job back up and resume it from its checkpoin
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 
@@ -88,6 +89,34 @@ class PostgresJobQueue:
                     "WHERE id = :id"
                 ),
                 {"id": job_id},
+            )
+
+    async def finish(
+        self,
+        job_id: uuid.UUID,
+        *,
+        report_path: str | None,
+        test_summary: dict | None,
+        graph_summary: dict | None,
+    ) -> None:
+        """Mark done AND persist the Phase 1 result columns in one update."""
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE jobs SET status = 'done', heartbeat_at = NULL, updated_at = now(), "
+                    "report_path = :report_path, "
+                    "test_summary = CAST(:test_summary AS jsonb), "
+                    "graph_summary = CAST(:graph_summary AS jsonb) "
+                    "WHERE id = :id"
+                ),
+                {
+                    "id": job_id,
+                    "report_path": report_path,
+                    "test_summary": json.dumps(test_summary) if test_summary is not None else None,
+                    "graph_summary": (
+                        json.dumps(graph_summary) if graph_summary is not None else None
+                    ),
+                },
             )
 
     async def fail(self, job_id: uuid.UUID, *, error: str) -> None:

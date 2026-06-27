@@ -21,6 +21,7 @@ async def run_job(
     job_id: uuid.UUID,
     repo_url: str,
     migration_recipe: str,
+    job_config: dict | None = None,
 ) -> dict:
     config = {"configurable": {"thread_id": str(job_id)}}
     snapshot = await graph.aget_state(config)
@@ -31,16 +32,17 @@ async def run_job(
             "job_id": str(job_id),
             "repo_url": repo_url,
             "migration_recipe": migration_recipe,
+            "config": job_config or {},
         }
         return await graph.ainvoke(initial, config)
 
     if snapshot.next:
         log.info(
-            "job=%s RESUME from checkpoint | next=%s loaded_run_marker=%s loaded_step_log=%s",
+            "job=%s RESUME from checkpoint | next=%s loaded_step_log=%s loaded_graph_nodes=%s",
             job_id,
             snapshot.next,
-            snapshot.values.get("run_marker"),
             snapshot.values.get("step_log"),
+            (snapshot.values.get("graph_summary") or {}).get("total_nodes"),
         )
         return await graph.ainvoke(None, config)
 

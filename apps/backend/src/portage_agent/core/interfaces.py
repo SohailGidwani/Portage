@@ -14,7 +14,7 @@ adapters arrive in the phases noted.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
@@ -110,6 +110,39 @@ class LLM(Protocol):
         ...
 
 
+# -------------------------------------------------------------------------- retrieval
+@dataclass(slots=True)
+class GraphSummary:
+    """Result of building the structural knowledge graph for a repo."""
+
+    files_parsed: int = 0
+    total_nodes: int = 0
+    total_edges: int = 0
+    flows_detected: int = 0
+    communities_detected: int = 0
+    build_type: str = ""
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.total_nodes > 0 and not self.errors
+
+
+@runtime_checkable
+class Retrieval(Protocol):
+    """Structural retrieval over a repo (graph + blast-radius). Phase 1 adapter =
+    `MCPRetrievalProvider` over code-review-graph's MCP server. Lean surface: build the
+    graph, plus one query (blast-radius). The fuller query surface lands in Phase 2 when
+    Plan consumes it."""
+
+    async def build(self, *, full_rebuild: bool = True) -> GraphSummary:
+        ...
+
+    async def blast_radius(self, changed_files: list[str], *, max_depth: int = 2) -> dict:
+        """Impact of changing `changed_files`: the affected callers/dependents/tests."""
+        ...
+
+
 __all__ = [
     "StorageBackend",
     "JobQueue",
@@ -119,4 +152,6 @@ __all__ = [
     "LLM",
     "LLMMessage",
     "LLMResponse",
+    "Retrieval",
+    "GraphSummary",
 ]

@@ -7,6 +7,9 @@
 # --- Personal decision log (per request: gitignored, for time-travel notes) ---
 notes/
 
+# --- Local command cheatsheet (gitignored for now) ---
+COMMANDS.txt
+
 # --- Python ---
 __pycache__/
 *.py[cod]

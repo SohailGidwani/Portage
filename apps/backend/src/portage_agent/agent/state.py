@@ -1,8 +1,8 @@
-"""Graph state for the trivial Phase 0 graph.
+"""Graph state for the Phase 1 Ingest → Verify → Report graph.
 
-`step_log` accumulates (operator.add reducer) across checkpoints — that's the artifact
-that makes "resume vs restart" observable: after a kill mid-`work`, the resumed run
-loads a state that already contains ``"start"`` and the original ``run_marker``.
+`step_log` (operator.add reducer) accumulates across checkpoints and makes resume
+observable: after a kill mid-Verify, the resumed run loads a state that already contains
+the Ingest output (`graph_summary`) and `["ingest"]` in the log — Ingest does NOT re-run.
 """
 
 from __future__ import annotations
@@ -12,18 +12,22 @@ from typing import Annotated, TypedDict
 
 
 class GraphState(TypedDict, total=False):
-    # set on enqueue / first invoke
+    # seeded on first invoke
     job_id: str
     repo_url: str
     migration_recipe: str
+    config: dict
 
-    # stamped by the `start` node — its presence on resume proves we didn't restart
-    run_marker: str
-    started_at: str
+    # Ingest output
+    workspace: str
+    graph_summary: dict
+    blast_radius_sample: dict
 
-    # produced later in the graph
-    work_done: bool
-    finished_at: str
+    # Verify output
+    test_summary: dict
 
-    # accumulates ["start"] -> ["start","work"] -> ["start","work","end"]
+    # Report output
+    report_path: str
+
+    # accumulates ["ingest"] -> ["ingest","verify"] -> ["ingest","verify","report"]
     step_log: Annotated[list[str], operator.add]

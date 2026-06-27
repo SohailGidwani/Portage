@@ -6,9 +6,11 @@
 
 *(A portage is the overland carry between two navigable waters.)* v1 targets **Pydantic v1 → v2**.
 
-**Status: Phase 0 (skeleton).** The durable execution spine is up and verified: Postgres +
-pgvector, a FastAPI control plane, and a LangGraph agent worker checkpointed to Postgres that
-**survives being killed mid-run and resumes from its last checkpoint**.
+**Status: Phase 1 (ingest + sandbox).** A submitted job now runs a real **Ingest → Verify →
+Report** graph: it clones a repo, builds a structural knowledge graph (code-review-graph, via
+MCP), runs the repo's tests in an ephemeral network-off Docker sandbox, and emits a structured
+report — all checkpointed to Postgres, so killing the worker mid-run **resumes from the last
+checkpoint** (skipping the already-done, expensive Ingest).
 
 ## Architecture (Phase 0)
 
@@ -45,17 +47,21 @@ curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
   -d '{"repo_url":"https://github.com/acme/x","migration_recipe":"pydantic_v1_to_v2"}'
 ```
 
-## Verifying the Phase 0 DoD (crash-recovery)
-
-`scripts/dod_check.sh` submits a job, SIGKILLs the worker while it is mid-`work`, restarts it,
-and asserts from the logs that it **resumed from the checkpoint** (the `start` node ran exactly
-once; the run marker stamped before the crash is preserved):
+## Verifying the DoDs
 
 ```bash
 docker compose up -d
+# Functional Phase 1 DoD: fixture repo -> structured test report + queryable graph
+bash scripts/phase1_check.sh
+# Crash-recovery DoD: kill the worker mid-Verify -> resume past the expensive Ingest
 bash scripts/dod_check.sh
-# -> DoD PASSED: killed mid-work, resumed from checkpoint (start ran once, marker ... preserved).
 ```
+
+`phase1_check.sh` runs the bundled fixture through Ingest→Verify→Report and asserts both a test
+report (pass/fail counts) and a graph (node/edge counts) come back. `dod_check.sh` submits a job
+with a Verify delay, SIGKILLs the worker mid-Verify, restarts it, and asserts from the logs that
+**Ingest ran exactly once** (the clone + graph build is not repeated) — it resumed from the
+post-Ingest checkpoint.
 
 ## Layout
 

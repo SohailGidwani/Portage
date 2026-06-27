@@ -266,8 +266,8 @@ Interfaces in `core` with swappable adapters keep AWS non-load-bearing and let C
 
 Drive Claude Code one phase at a time; don't let it sprawl.
 
-- **Phase 0 — Skeleton.** Compose up: Postgres+pgvector + FastAPI + trivial LangGraph graph with the Postgres checkpointer that survives a worker restart. *DoD:* kill the worker mid-graph, restart, it resumes. (See kickstart prompt, Appendix A.)
-- **Phase 1 — Ingest + Sandbox.** Integrate **code-review-graph** for ingest/repo-map/blast-radius; build the ephemeral-Docker sandbox that clones a repo and runs its tests. *DoD:* given a repo, output a structured test report + a queryable graph.
+- **Phase 0 — Skeleton. ✅ DONE.** Compose up: Postgres+pgvector + FastAPI + trivial LangGraph graph with the Postgres checkpointer that survives a worker restart. *DoD:* kill the worker mid-graph, restart, it resumes. (See kickstart prompt, Appendix A.) Verified by `scripts/dod_check.sh`.
+- **Phase 1 — Ingest + Sandbox. ✅ DONE.** Integrate **code-review-graph** (MCP) for ingest/repo-map/blast-radius; build the ephemeral-Docker sandbox that clones a repo and runs its tests. *DoD:* given a repo, output a structured test report + a queryable graph. Verified by `scripts/phase1_check.sh` (and crash-recovery by `scripts/dod_check.sh`). **Detailed architecture + status tracker in §18.**
 - **Phase 2 — One recipe, end-to-end.** Pydantic v1→v2 on a single small repo: Plan → Execute → Verify → green. *DoD:* one real repo migrated, full suite passes.
 - **Phase 3 — Recovery.** Idempotency, bounded retries, replan, model escalation, rollback, checkpoint-resume. *DoD:* injected faults survived.
 - **Phase 4 — Eval harness.** Corpus, metrics, fault injection, K-run statistics, per-model rows. *DoD:* a metrics report across ≥10 repos with variance.
@@ -285,6 +285,97 @@ README leads with the architecture diagram + three headline numbers. A 2-minute 
 ## 17. Risks & de-risking
 
 Scope creep into "migrate anything" → hard-commit to one recipe. Weak eval corpus → start mining repos in Phase 1, in parallel. Sandbox security → network-off + caps v1, document Fargate/gVisor. LLM nondeterminism muddying metrics → K-runs + variance, pinned versions. Demo box cost → stop the EC2 instance when idle.
+
+---
+
+## 18. Phase 1 — Ingest + Sandbox (detailed architecture & live status)
+
+> This section is the working spec for Phase 1 and is kept **current as we build** — the
+> status tracker at the end is the source of truth for what's implemented vs remaining.
+
+### 18.1 Decisions (locked for Phase 1)
+| Decision | Choice | Why |
+|---|---|---|
+| Phase 1 shape | **Full LangGraph node integration**: replace the trivial `start→work→end` with **Ingest → Verify → Report** | A submitted job really clones, builds a graph, and runs tests end-to-end — a stronger demo than standalone scripts. Stops short of Plan/Execute (Phase 2). |
+| code-review-graph (CRG) integration | **MCP client** (stdio) to CRG's `serve` command | On-theme for an Anthropic-targeted project (MCP fluency); CRG has no importable Python API anyway. |
+| CRG dependency isolation | Installed **isolated** in the worker image (`uv tool install`), launched as a subprocess; worker venv adds only the lightweight `mcp` client SDK | Keeps CRG's `fastmcp`/`tree-sitter`/`networkx` out of the langgraph venv — client/server only share JSON-RPC. |
+| DoD target repo | **Controlled fixture** under `apps/backend/tests/fixtures/sample_repo/` | Deterministic, offline, CI-friendly. Real OSS repos come later. |
+| Sandbox image build | Compose **`tools` profile** (`docker compose --profile tools build sandbox`); worker `docker run`s it on demand | `docker compose up` stays clean; the sandbox is ephemeral, not a long-running service. |
+| Test report format | `pytest --json-report` (pytest-json-report) written to the shared volume | Machine-readable; we control the runner image so the plugin is always present. |
+
+### 18.2 Architecture — the new graph
+```
+[*] --> Ingest --> Verify --> Report --> [*]
+  Ingest:  clone repo into /workspaces/<job_id> (network ON, trusted clone)
+           launch `code-review-graph serve --repo <ws>` (stdio MCP), call
+           build_or_update_graph_tool, then a sample query -> RepoModel summary
+  Verify:  spawn ephemeral sibling container (DooD): --network none, cpu/mem caps,
+           timeout, mounts the shared `workspaces` volume; runs pytest --json-report;
+           worker reads report.json back -> TestReport
+  Report:  assemble JobResult (test summary + graph summary + sample query);
+           persist report.json via LocalStorage; store path + summary on the job row
+```
+Every node still checkpoints (Phase 0 mechanism unchanged). **Crash-recovery is now proven
+against the real graph:** Ingest (clone + graph build) is the expensive step, so killing the
+worker mid-Ingest and restarting resumes *past* it. Ingest is **idempotent** (workspace +
+graph present → skip rebuild).
+
+### 18.3 Workspace + Docker-out-of-Docker
+- Named volume **`workspaces`** mounted at `/workspaces` in the worker; per-job dir
+  `/workspaces/<job_id>`.
+- Worker mounts the host **Docker socket**; Verify spawns a **sibling** container. Sibling
+  bind mounts resolve on the daemon/host, not inside the worker — so we mount the **same
+  named volume** into the sibling (`-v portage_workspaces:/workspaces`, workdir
+  `/workspaces/<job_id>`) instead of a bind path. This is the DooD file-sharing fix.
+- Sandbox container: `--network none`, `--cpus`, `--memory`, `--pids-limit`, a wall-clock
+  timeout, `--rm`. Untrusted code (the repo's tests) only ever runs here.
+
+### 18.4 Network-off vs. dependency provisioning
+- Sandbox image (`portage-sandbox`) preinstalls `pytest`, `pytest-json-report`, `pydantic`.
+- Fixture installs itself offline: `pip install -e . --no-index --no-deps` → `pytest`. Tests
+  run **fully network-off**.
+- **Known limitation (future work):** real OSS repos need their own deps. The provisioning
+  story (pre-warm a venv with network on, then run tests network-off; or a per-repo deps
+  image) is deferred — documented, not built in Phase 1.
+
+### 18.5 Retrieval mechanics (verified against CRG v2.3.6)
+- Launch: `code-review-graph serve --repo /workspaces/<job_id> --tools build_or_update_graph_tool,get_impact_radius_tool,query_graph_tool` (stdio MCP server; `--data-dir` controls graph SQLite location).
+- Client: official `mcp` Python SDK, stdio transport, async. Calls `build_or_update_graph_tool`
+  then one query (`query_graph_tool` / `get_impact_radius_tool`) to prove queryability.
+- CRG only *parses* files (Tree-sitter) — it does not execute repo code, so running it in the
+  worker is safe; only the repo's **tests** go through the sandbox.
+
+### 18.6 Interfaces & persistence
+- **`Retrieval` Protocol** (new, in `core/interfaces.py`) — lean: `build(workspace)` + one
+  query method. Adapter `MCPRetrievalProvider` in `retrieval/`.
+- **`core.Sandbox`** → `DockerSandbox` adapter in `sandbox/`.
+- **`StorageBackend`** → `LocalStorage` adapter (writes artifacts to a local/volume dir).
+- **DB:** small Alembic migration adds `report_path` + `test_summary` (JSONB) to `jobs`. **No**
+  `artifacts`/`events` tables yet (Phase 4/5).
+
+### 18.7 Testing & DoD
+- Standalone capability checks first: (a) DockerSandbox runs the fixture → structured report;
+  (b) MCPRetrievalProvider builds + queries the fixture graph.
+- `scripts/phase1_check.sh`: fixture through the pipeline → assert a structured report
+  (passed/failed counts) **and** a non-empty graph query result.
+- Re-point `scripts/dod_check.sh`: kill the worker mid-**Ingest**, restart, assert resume past
+  Ingest (preserves the Phase 0 crash-recovery proof against the real graph).
+
+### 18.8 Status tracker (kept current)
+- [x] **18-A** Fixture repo `apps/backend/tests/fixtures/sample_repo/` (pydantic + pytest, offline-installable) — 4 tests pass
+- [x] **18-B** `DockerSandbox` (DooD, network-off, caps, timeout) + `portage-sandbox` image + compose `tools` profile — standalone verified: fixture → 4/4 passed, report parsed (JUnit XML, not the json-report plugin — version-robust)
+- [x] **18-C** `MCPRetrievalProvider` + `mcp` client dep + isolated CRG (`uv tool`, v2.3.6) in worker image (+ git + docker CLI) — standalone verified: fixture → 13 nodes/43 edges + cross-session blast-radius query `status:ok`. Key API facts: repo needs a `.git` marker; build needs `full_rebuild=True` (incremental diffs HEAD~1); `query_graph_tool(pattern, target)` where pattern ∈ callers_of/callees_of/tests_for/…; `get_impact_radius_tool(changed_files=[…])` for blast-radius.
+- [x] **18-D** `LocalStorage` adapter + `Retrieval` Protocol (in core) + Alembic `0002` migration (`report_path`, `test_summary`, `graph_summary`) + JobOut schema updated
+- [x] **18-E** Wire `Ingest → Verify → Report` graph + worker (workspaces volume + docker socket + fixtures mount) — verified via compose: fixture job → graph (13 nodes/43 edges) + tests (4/4) + report.json; `test_summary`/`graph_summary` persisted on the job and served by the API
+- [x] **18-F** `scripts/phase1_check.sh` (repo → report + graph, asserted) + re-pointed `scripts/dod_check.sh` (kill mid-Verify → resume past Ingest, `INGEST` runs once) — both green
+- [x] **18-G** Frontend: jobs table now shows per-job tests (passed/total) + graph (nodes·edges)
+
+**Phase 1 status: ✅ COMPLETE** — both DoDs green (`scripts/phase1_check.sh`, `scripts/dod_check.sh`).
+Known limitations carried forward: real-OSS-repo dependency provisioning under `--network none`
+(fixture is offline-clean); sandbox runs as root (gVisor/rootless is the documented upgrade); a
+crash *during* the sandbox test run (vs. the pre-test delay the DoD kills in) can leave an
+orphaned sandbox container until the resumed Verify spawns a fresh one — unique `--rm` names
+avoid a clash; reaping orphans by job label is a Phase 3 hardening.
 
 ---
 

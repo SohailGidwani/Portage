@@ -47,7 +47,7 @@ export default function Home() {
     <main>
       <h1 style={{ marginBottom: 4 }}>Portage</h1>
       <p className="muted" style={{ marginTop: 0 }}>
-        Autonomous code-migration agent — Phase 0 skeleton. API:{" "}
+        Autonomous code-migration agent — Phase 1 (Ingest → Verify → Report). API:{" "}
         <code>{API_BASE}</code> · health: <code>{health}</code>
       </p>
 
@@ -82,13 +82,15 @@ export default function Home() {
               <th>id</th>
               <th>recipe</th>
               <th>status</th>
+              <th>tests</th>
+              <th>graph</th>
               <th>updated</th>
             </tr>
           </thead>
           <tbody>
             {jobs.length === 0 && (
               <tr>
-                <td colSpan={4} className="muted">
+                <td colSpan={6} className="muted">
                   No jobs yet.
                 </td>
               </tr>
@@ -101,6 +103,26 @@ export default function Home() {
                 <td>{j.migration_recipe}</td>
                 <td>
                   <span className={`badge s-${j.status}`}>{j.status}</span>
+                </td>
+                <td>
+                  {j.test_summary ? (
+                    <span
+                      className={
+                        j.test_summary.failed + j.test_summary.errors === 0
+                          ? "s-done badge"
+                          : "s-failed badge"
+                      }
+                    >
+                      {j.test_summary.passed}/{j.test_summary.total}
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </td>
+                <td className="muted">
+                  {j.graph_summary
+                    ? `${j.graph_summary.total_nodes}n · ${j.graph_summary.total_edges}e`
+                    : "—"}
                 </td>
                 <td className="muted">
                   {new Date(j.updated_at).toLocaleTimeString()}
