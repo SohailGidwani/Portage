@@ -1,15 +1,24 @@
-"""Execute node — migrate each planned file with the LLM, on the git worktree.
+"""Execute node — migrate each pending file task with the LLM, on the git worktree.
 
-For every file Task (in dependency order): gather context (the behavioural test contract, the
-framework-agnostic callees, and any already-migrated siblings), prompt the model for a full
-rewrite, write it into the worktree, and record a content hash + diff in Postgres.
+For every *pending* file Task (in dependency order): gather context (the behavioural test
+contract, the framework-agnostic callees, and any already-migrated siblings), prompt the
+model for a full rewrite, write it into the worktree, and record content hash + per-file
+diff + an attempts_log entry in Postgres.
 
-Durability (Phase 2 scope):
-  * Idempotent / resume-safe — a task whose worktree file already hashes to the recorded
-    value is skipped, so a crash mid-Execute resumes without re-calling the model.
-  * Bounded retry — when Verify fails, the graph loops back here (≤ max_execute_attempts).
-    A retry restores the worktree to the original sources and re-migrates with the failing
-    test output in context. The richer Recover taxonomy + model escalation is Phase 3.
+Durability & recovery (Phase 3):
+  * Idempotent / resume-safe — a `done` task whose worktree file still hashes to the
+    recorded value is skipped, so a crash mid-Execute resumes without re-calling the model;
+    `skipped` tasks (recovery gave up on them) are never retried.
+  * Targeted regeneration — Recover rolls back exactly the files it wants redone and resets
+    those tasks to pending; Execute regenerates only those, with the failing test output as
+    added context.
+  * **Model escalation (measured)** — a task's first `escalate_after_attempts` attempts use
+    the driver model; later attempts use the escalation model. Every attempt is recorded in
+    attempts_log with its tier/model, so "how often does escalation rescue a task?" is a
+    queryable fact, not an anecdote.
+  * Fault injection (config `inject_fault`, Phase 3 DoD + Phase 4 harness): `bad_patch`
+    corrupts the first attempt of the first task; `bad_patch_until_escalation` corrupts
+    every driver-tier attempt of the first task, so only escalation can rescue it.
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 
 from portage_agent.config import settings
 from portage_agent.core.interfaces import LLMMessage
@@ -30,14 +40,43 @@ from ..state import GraphState
 from .common import (
     content_hash,
     extract_code,
+    file_diff,
     iter_py_files,
     read_file,
-    run_git,
     worktree_diff,
     write_file,
 )
 
 log = logging.getLogger("portage.agent")
+
+_FAULT_PAYLOAD = "\n\n<<< portage fault-injection: deliberately invalid python >>>\n"
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _tier_for(attempt: int) -> tuple[str, str, str]:
+    """(tier, model, label) for the given (1-based) attempt number: driver first, then
+    escalation. `model` is the raw LiteLLM string used for the call; `label` is what lands
+    in attempts_log / logs (a private deployment id never leaves the env)."""
+    if attempt <= settings.escalate_after_attempts:
+        return ("driver", settings.llm_driver_model,
+                settings.llm_driver_model_label or settings.llm_driver_model)
+    return ("escalation", settings.llm_escalation_model,
+            settings.llm_escalation_model_label or settings.llm_escalation_model)
+
+
+def _should_corrupt(fault: str | None, *, path: str, first_path: str | None,
+                    attempt: int, tier: str) -> bool:
+    """Deterministic fault gates. Both faults target only the first planned file."""
+    if not fault or path != first_path:
+        return False
+    if fault == "bad_patch":
+        return attempt == 1
+    if fault == "bad_patch_until_escalation":
+        return tier == "driver"
+    return False
 
 
 def _gather_context(
@@ -59,10 +98,10 @@ def _gather_context(
     return ctx
 
 
-async def _migrate_file(recipe, worktree: str, *, path: str, role: str,
+async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: str,
                         subtasks: list[Subtask], context: dict[str, str],
-                        verify_errors: str) -> tuple[str, str]:
-    """Call the model for one file; return (migrated_content, hash)."""
+                        verify_errors: str) -> str:
+    """Call the model for one file; return the migrated content (not yet written)."""
     source = read_file(worktree, path, limit=20000) or ""
     planned = PlannedFile(path=path, role=role, subtasks=subtasks)
     user = recipe.build_user_prompt(file=planned, source=source, context=context)
@@ -75,11 +114,8 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str,
         LLMMessage(role="system", content=recipe.system_prompt()),
         LLMMessage(role="user", content=user),
     ]
-    resp = await get_llm().complete(messages)
-    content = extract_code(resp.text)
-    h = write_file(worktree, path, content)
-    log.info("  migrated %s (role=%s, %s chars, model=%s)", path, role, len(content), resp.model)
-    return content, h
+    resp = await get_llm().complete(messages, model=model)
+    return extract_code(resp.text)
 
 
 async def execute_node(state: GraphState) -> GraphState:
@@ -91,37 +127,37 @@ async def execute_node(state: GraphState) -> GraphState:
     worktree = state["worktree"]
     recipe = get_recipe(state["migration_recipe"])
     verify_errors = state.get("last_verify_errors") or ""
-    retry = bool(verify_errors)
-    delay = int((state.get("config") or {}).get(
-        "execute_delay_seconds", settings.execute_task_delay_seconds))
+    cfg = state.get("config") or {}
+    fault = cfg.get("inject_fault")
+    delay = int(cfg.get("execute_delay_seconds", settings.execute_task_delay_seconds))
 
     tasks = await task_store.load_tasks(uuid.UUID(job_id))
-    target_paths = {t.target_path for t in tasks if t.target_path}
-    log.info("EXECUTE node | job=%s tasks=%s retry=%s", job_id, len(tasks), retry)
-
-    if retry:
-        # Discard the failed attempt's edits and re-migrate from the original sources.
-        await run_git("checkout", "--", ".", cwd=worktree)
-        for t in tasks:
-            await task_store.update_task(t.id, status=TaskStatus.pending.value,
-                                         content_hash=None, cascade_subtasks=True)
-        tasks = await task_store.load_tasks(uuid.UUID(job_id))
+    file_tasks = [t for t in tasks if t.target_path]
+    target_paths = {t.target_path for t in file_tasks}
+    first_path = file_tasks[0].target_path if file_tasks else None
+    log.info("EXECUTE node | job=%s tasks=%s pending=%s fault=%s", job_id, len(file_tasks),
+             sum(t.status == TaskStatus.pending.value for t in file_tasks), fault or "-")
 
     done_paths: set[str] = set()
-    for t in tasks:
+    for t in file_tasks:
         path = t.target_path
-        if not path:
+        assert path is not None
+        if t.status == TaskStatus.skipped.value:
             continue
         current = read_file(worktree, path, limit=20000) or ""
         # Idempotent skip (resume): already migrated and unchanged on disk.
-        already_done = t.status == TaskStatus.done.value and t.content_hash == content_hash(current)
-        if not retry and already_done:
+        if t.status == TaskStatus.done.value and t.content_hash == content_hash(current):
             log.info("  skip %s — already migrated (content-hash match)", path)
             done_paths.add(path)
             continue
 
-        await task_store.update_task(t.id, status=TaskStatus.running.value,
-                                     attempts=t.attempts + 1, cascade_subtasks=True)
+        attempt = t.attempts + 1
+        tier, model, model_label = _tier_for(attempt)
+        await task_store.update_task(
+            t.id, status=TaskStatus.running.value, attempts=attempt, cascade_subtasks=True,
+            append_attempt={"attempt": attempt, "tier": tier, "model": model_label,
+                            "action": "migrate", "at": _now()},
+        )
         if delay:
             log.info("  EXECUTE pre-migrate delay %ss (kill window) | job=%s task=%s",
                      delay, job_id, path)
@@ -131,12 +167,22 @@ async def execute_node(state: GraphState) -> GraphState:
             context = _gather_context(worktree, current=path, target_paths=target_paths,
                                       done_paths=done_paths)
             subtasks = [Subtask(s.type, s.title, "") for s in t.subtasks]
-            _, h = await _migrate_file(recipe, worktree, path=path, role=t.type,
-                                       subtasks=subtasks, context=context,
-                                       verify_errors=verify_errors)
+            content = await _migrate_file(
+                recipe, worktree, path=path, role=t.type, model=model,
+                subtasks=subtasks, context=context, verify_errors=verify_errors,
+            )
+            if _should_corrupt(fault, path=path, first_path=first_path,
+                               attempt=attempt, tier=tier):
+                log.warning("  FAULT %s | corrupting %s (attempt=%s tier=%s)",
+                            fault, path, attempt, tier)
+                content += _FAULT_PAYLOAD
+            h = write_file(worktree, path, content)
+            diff = await file_diff(worktree, path)
             await task_store.update_task(t.id, status=TaskStatus.done.value,
-                                         content_hash=h, cascade_subtasks=True)
+                                         content_hash=h, diff=diff, cascade_subtasks=True)
             done_paths.add(path)
+            log.info("  migrated %s (attempt=%s tier=%s model=%s, %s chars)",
+                     path, attempt, tier, model_label, len(content))
         except Exception as exc:
             log.exception("  migrate FAILED for %s", path)
             await task_store.update_task(t.id, status=TaskStatus.failed.value, error=repr(exc))
@@ -145,7 +191,7 @@ async def execute_node(state: GraphState) -> GraphState:
     diff = await worktree_diff(worktree)
     snapshots = await task_store.load_tasks(uuid.UUID(job_id))
     return {
-        "plan": [s.to_dict() for s in snapshots],
+        "plan": [s.to_state_dict() for s in snapshots],
         "diff": diff,
         "last_verify_errors": "",  # consumed
         "step_log": ["execute"],

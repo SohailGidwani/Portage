@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     # Escalation tier is wired in Phase 3 (a measured recovery strategy); declared here so
     # the ladder is configurable from the start.
     llm_escalation_model: str = "bedrock/us.anthropic.claude-opus-4-8-v1:0"
+    # Public display labels for the two tiers. Everything user-visible (attempts_log,
+    # report.json, the dashboard timeline) shows the label; the raw model string can be a
+    # private deployment id (e.g. `azure/<deployment>`) that never leaves the env.
+    # Unset => the raw model string is shown (fine for self-describing ids like bedrock/...).
+    llm_driver_model_label: str | None = None
+    llm_escalation_model_label: str | None = None
     llm_max_tokens: int = 4096
     llm_timeout_seconds: int = 120
     # LiteLLM-level transient-error retries (network/5xx) — NOT the agent's task retry.
@@ -78,14 +84,19 @@ class Settings(BaseSettings):
     # combined with litellm drop_params=True this is safe across providers.
     llm_temperature: float | None = 0.0
 
-    # --- Phase 2: Execute / migration ---
-    # Bounded Execute↔Verify loop (Phase 2 has no rich recovery): the migration is retried
-    # at most this many times, feeding the failing test output back to the model. Phase 3
-    # replaces this with the full Recover taxonomy + model escalation.
-    max_execute_attempts: int = 2
+    # --- Phase 2/3: Execute / recovery budgets ---
     # Optional per-task delay in Execute (seconds) — a deterministic window to kill the
     # worker mid-Execute and prove content-hash resume skips already-applied tasks. 0 normally.
     execute_task_delay_seconds: int = 0
+    # Phase 3 recovery knobs (the bounded-recovery taxonomy; plan §8):
+    # A task's first `escalate_after_attempts` attempts use the driver model; later attempts
+    # use the escalation model (measured — attempts_log records the tier per attempt).
+    escalate_after_attempts: int = 2
+    # A task that fails this many attempts is rolled back to its original source and marked
+    # `skipped` (skip-and-continue keeps the run alive; the report stays honest).
+    max_task_attempts: int = 3
+    # Global step budget on the Verify→Recover loop; exceeded => give up and Integrate.
+    max_recover_visits: int = 4
 
     @property
     def _userinfo(self) -> str:

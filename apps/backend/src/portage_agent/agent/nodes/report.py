@@ -28,6 +28,20 @@ async def report_node(state: GraphState) -> GraphState:
     plan = state.get("plan") or []
     tasks_done = sum(1 for t in plan if t.get("status") == "done")
 
+    # Phase 3: the measured recovery/escalation record. "Rescued" = the task ended done and
+    # its successful path needed an escalation-tier attempt — the eval-facing number.
+    escalation_tasks = [
+        t for t in plan
+        if any(a.get("tier") == "escalation" for a in t.get("attempts_log", []))
+    ]
+    recovery = {
+        "visits": state.get("recover_visits", 0),
+        "actions": state.get("recovery_actions", []),
+        "tasks_skipped": sum(1 for t in plan if t.get("status") == "skipped"),
+        "escalation_attempted": len(escalation_tasks),
+        "escalation_rescued": sum(1 for t in escalation_tasks if t.get("status") == "done"),
+    }
+
     report = {
         "job_id": job_id,
         "repo_url": state.get("repo_url"),
@@ -39,6 +53,7 @@ async def report_node(state: GraphState) -> GraphState:
         "tasks_total": len(plan),
         "tasks_done": tasks_done,
         "affected_tests": state.get("affected_tests", []),
+        "recovery": recovery,
         "verify_summary": verify_summary,
         "integrate_summary": integrate_summary,
         "test_summary": final,

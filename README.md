@@ -1,18 +1,43 @@
 # Portage
 
 > An autonomous code-migration agent that carries a codebase across the gap between two
-> framework versions — executing the migration across many files, verifying itself against
-> the test suite, recovering from failures, and proving its reliability with an eval harness.
+> frameworks — executing the migration across many files, verifying itself against the test
+> suite, recovering from failures, and proving its reliability with an eval harness.
 
-*(A portage is the overland carry between two navigable waters.)* v1 targets **Pydantic v1 → v2**.
+*(A portage is the overland carry between two navigable waters.)* v1 targets **Flask →
+FastAPI** — a migration deterministic tools genuinely can't do (routing decorators,
+request/response handling, async, blueprints→routers need *understanding*, not mechanical
+rewriting). Migrations are pluggable "recipes", so the architecture generalizes; the
+differentiator is the durability/recovery story plus the eval harness.
 
-**Status: Phase 1 (ingest + sandbox).** A submitted job now runs a real **Ingest → Verify →
-Report** graph: it clones a repo, builds a structural knowledge graph (code-review-graph, via
-MCP), runs the repo's tests in an ephemeral network-off Docker sandbox, and emits a structured
-report — all checkpointed to Postgres, so killing the worker mid-run **resumes from the last
-checkpoint** (skipping the already-done, expensive Ingest).
+**Status: Phase 3 (recovery) — an autonomous, self-healing migration works end-to-end.**
+A submitted job runs the full **Ingest → Plan → Execute → Verify → (Recover) → Integrate →
+Report** graph: it clones the repo, builds a structural knowledge graph, plans a per-file task
+DAG, migrates each file with an LLM on a git worktree, runs the affected tests in an ephemeral
+network-off Docker sandbox, and — when verification fails — classifies the failure and picks a
+bounded recovery strategy before reporting honestly. Everything is checkpointed to Postgres,
+so killing the worker mid-run resumes from the last node without re-doing finished work.
 
-## Architecture (Phase 0)
+## What "recovery" means (Phase 3)
+
+A failed Verify routes to the **Recover** node, which classifies the failure and picks one of
+three bounded strategies:
+
+- **Targeted rollback + regenerate** — a crash implicating specific planned files rolls back
+  only those files (`git checkout -- <path>`) and re-runs Execute on them, with the failing
+  test output as added context.
+- **Model escalation (measured)** — a task's first attempts use the driver-tier model; repeated
+  failures switch it to the escalation tier. Every attempt lands in the task's `attempts_log`
+  with its tier and model, so "how often does escalation rescue a task?" is a queryable fact.
+- **Replan** — framework residue in a file the planner missed triggers a replan that appends
+  the missing task.
+
+Budgets bound everything (`MAX_TASK_ATTEMPTS`, `MAX_RECOVER_VISITS`); a task that exhausts its
+budget is rolled back to original source and marked `skipped` — the run stays alive and the
+report stays honest. Execute is idempotent (content-hash keyed), so a crash mid-Execute
+resumes without re-calling the model for already-applied files.
+
+## Architecture
 
 ```
 Next.js dashboard ──REST──> FastAPI API ──enqueue──> Postgres job queue
@@ -20,60 +45,80 @@ Next.js dashboard ──REST──> FastAPI API ──enqueue──> Postgres jo
                             LangGraph worker <────claim───┘
                                    │ checkpoints every node (thread_id = job_id)
                                    ▼
-                          Postgres + pgvector
+      Ingest → Plan → Execute → Verify ──pass──> Integrate → Report
+                ▲        ▲         │fail                ▲
+                │        │         ▼                    │
+                └─replan─┴────── Recover ───give up─────┘
+                      (regenerate / replan / give up, bounded)
 ```
 
-- **api** — FastAPI: `GET /health`, `POST /jobs`, `GET /jobs/{id}`, `GET /jobs`.
-- **worker** — claims a job off the Postgres queue and runs the LangGraph graph
-  (`start → work → end`), checkpointing at every node.
-- **db** — Postgres 16 + pgvector. Alembic owns domain tables; LangGraph owns its checkpoint
-  tables (same DB, different driver — no conflict).
-- **frontend** — Next.js (App Router, TS). REST client only, no DB/ORM.
+- **api** — FastAPI: `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`, `/jobs/{id}/tasks`,
+  `/jobs/{id}/report`, `GET /health`.
+- **worker** — claims jobs off the Postgres queue (atomic `FOR UPDATE SKIP LOCKED` + heartbeat
+  lease) and runs the LangGraph graph, checkpointing at every node.
+- **db** — Postgres 16 + pgvector. Alembic owns domain tables (`jobs`, `tasks`); LangGraph
+  owns its checkpoint tables (same DB, different driver — no conflict).
+- **frontend** — Next.js (App Router, TS), REST only. The observability surface: jobs list
+  plus a job-detail view with the task tree, per-file diffs, the per-attempt tier/model
+  timeline, and the recovery summary.
+- **sandbox** — ephemeral `--network none` Docker container per test run; JUnit-parsed results.
+- **LLM** — LiteLLM model ladder; provider is config, not code. Documented default is Claude
+  Sonnet on Bedrock; any LiteLLM model string + creds in `.env` works (Azure OpenAI, Gemini,
+  Anthropic…). Optional `LLM_*_MODEL_LABEL` vars control what the UI/reports display, so a
+  private deployment name never leaves the env.
 
 ## Quickstart
 
 ```bash
-cp .env.example .env
+cp .env.example .env         # add LLM creds for migration runs (see comments inside)
+docker compose --profile tools build sandbox
 docker compose up            # db -> api (runs migrations) -> worker -> frontend
 ```
 
 - API: <http://localhost:8000> (`/docs` for the OpenAPI UI)
 - Dashboard: <http://localhost:3000>
 
-Submit a job:
+Submit a migration of the bundled fixture Flask app:
 
 ```bash
 curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
-  -d '{"repo_url":"https://github.com/acme/x","migration_recipe":"pydantic_v1_to_v2"}'
+  -d '{"repo_url":"/fixtures/flask_app","migration_recipe":"flask_to_fastapi"}'
 ```
+
+A recipe the planner doesn't recognize degrades gracefully: the run becomes
+ingest→verify→report (test the repo, build its graph, report — no changes).
 
 ## Verifying the DoDs
 
+Each phase has a repeatable definition-of-done check:
+
 ```bash
 docker compose up -d
-# Functional Phase 1 DoD: fixture repo -> structured test report + queryable graph
-bash scripts/phase1_check.sh
-# Crash-recovery DoD: kill the worker mid-Verify -> resume past the expensive Ingest
-bash scripts/dod_check.sh
+bash scripts/dod_check.sh     # Phase 0: kill the worker mid-run -> it resumes from checkpoint
+bash scripts/phase1_check.sh  # Phase 1: repo -> structured test report + queryable graph
+bash scripts/phase2_check.sh  # Phase 2: fixture Flask app autonomously migrated; full suite green
+bash scripts/phase3_check.sh  # Phase 3: injected faults survived (rollback, escalation, replan)
 ```
 
-`phase1_check.sh` runs the bundled fixture through Ingest→Verify→Report and asserts both a test
-report (pass/fail counts) and a graph (node/edge counts) come back. `dod_check.sh` submits a job
-with a Verify delay, SIGKILLs the worker mid-Verify, restarts it, and asserts from the logs that
-**Ingest ran exactly once** (the clone + graph build is not repeated) — it resumed from the
-post-Ingest checkpoint.
+`phase3_check.sh` runs three deterministic fault scenarios — a corrupted patch (rescued by
+rollback+retry), a patch corrupted until escalation (rescued by the stronger model), and a
+deliberately dropped plan task (repaired by replan) — and asserts each run still ends with the
+full suite green plus the expected recovery evidence in the report.
 
 ## Layout
 
 - `apps/backend` — Python 3.12, uv. Package `portage_agent`. (`apps/backend/README.md`)
-- `apps/frontend` — Next.js (App Router, TS, pnpm).
-- `scripts/` — operational scripts (`dod_check.sh`).
+- `apps/frontend` — Next.js (App Router, TS, pnpm). Observability dashboard.
+- `scripts/` — per-phase DoD checks.
 - `infra/terraform/` — IaC (minimal; later phases).
-- `code-migration-agent-plan.md` — the full architecture & build plan (source of truth).
+- `code-migration-agent-planV2.md` — the full architecture & build plan (**source of truth**),
+  with `portage-v2-forward-plan.md` as the reasoning behind the v2 pivot.
 - `CLAUDE.md` — stack, conventions, and the phase plan for contributors/agents.
 
 ## Roadmap
 
-Phase 0 skeleton ✅ → Phase 1 ingest + sandbox → Phase 2 one recipe end-to-end → Phase 3
-recovery → Phase 4 eval harness → Phase 5 dashboard + demo → Phase 6 packaging. See `CLAUDE.md`
-for the definition-of-done per phase.
+Phase 0 skeleton ✅ → Phase 1 ingest + sandbox ✅ → Phase 2 autonomous Flask→FastAPI ✅ →
+Phase 3 recovery ✅ → Phase 4 eval harness (curated corpus, fault injection, K-run
+mean±variance, per-model metrics) → Phase 5 CLI + MCP server (`verify_patch_in_sandbox`,
+`repo_graph`, `blast_radius`) → Phase 6 dashboard-as-proof + packaging. See `CLAUDE.md` for
+the definition-of-done per phase.

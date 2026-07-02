@@ -109,6 +109,10 @@ class Task(Base):
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     diff: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Phase 3: one entry per migration attempt / recovery action —
+    # {attempt, tier, model, action, reason, at}. This is the measured-escalation record
+    # ("did the stronger model rescue the task?") and the frontend's recovery timeline.
+    attempts_log: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

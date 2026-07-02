@@ -39,10 +39,20 @@ class TaskSnapshot:
     order_index: int
     verify_spec: dict
     content_hash: str | None
+    error: str | None = None
+    diff: str | None = None
+    attempts_log: list = field(default_factory=list)
     subtasks: list[SubtaskSnapshot] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def to_state_dict(self) -> dict:
+        """Compact form for LangGraph state / report.json — omits the (potentially large)
+        per-task diff, which stays queryable via GET /jobs/{id}/tasks."""
+        d = asdict(self)
+        d.pop("diff", None)
+        return d
 
 
 async def _load(session, job_id: uuid.UUID) -> list[TaskSnapshot]:
@@ -69,6 +79,9 @@ async def _load(session, job_id: uuid.UUID) -> list[TaskSnapshot]:
                 order_index=p.order_index,
                 verify_spec=p.verify_spec or {},
                 content_hash=p.content_hash,
+                error=p.error,
+                diff=p.diff,
+                attempts_log=list(p.attempts_log or []),
                 subtasks=[
                     SubtaskSnapshot(id=str(c.id), type=c.type, title=c.title, status=c.status)
                     for c in children.get(p.id, [])
@@ -135,9 +148,13 @@ async def update_task(
     content_hash: str | None = None,
     diff: str | None = None,
     error: str | None = None,
+    append_attempt: dict | None = None,
     cascade_subtasks: bool = False,
 ) -> None:
-    """Update one Task row; optionally mirror ``status`` onto its subtasks."""
+    """Update one Task row; optionally mirror ``status`` onto its subtasks.
+
+    ``append_attempt`` appends one entry to ``attempts_log`` (reassigned, not mutated, so
+    SQLAlchemy detects the JSONB change)."""
     tid = uuid.UUID(str(task_id))
     async with AsyncSessionLocal() as session, session.begin():
         task = (await session.execute(select(Task).where(Task.id == tid))).scalar_one()
@@ -151,9 +168,58 @@ async def update_task(
             task.diff = diff
         if error is not None:
             task.error = error
+        if append_attempt is not None:
+            task.attempts_log = [*(task.attempts_log or []), append_attempt]
         if cascade_subtasks and status is not None:
             children = (
                 await session.execute(select(Task).where(Task.parent_id == tid))
             ).scalars().all()
             for c in children:
                 c.status = status
+
+
+async def append_tasks(job_id: uuid.UUID, specs: list[dict]) -> list[TaskSnapshot]:
+    """Append file Tasks to an existing plan (the replan path — e.g. a file the original
+    plan missed). Specs use the same shape as ``save_plan``; already-planned target paths
+    are skipped so a repeated replan stays idempotent."""
+    async with AsyncSessionLocal() as session, session.begin():
+        existing_paths = {
+            p for (p,) in (
+                await session.execute(
+                    select(Task.target_path).where(
+                        Task.job_id == job_id, Task.parent_id.is_(None)
+                    )
+                )
+            ).all()
+        }
+        for spec in specs:
+            if spec.get("target_path") in existing_paths:
+                continue
+            parent = Task(
+                id=uuid.uuid4(),
+                job_id=job_id,
+                parent_id=None,
+                type=spec["type"],
+                title=spec["title"],
+                target_path=spec.get("target_path"),
+                status=TaskStatus.pending.value,
+                order_index=spec.get("order_index", 0),
+                verify_spec=spec.get("verify_spec", {}),
+            )
+            session.add(parent)
+            await session.flush()
+            for st in spec.get("subtasks", []):
+                session.add(
+                    Task(
+                        id=uuid.uuid4(),
+                        job_id=job_id,
+                        parent_id=parent.id,
+                        type=st["type"],
+                        title=st["title"],
+                        status=TaskStatus.pending.value,
+                        order_index=0,
+                        verify_spec={},
+                    )
+                )
+        snapshots = await _load(session, job_id)
+    return snapshots

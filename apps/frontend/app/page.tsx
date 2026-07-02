@@ -1,13 +1,14 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { API_BASE, Job, createJob, getHealth, listJobs } from "./lib/api";
 
 export default function Home() {
   const [health, setHealth] = useState<string>("…");
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [repoUrl, setRepoUrl] = useState("https://github.com/acme/widgets");
-  const [recipe, setRecipe] = useState("pydantic_v1_to_v2");
+  const [repoUrl, setRepoUrl] = useState("/fixtures/flask_app");
+  const [recipe, setRecipe] = useState("flask_to_fastapi");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -47,8 +48,8 @@ export default function Home() {
     <main>
       <h1 style={{ marginBottom: 4 }}>Portage</h1>
       <p className="muted" style={{ marginTop: 0 }}>
-        Autonomous code-migration agent — Phase 1 (Ingest → Verify → Report). API:{" "}
-        <code>{API_BASE}</code> · health: <code>{health}</code>
+        Autonomous code-migration agent — Ingest → Plan → Execute → Verify → Recover →
+        Integrate → Report. API: <code>{API_BASE}</code> · health: <code>{health}</code>
       </p>
 
       <form onSubmit={submit} className="panel" style={{ marginTop: 24 }}>
@@ -60,7 +61,8 @@ export default function Home() {
             placeholder="repo url"
           />
           <select value={recipe} onChange={(e) => setRecipe(e.target.value)}>
-            <option value="pydantic_v1_to_v2">pydantic_v1_to_v2</option>
+            <option value="flask_to_fastapi">flask_to_fastapi</option>
+            <option value="pydantic_v1_to_v2">pydantic_v1_to_v2 (verify-only)</option>
           </select>
           <button type="submit" disabled={busy}>
             {busy ? "Submitting…" : "Submit job"}
@@ -98,7 +100,9 @@ export default function Home() {
             {jobs.map((j) => (
               <tr key={j.id}>
                 <td>
-                  <code>{j.id.slice(0, 8)}</code>
+                  <Link href={`/jobs/${j.id}`}>
+                    <code>{j.id.slice(0, 8)}</code>
+                  </Link>
                 </td>
                 <td>{j.migration_recipe}</td>
                 <td>

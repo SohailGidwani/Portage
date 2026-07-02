@@ -33,9 +33,89 @@ export type Job = {
   updated_at: string;
 };
 
+// One migration attempt / recovery action on a task (Phase 3 attempts_log entry).
+export type AttemptEntry = {
+  attempt?: number;
+  tier?: "driver" | "escalation";
+  model?: string;
+  action?: string; // migrate | rollback_regenerate | rollback_skip
+  reason?: string;
+  visit?: number;
+  at?: string;
+};
+
+export type Subtask = {
+  id: string;
+  type: string;
+  title: string;
+  status: string;
+};
+
+export type Task = {
+  id: string;
+  type: string;
+  title: string;
+  target_path: string | null;
+  status: "pending" | "running" | "done" | "skipped" | "failed";
+  attempts: number;
+  order_index: number;
+  verify_spec: { affected_tests?: string[]; subtasks?: string[] };
+  content_hash: string | null;
+  error: string | null;
+  diff: string | null;
+  attempts_log: AttemptEntry[];
+  subtasks: Subtask[];
+};
+
+export type RecoverySummary = {
+  visits: number;
+  actions: {
+    visit?: number;
+    classification?: string;
+    action?: string;
+    targets?: string[];
+    skipped?: string[];
+    at?: string;
+  }[];
+  tasks_skipped: number;
+  escalation_attempted: number;
+  escalation_rescued: number;
+};
+
+export type Report = {
+  migrated: boolean;
+  tasks_total: number;
+  tasks_done: number;
+  affected_tests: string[];
+  recovery?: RecoverySummary;
+  verify_summary?: TestSummary;
+  integrate_summary?: TestSummary;
+  test_summary?: TestSummary;
+  diff: string;
+};
+
 export async function getHealth(): Promise<{ status: string; db: string }> {
   const r = await fetch(`${API_BASE}/health`, { cache: "no-store" });
   if (!r.ok) throw new Error(`health ${r.status}`);
+  return r.json();
+}
+
+export async function getJob(id: string): Promise<Job> {
+  const r = await fetch(`${API_BASE}/jobs/${id}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`getJob ${r.status}`);
+  return r.json();
+}
+
+export async function getJobTasks(id: string): Promise<Task[]> {
+  const r = await fetch(`${API_BASE}/jobs/${id}/tasks`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`getJobTasks ${r.status}`);
+  return r.json();
+}
+
+export async function getJobReport(id: string): Promise<Report | null> {
+  const r = await fetch(`${API_BASE}/jobs/${id}/report`, { cache: "no-store" });
+  if (r.status === 404) return null; // no report yet (job still running)
+  if (!r.ok) throw new Error(`getJobReport ${r.status}`);
   return r.json();
 }
 

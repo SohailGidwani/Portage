@@ -1,4 +1,4 @@
-"""Graph state for the Phase 2 Ingest → Plan → Execute → Verify → Integrate → Report graph.
+"""Graph state for the Ingest → Plan → Execute → Verify → (Recover) → Integrate → Report graph.
 
 `step_log` (operator.add reducer) accumulates across checkpoints and makes resume observable.
 The graph is recipe-dispatched: when no recipe matches (or it finds no files), `migrate` is
@@ -30,10 +30,16 @@ class GraphState(TypedDict, total=False):
     worktree: str  # migration worktree path (only when migrate)
     affected_tests: list[str]  # blast-radius-selected test files ([] => run all)
 
-    # --- Execute / Verify retry loop ---
-    verify_attempts: int  # bumped by Verify each run; bounds the retry loop
+    # --- Execute / Verify / Recover loop ---
+    verify_attempts: int  # bumped by Verify each run (diagnostic)
     verify_passed: bool
-    last_verify_errors: str  # failing-test output fed back into Execute on retry
+    last_verify_errors: str  # failing-test output; Recover classifies it, Execute retries with it
+
+    # --- Recover (Phase 3) ---
+    recover_visits: int  # step budget on the Verify→Recover loop
+    recover_route: str  # "execute" | "plan" | "integrate" — Recover's routing decision
+    replan_requested: bool  # set by Recover, consumed by Plan (append missed tasks)
+    recovery_actions: Annotated[list[dict], operator.add]  # audit log for report/frontend
 
     # --- results ---
     test_summary: dict  # Verify's (affected-subset) result; the Phase-1 contract field
