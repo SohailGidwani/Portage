@@ -1,8 +1,9 @@
-"""Graph state for the Phase 1 Ingest → Verify → Report graph.
+"""Graph state for the Phase 2 Ingest → Plan → Execute → Verify → Integrate → Report graph.
 
-`step_log` (operator.add reducer) accumulates across checkpoints and makes resume
-observable: after a kill mid-Verify, the resumed run loads a state that already contains
-the Ingest output (`graph_summary`) and `["ingest"]` in the log — Ingest does NOT re-run.
+`step_log` (operator.add reducer) accumulates across checkpoints and makes resume observable.
+The graph is recipe-dispatched: when no recipe matches (or it finds no files), `migrate` is
+False and Execute/Integrate degrade to the Phase-1 ingest→verify→report behaviour, so the
+older fixtures (and dod_check / phase1_check) keep working unchanged.
 """
 
 from __future__ import annotations
@@ -12,22 +13,33 @@ from typing import Annotated, TypedDict
 
 
 class GraphState(TypedDict, total=False):
-    # seeded on first invoke
+    # --- seeded on first invoke ---
     job_id: str
     repo_url: str
     migration_recipe: str
     config: dict
 
-    # Ingest output
+    # --- Ingest ---
     workspace: str
     graph_summary: dict
     blast_radius_sample: dict
 
-    # Verify output
-    test_summary: dict
+    # --- Plan ---
+    migrate: bool  # True iff a recipe matched and produced tasks
+    plan: list[dict]  # TaskSnapshot dicts (visibility / report)
+    worktree: str  # migration worktree path (only when migrate)
+    affected_tests: list[str]  # blast-radius-selected test files ([] => run all)
 
-    # Report output
+    # --- Execute / Verify retry loop ---
+    verify_attempts: int  # bumped by Verify each run; bounds the retry loop
+    verify_passed: bool
+    last_verify_errors: str  # failing-test output fed back into Execute on retry
+
+    # --- results ---
+    test_summary: dict  # Verify's (affected-subset) result; the Phase-1 contract field
+    integrate_summary: dict  # full-suite result (authoritative for migration runs)
+    diff: str  # the migration diff (git diff in the worktree)
     report_path: str
 
-    # accumulates ["ingest"] -> ["ingest","verify"] -> ["ingest","verify","report"]
+    # accumulates ["ingest","plan","execute","verify","integrate","report"]
     step_log: Annotated[list[str], operator.add]

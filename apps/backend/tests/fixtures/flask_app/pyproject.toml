@@ -1,0 +1,19 @@
+[project]
+name = "flaskapp"
+version = "0.1.0"
+description = "A small Flask 'items' API — Portage Phase 2 Flask→FastAPI migration fixture."
+requires-python = ">=3.10"
+dependencies = ["flask>=3"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Tests import the `flaskapp` package from src/ without an install step (the sandbox runs
+# offline). The package name stays `flaskapp` after the FastAPI migration so test imports
+# don't churn — only the framework wiring inside it changes.
+[tool.pytest.ini_options]
+pythonpath = ["src"]

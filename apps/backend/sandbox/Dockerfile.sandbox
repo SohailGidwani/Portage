@@ -2,21 +2,27 @@
 # Built via the compose `tools` profile (NOT started by `docker compose up`); the worker
 # `docker run`s it per verification. Untrusted repo code only ever executes in here.
 #
-# Deps are baked in so tests run with `--network none` (no pip fetches at run time):
-#   pytest (JUnit XML output, built in) + pydantic (the fixture's only dependency)
-#   + setuptools/wheel (for offline editable installs).
+# Deps are baked in so tests run with `--network none` (no pip fetches at run time). The set
+# covers both fixtures: pydantic (Phase 1) and the Flask→FastAPI migration (Phase 2) — the
+# migrated app imports fastapi/starlette and its TestClient needs httpx; flask is kept so a
+# pre-migration baseline can also run offline. The LLM is told this is the only set available.
 FROM python:3.12-slim-bookworm
 
 # Pinned so the runner image is reproducible.
 RUN pip install --no-cache-dir \
         "pytest==8.3.4" \
         "pydantic==2.13.4" \
+        "fastapi==0.115.6" \
+        "starlette==0.41.3" \
+        "uvicorn==0.34.0" \
+        "httpx==0.28.1" \
+        "flask==3.1.0" \
         "setuptools==75.6.0" \
         "wheel==0.45.1"
 
 COPY run-tests /usr/local/bin/run-tests
 RUN chmod +x /usr/local/bin/run-tests
 
-# Default workdir is the mounted repo; the worker overrides -w to /workspaces/<job_id>.
+# Default workdir is the mounted repo; the worker overrides -w to the workspace/worktree.
 WORKDIR /repo
 CMD ["run-tests"]

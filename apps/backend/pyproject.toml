@@ -23,11 +23,10 @@ dependencies = [
     # MCP client SDK — talks to code-review-graph's `serve` (stdio) MCP server. The CRG
     # server itself is installed isolated in the worker image (uv tool), not here.
     "mcp>=1.2",
+    # LLM model ladder — one interface across Bedrock / Azure OpenAI / Gemini / Anthropic.
+    # Wired in Phase 2 (Execute node). Pinned via uv.lock.
+    "litellm>=1.55",
 ]
-
-# NOTE: litellm is part of the locked stack (model ladder) but is deliberately
-# NOT a Phase 0 dependency — the `llm` interface is a Protocol stub for now.
-# It gets wired (with the real adapter) in Phase 2. Keeping the skeleton lean.
 
 [project.optional-dependencies]
 dev = [

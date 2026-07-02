@@ -1,8 +1,11 @@
 #!/usr/bin/env sh
-# Test runner executed inside the ephemeral sandbox (cwd = the mounted repo workspace).
+# Test runner executed inside the ephemeral sandbox (cwd = the mounted workspace/worktree).
 # Best-effort offline editable install (real repos import the installed package); the
 # fixture also works via pytest's `pythonpath` setting, so install failure is non-fatal.
 # Emits JUnit XML (built into pytest — robust across versions); the Verify node parses it.
+#
+# Extra args are pytest test targets: Verify passes the blast-radius-affected subset,
+# Integrate passes none (the full suite).
 
 if [ -f pyproject.toml ] || [ -f setup.py ]; then
     if pip install -e . --no-build-isolation --no-index --no-deps >/dev/null 2>&1; then
@@ -15,5 +18,5 @@ fi
 # Write the report to a stable path the worker reads back off the shared volume.
 # Do not let a non-zero pytest exit (failing tests) abort before the report is flushed —
 # pytest writes the XML before exiting, so we just propagate its code afterwards.
-pytest --junit-xml=.portage-report.xml -q
+pytest --junit-xml=.portage-report.xml -q "$@"
 exit $?

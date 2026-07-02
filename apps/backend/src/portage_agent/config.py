@@ -61,6 +61,32 @@ class Settings(BaseSettings):
     # Artifact storage (LocalStorage). On the shared volume so reports survive the job.
     artifacts_dir: str = "/workspaces/_artifacts"
 
+    # --- Phase 2: LLM (LiteLLM model ladder) ---
+    # The provider is config, not code: the documented default is Claude Sonnet 4.6 on
+    # Bedrock (plan §5), but any LiteLLM model string + matching provider creds in .env
+    # works — e.g. `azure/<deployment>` (+ AZURE_API_*), `gemini/<model>` (+ GEMINI_API_KEY),
+    # `anthropic/<model>` (+ ANTHROPIC_API_KEY). Swapping providers is an env change.
+    llm_driver_model: str = "bedrock/us.anthropic.claude-sonnet-4-6-v1:0"
+    # Escalation tier is wired in Phase 3 (a measured recovery strategy); declared here so
+    # the ladder is configurable from the start.
+    llm_escalation_model: str = "bedrock/us.anthropic.claude-opus-4-8-v1:0"
+    llm_max_tokens: int = 4096
+    llm_timeout_seconds: int = 120
+    # LiteLLM-level transient-error retries (network/5xx) — NOT the agent's task retry.
+    llm_request_max_retries: int = 2
+    # Opus 4.7+ dropped temperature/top_p/top_k (prompt-steer only). None => omit the param;
+    # combined with litellm drop_params=True this is safe across providers.
+    llm_temperature: float | None = 0.0
+
+    # --- Phase 2: Execute / migration ---
+    # Bounded Execute↔Verify loop (Phase 2 has no rich recovery): the migration is retried
+    # at most this many times, feeding the failing test output back to the model. Phase 3
+    # replaces this with the full Recover taxonomy + model escalation.
+    max_execute_attempts: int = 2
+    # Optional per-task delay in Execute (seconds) — a deterministic window to kill the
+    # worker mid-Execute and prove content-hash resume skips already-applied tasks. 0 normally.
+    execute_task_delay_seconds: int = 0
+
     @property
     def _userinfo(self) -> str:
         return f"{quote_plus(self.postgres_user)}:{quote_plus(self.postgres_password)}"
