@@ -94,3 +94,9 @@ async def worktree_diff(worktree: str) -> str:
     """The migration diff = tracked changes in the worktree vs its clean HEAD."""
     _, out = await run_git("diff", cwd=worktree)
     return out
+
+
+async def file_diff(worktree: str, rel: str) -> str:
+    """One file's migration diff vs the worktree's clean HEAD."""
+    _, out = await run_git("diff", "--", rel, cwd=worktree)
+    return out

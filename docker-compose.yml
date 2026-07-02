@@ -30,6 +30,10 @@ services:
     command: ["sh", "docker/entrypoint-api.sh"]
     ports:
       - "8000:8000"
+    volumes:
+      # Read-only: GET /jobs/{id}/report serves report.json off the shared volume. Only
+      # the worker writes to it.
+      - workspaces:/workspaces:ro
     depends_on:
       db:
         condition: service_healthy

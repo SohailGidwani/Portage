@@ -6,19 +6,22 @@ the graph and never touches the checkpointer.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 
+from portage_agent.db import task_store
 from portage_agent.db.models import Job
 from portage_agent.db.session import AsyncSessionLocal
 from portage_agent.logging_conf import setup_logging
 from portage_agent.worker.queue import PostgresJobQueue
 
-from .schemas import JobCreate, JobOut
+from .schemas import JobCreate, JobOut, TaskOut
 
 setup_logging()
 log = logging.getLogger("portage.api")
@@ -78,3 +81,27 @@ async def list_jobs(limit: int = 50) -> list[Job]:
             await session.execute(select(Job).order_by(Job.created_at.desc()).limit(limit))
         ).scalars().all()
     return list(rows)
+
+
+@app.get("/jobs/{job_id}/tasks", response_model=list[TaskOut])
+async def get_job_tasks(job_id: uuid.UUID) -> list[dict]:
+    """The job's migration plan: file tasks with per-file diffs and the per-attempt
+    tier/model/recovery log — what the dashboard's task tree + recovery timeline render."""
+    await _get_job_or_404(job_id)
+    snapshots = await task_store.load_tasks(job_id)
+    return [s.to_dict() for s in snapshots]
+
+
+@app.get("/jobs/{job_id}/report")
+async def get_job_report(job_id: uuid.UUID) -> dict:
+    """The structured run report (report.json) — includes the full migration diff and the
+    recovery summary. Served off the shared workspaces volume (mounted read-only here)."""
+    job = await _get_job_or_404(job_id)
+    if not job.report_path:
+        raise HTTPException(status_code=404, detail="no report for this job (yet)")
+    try:
+        return json.loads(Path(job.report_path).read_text())
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"report file missing: {job.report_path}"
+        ) from exc

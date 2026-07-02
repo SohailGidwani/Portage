@@ -28,3 +28,28 @@ class JobOut(BaseModel):
     graph_summary: dict | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class SubtaskOut(BaseModel):
+    id: str
+    type: str
+    title: str
+    status: str
+
+
+class TaskOut(BaseModel):
+    """One file-level migration task (+ its transformation subtasks) for the dashboard."""
+
+    id: str
+    type: str
+    title: str
+    target_path: str | None = None
+    status: str
+    attempts: int
+    order_index: int
+    verify_spec: dict
+    content_hash: str | None = None
+    error: str | None = None
+    diff: str | None = None
+    attempts_log: list[dict] = []
+    subtasks: list[SubtaskOut] = []
