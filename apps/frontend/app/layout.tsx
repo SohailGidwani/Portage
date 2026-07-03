@@ -3,7 +3,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Portage",
-  description: "Autonomous code-migration agent — control plane",
+  description:
+    "Autonomous code-migration agent — plans, migrates, verifies, recovers",
 };
 
 export default function RootLayout({

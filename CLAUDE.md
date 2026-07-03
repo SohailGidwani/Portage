@@ -66,18 +66,20 @@ apps/backend/src/portage_agent/
   logging_conf.py  # stdout logging
   core/            # swappable interfaces: storage, queue, sandbox, llm, retrieval (Protocols)
   db/              # SQLAlchemy async base, session, models (Job, Task)
-  agent/           # LangGraph graph (Ingest→Plan→Execute→Verify→Integrate→Report), runner
+  agent/           # LangGraph graph (Ingest→Plan→Execute→Verify→Recover→Integrate→Report), runner
   worker/          # Postgres queue (FOR UPDATE SKIP LOCKED + lease) + worker loop
   api/             # FastAPI app: /health, POST /jobs, GET /jobs/{id}, GET /jobs
   retrieval/       # adapter over code-review-graph (graph + blast-radius), via MCP stdio
   sandbox/         # ephemeral network-off Docker execution + JUnit report parsing
   storage/         # LocalStorage artifact backend (s3 later)
   recipes/         # migration recipes; v1: flask_to_fastapi/
-  llm/             # LiteLLM provider ladder + model-escalation (Phase 3)
-  cli/ mcp/ eval/  # stubs — Phase 4/5
+  llm/             # LiteLLM provider ladder (driver/escalation tiers, provider = env config)
+  eval/            # Phase 4 harness: corpus loader + scenario runner -> runs/metrics tables
+  cli/ mcp/        # stubs — Phase 5
+corpus/                 # pinned eval corpus (corpus.toml + curation criteria in README)
 apps/backend/alembic/   # migrations (Alembic owns domain tables only)
 apps/frontend/          # Next.js App Router dashboard (REST client; observability surface)
-scripts/                # repeatable per-phase DoD checks (dod_check, phase1_check, phase2_check)
+scripts/                # repeatable per-phase DoD checks (dod_check, phase{1,2,3}_check)
 notes/                  # gitignored personal decision log
 ```
 
@@ -112,6 +114,10 @@ docker compose up             # db -> api (migrates) -> worker -> frontend
 Submit a job: `curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
   -d '{"repo_url":"/fixtures/flask_app","migration_recipe":"flask_to_fastapi"}'`
 
+Run the eval harness (worker must be up; writes `runs`/`metrics`):
+`docker compose run --rm worker python -m portage_agent.eval --corpus /corpus/corpus.toml \
+  --k 2 --scenarios baseline,bad_patch` (smoke: `scripts/phase4_smoke.sh`).
+
 Backend dev loop (host): `cd apps/backend && uv sync --extra dev && uv run ruff check src`.
 
 ## Durability model (the core edge)
@@ -128,6 +134,12 @@ Backend dev loop (host): `cd apps/backend && uv sync --extra dev && uv run ruff 
   input); terminal → no-op.
 - **Idempotent Execute:** each Execute step is keyed by job+task+content-hash, so a resume
   after a mid-Execute crash skips tasks already applied instead of re-running them.
+- **Recovery (Phase 3):** a failed Verify routes to Recover, which classifies the failure —
+  crash tracebacks implicate the *deepest planned frame* (targeted `git checkout` rollback +
+  regenerate); framework residue in an unplanned file triggers **replan**; otherwise
+  behavioral retry-all — under budgets (`MAX_TASK_ATTEMPTS`, `MAX_RECOVER_VISITS`); exhausted
+  tasks are rolled back + skipped so the run finishes with an honest report. Verify must feed
+  Recover **stdout + stderr** (conftest-chain import errors only appear on stderr).
 
 ## Phase plan (DoD per phase) — revised per plan v2 §15
 
@@ -138,22 +150,34 @@ Backend dev loop (host): `cd apps/backend && uv sync --extra dev && uv run ruff 
   sandboxed test run (network-off Docker, behind `sandbox`) → structured report, checkpointed;
   Ingest runs exactly once on resume. *DoD:* repo → structured test report + queryable graph
   (`scripts/phase1_check.sh`).
-- **Phase 2 — Autonomous recipe end-to-end (Flask→FastAPI).** Plan → Execute → Verify → green
-  on one small fixture repo. *DoD:* the fixture Flask app is migrated to FastAPI and its full
-  test suite passes, autonomously, checkpointed at every node.
-- **Phase 3 — Recovery.** Content-hash idempotency, bounded retries, replan, model escalation
-  (Sonnet→Opus as a *measured* recovery strategy), git-worktree rollback, checkpoint-resume.
-  *DoD:* injected faults survived.
-- **Phase 4 — Eval harness (the hireable core).** Recipe-agnostic harness, curated corpus
-  (~10–15 small Flask apps), fault injection, K-run mean±variance, per-model rows.
-  *DoD:* metrics report across ≥10 repos with variance. **Don't shortchange this.**
-- **Phase 5 — MCP + CLI (the product wedge).** `portage migrate <repo> --recipe
-  flask-to-fastapi` CLI; MCP server exposing `verify_patch_in_sandbox` / `repo_graph` /
-  `blast_radius`; Claude Code + Cursor configs. *DoD:* Claude Code calls
-  `verify_patch_in_sandbox` to test its own work before writing to disk.
-- **Phase 6 — Dashboard-as-proof + packaging.** Repurpose the Next.js app into the
-  observability/eval/demo surface (live task tree, trace timeline, chaos-recovery view,
-  leaderboard). README + architecture diagram + 2-min demo video + methodology writeup.
+- **Phase 2 — Autonomous recipe end-to-end (Flask→FastAPI) ✅.** Plan → Execute → Verify →
+  green on the bundled fixture, LLM-driven (provider via env; verified on Azure GPT-4o),
+  checkpointed at every node. *DoD:* `scripts/phase2_check.sh`.
+- **Phase 3 — Recovery ✅.** Recover node (classify → targeted git-worktree rollback +
+  regenerate / replan / skip-and-continue, bounded budgets), **measured model escalation**
+  (driver→escalation tier per task attempts, recorded in `tasks.attempts_log`), deterministic
+  fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`), content-hash
+  idempotency, checkpoint-resume. Job-detail API (`/jobs/{id}/tasks`, `/jobs/{id}/report`) +
+  dashboard job-inspection page. *DoD:* injected faults survived (`scripts/phase3_check.sh`).
+- **Phase 4 — Eval harness (the hireable core; now the critical path).** Recipe-agnostic
+  harness; curated corpus of ~10–15 small Flask apps with real test suites (**the long pole —
+  start collecting immediately**); the phase3_check fault scenarios promoted into harness eval
+  cases; K runs per repo with mean±variance; per-model rows; cost per migration. **The harness
+  writes results to `runs`/`metrics` tables — that's the contract the Phase 6 leaderboard
+  reads.** Include a **"known limitations" finding**: document the failure taxonomy honestly
+  (which Flask patterns break it, why) — a results table with analyzed failures is more
+  credible than all-green. *DoD:* metrics report across ≥10 repos with variance.
+- **Phase 5a — CLI (do right after Phase 4).** `portage migrate <repo> --recipe
+  flask-to-fastapi`. Small; makes the eval harness and demos dramatically easier to drive.
+  Not cuttable.
+- **Phase 5b — MCP server (the product wedge; ships after eval numbers exist).**
+  `verify_patch_in_sandbox` / `repo_graph` / `blast_radius`; Claude Code + Cursor configs.
+  The eval numbers are its credibility. **If time gets tight, 5b is the cuttable item.**
+  *DoD:* Claude Code calls `verify_patch_in_sandbox` to test its own work before writing.
+- **Phase 6 — Dashboard-as-proof + packaging (reduced scope).** The dashboard already exists
+  (jobs list + job-detail with task tree / diffs / recovery timeline), so what remains:
+  leaderboard view over the Phase 4 metrics tables, chaos-recovery demo view, the
+  kill-and-resume GIF, README + architecture diagram + methodology writeup.
 
 ## Model ladder (Phase 2+, via LiteLLM)
 

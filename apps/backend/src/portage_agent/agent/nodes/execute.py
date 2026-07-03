@@ -100,8 +100,9 @@ def _gather_context(
 
 async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: str,
                         subtasks: list[Subtask], context: dict[str, str],
-                        verify_errors: str) -> str:
-    """Call the model for one file; return the migrated content (not yet written)."""
+                        verify_errors: str) -> tuple[str, dict]:
+    """Call the model for one file; return (migrated content, usage) — content not yet
+    written. Usage feeds the attempts_log entry (cost-per-migration is an eval metric)."""
     source = read_file(worktree, path, limit=20000) or ""
     planned = PlannedFile(path=path, role=role, subtasks=subtasks)
     user = recipe.build_user_prompt(file=planned, source=source, context=context)
@@ -115,7 +116,12 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
         LLMMessage(role="user", content=user),
     ]
     resp = await get_llm().complete(messages, model=model)
-    return extract_code(resp.text)
+    usage = {
+        "prompt_tokens": resp.prompt_tokens,
+        "completion_tokens": resp.completion_tokens,
+        "cost_usd": round(resp.cost_usd, 6),
+    }
+    return extract_code(resp.text), usage
 
 
 async def execute_node(state: GraphState) -> GraphState:
@@ -167,7 +173,7 @@ async def execute_node(state: GraphState) -> GraphState:
             context = _gather_context(worktree, current=path, target_paths=target_paths,
                                       done_paths=done_paths)
             subtasks = [Subtask(s.type, s.title, "") for s in t.subtasks]
-            content = await _migrate_file(
+            content, usage = await _migrate_file(
                 recipe, worktree, path=path, role=t.type, model=model,
                 subtasks=subtasks, context=context, verify_errors=verify_errors,
             )
@@ -179,7 +185,8 @@ async def execute_node(state: GraphState) -> GraphState:
             h = write_file(worktree, path, content)
             diff = await file_diff(worktree, path)
             await task_store.update_task(t.id, status=TaskStatus.done.value,
-                                         content_hash=h, diff=diff, cascade_subtasks=True)
+                                         content_hash=h, diff=diff, cascade_subtasks=True,
+                                         amend_last_attempt=usage)
             done_paths.add(path)
             log.info("  migrated %s (attempt=%s tier=%s model=%s, %s chars)",
                      path, attempt, tier, model_label, len(content))

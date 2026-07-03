@@ -1,14 +1,24 @@
+/* Portage — observability surface for an autonomous code-migration agent.
+   Design language: a portage is the overland carry between two navigable waters.
+   The palette is the night river: two waters (upstream amber = source framework,
+   downstream green = target), rapids red for failure, channel blue for wayfinding.
+   Monospace is the display voice — this tool's content IS code. */
+
 :root {
-  --bg: #0b0f17;
-  --panel: #131a26;
-  --border: #232c3b;
-  --text: #e6edf3;
-  --muted: #8b97a7;
-  --accent: #4f9cf9;
-  --queued: #b0b8c4;
-  --running: #f5b942;
-  --done: #46c98b;
-  --failed: #f06a6a;
+  --ink: #0a0e14; /* page: blue-black night */
+  --deck: #10161f; /* panel */
+  --hull: #161f2b; /* raised surface inside a panel */
+  --line: #243040; /* hairline */
+  --foam: #e9eef4; /* primary text */
+  --mist: #8494a6; /* secondary text */
+  --downstream: #46c98b; /* target water: success, additions */
+  --upstream: #e3a94f; /* source shore: running, escalation */
+  --rapids: #ef6659; /* failure, deletions */
+  --channel: #62a8dc; /* links, info, focus */
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Code",
+    Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    sans-serif;
 }
 
 * {
@@ -17,16 +27,111 @@
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--ink);
+  color: var(--foam);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
 
 main {
-  max-width: 880px;
+  max-width: 960px;
   margin: 0 auto;
-  padding: 48px 24px 96px;
+  padding: 40px 24px 120px;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.93em;
+}
+
+a {
+  color: var(--channel);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--channel);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ---------------------------------------------------------------- masthead */
+.masthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 28px;
+}
+
+.wordmark {
+  font-family: var(--mono);
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  margin: 0;
+  color: var(--foam);
+}
+
+.wordmark a {
+  color: inherit;
+}
+
+.wordmark a:hover {
+  text-decoration: none;
+}
+
+.tagline {
+  display: block;
+  font-family: var(--sans);
+  font-weight: 400;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+  color: var(--mist);
+  margin-top: 4px;
+}
+
+.syscheck {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mist);
+  letter-spacing: 0.04em;
+}
+
+.syscheck .ok {
+  color: var(--downstream);
+}
+
+.syscheck .bad {
+  color: var(--rapids);
+}
+
+/* ------------------------------------------------------------------ panels */
+.panel {
+  background: var(--deck);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--mist);
+  margin: 36px 0 12px;
 }
 
 .row {
@@ -36,169 +141,548 @@ main {
   flex-wrap: wrap;
 }
 
+/* ----------------------------------------------------------------- controls */
 input,
 select,
 button {
   font: inherit;
-  color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--border);
+  color: var(--foam);
+  background: var(--hull);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 9px 12px;
+}
+
+input,
+select {
+  font-family: var(--mono);
+  font-size: 13px;
 }
 
 button {
-  background: var(--accent);
-  color: #06121f;
+  background: var(--channel);
+  color: var(--ink);
   border: none;
-  font-weight: 600;
+  font-weight: 650;
   cursor: pointer;
 }
 
+button:hover {
+  filter: brightness(1.1);
+}
+
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: default;
 }
 
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
+/* ------------------------------------------------------------------ status */
+.status {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  white-space: nowrap;
+}
+
+.status::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 7px;
+  vertical-align: 0;
+  background: var(--mist);
+}
+
+.s-queued {
+  color: var(--mist);
+}
+
+.s-running {
+  color: var(--upstream);
+}
+
+.s-running::before {
+  background: var(--upstream);
+  animation: pulse-amber 1.6s ease-out infinite;
+}
+
+.s-done {
+  color: var(--downstream);
+}
+
+.s-done::before {
+  background: var(--downstream);
+}
+
+.s-failed,
+.s-skipped {
+  color: var(--rapids);
+}
+
+.s-failed::before,
+.s-skipped::before {
+  background: var(--rapids);
+}
+
+.s-pending {
+  color: var(--mist);
+}
+
+/* error strip */
+.errband {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--rapids);
+  background: rgba(239, 102, 89, 0.07);
+  border: 1px solid rgba(239, 102, 89, 0.35);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 14px;
+  white-space: pre-wrap;
+}
+
+/* ------------------------------------------------------------------- stats */
+.statgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.stat {
+  background: var(--deck);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.stat-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--mist);
+}
+
+.stat-value {
+  font-family: var(--mono);
+  font-size: 23px;
+  font-weight: 650;
+  margin-top: 6px;
+  line-height: 1.2;
+}
+
+.stat-value small {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--mist);
+  letter-spacing: 0.02em;
+}
+
+/* ------------------------------------------------------------------- table */
+.tablewrap {
+  overflow-x: auto;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 th,
 td {
   text-align: left;
-  padding: 10px 8px;
-  border-bottom: 1px solid var(--border);
+  padding: 11px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+tr:last-child td {
+  border-bottom: none;
 }
 
 th {
-  color: var(--muted);
-  font-weight: 500;
-}
-
-.badge {
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: 10.5px;
   font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.13em;
+  color: var(--mist);
 }
 
-.s-queued {
-  color: var(--queued);
-  background: #1c2330;
+tbody tr:hover td {
+  background: rgba(98, 168, 220, 0.045);
 }
-.s-running {
-  color: var(--running);
-  background: #2a2410;
-}
-.s-done {
-  color: var(--done);
-  background: #102a1d;
-}
-.s-failed {
-  color: var(--failed);
-  background: #2a1212;
+
+td.mono,
+.mono {
+  font-family: var(--mono);
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--mist);
 }
 
-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
+/* tests meter */
+.meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-family: var(--mono);
+  font-size: 12.5px;
 }
 
-a {
-  color: var(--accent);
-  text-decoration: none;
+.meter-bar {
+  width: 54px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
 }
 
-a:hover {
-  text-decoration: underline;
+.meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--downstream);
 }
 
-/* --- job detail: summary cards --- */
-.cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
-  margin-top: 24px;
+.meter-fill.bad {
+  background: var(--rapids);
 }
 
-.card .big {
-  font-size: 22px;
+/* ----------------------------------------------------- the route (signature) */
+.route {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 26px 18px 20px;
+  margin-top: 20px;
+  overflow-x: auto;
+}
+
+.water {
+  font-family: var(--mono);
+  font-size: 11px;
   font-weight: 600;
-  margin-top: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  padding: 5px 11px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+  white-space: nowrap;
+  margin-top: -3px;
 }
 
-/* --- job detail: subtask chips + attempt timeline --- */
+.water-src {
+  color: var(--upstream);
+  border-color: rgba(227, 169, 79, 0.4);
+}
+
+.water-dst {
+  color: var(--downstream);
+  border-color: rgba(70, 201, 139, 0.4);
+}
+
+.waypoints {
+  display: flex;
+  flex: 1;
+  list-style: none;
+  margin: 0;
+  padding: 0 4px;
+  min-width: 480px;
+}
+
+.wp {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  position: relative;
+  min-width: 58px;
+}
+
+/* trail segment connecting each waypoint to the previous one */
+.wp::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: calc(-50% + 13px);
+  right: calc(50% + 13px);
+  border-top: 2px dashed var(--line);
+}
+
+.wp:first-child::before {
+  display: none;
+}
+
+.wp.is-done::before {
+  border-color: rgba(70, 201, 139, 0.55);
+}
+
+.wp.is-active::before {
+  border-color: rgba(227, 169, 79, 0.55);
+}
+
+.wp-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--mist);
+  background: var(--ink);
+  z-index: 1;
+}
+
+.wp.is-done .wp-dot {
+  background: var(--downstream);
+  border-color: var(--downstream);
+}
+
+.wp.is-active .wp-dot {
+  background: var(--upstream);
+  border-color: var(--upstream);
+  animation: pulse-amber 1.6s ease-out infinite;
+}
+
+/* recover: the conditional detour — a diamond, dim until engaged */
+.wp-diamond .wp-dot {
+  border-radius: 2.5px;
+  transform: rotate(45deg);
+}
+
+.wp.is-off .wp-dot {
+  border-color: var(--line);
+}
+
+.wp.is-off .wp-name {
+  color: var(--line);
+}
+
+.wp.is-detour .wp-dot {
+  background: var(--upstream);
+  border-color: var(--upstream);
+}
+
+.wp.is-detour .wp-name {
+  color: var(--upstream);
+}
+
+.wp-name {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--mist);
+}
+
+.wp.is-done .wp-name {
+  color: var(--foam);
+}
+
+.wp.is-active .wp-name {
+  color: var(--upstream);
+}
+
+/* ------------------------------------------------------------- task cards */
+.taskcard {
+  background: var(--deck);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+
+.taskhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.taskpath {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.rolelabel {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--mist);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 2px 7px;
+  margin-left: 10px;
+}
+
+.chips {
+  margin-top: 9px;
+}
+
 .chip {
   display: inline-block;
-  font-size: 12px;
-  color: var(--muted);
-  background: #1c2330;
-  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mist);
+  background: var(--hull);
+  border: 1px solid var(--line);
   border-radius: 999px;
   padding: 2px 10px;
   margin: 0 6px 6px 0;
 }
 
-.timeline {
-  list-style: none;
-  margin: 8px 0 0;
-  padding: 0 0 0 4px;
-}
-
-.timeline li {
-  padding: 4px 0;
-  border-left: 2px solid var(--border);
-  padding-left: 12px;
+details {
+  margin-top: 10px;
 }
 
 details > summary {
   cursor: pointer;
   user-select: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--mist);
 }
 
-/* --- diff rendering --- */
+details > summary:hover {
+  color: var(--foam);
+}
+
+details[open] > summary {
+  color: var(--foam);
+  margin-bottom: 6px;
+}
+
+/* --------------------------------------------------------- attempt timeline */
+.timeline {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.timeline li {
+  position: relative;
+  padding: 5px 0 5px 16px;
+  border-left: 1px solid var(--line);
+}
+
+.timeline li::before {
+  content: "";
+  position: absolute;
+  left: -3.5px;
+  top: 11px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--mist);
+}
+
+.timeline li.t-escalation::before {
+  background: var(--upstream);
+}
+
+.timeline li.t-recover::before {
+  background: var(--rapids);
+}
+
+.timeline .tag {
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 10.5px;
+  margin-right: 8px;
+}
+
+.timeline .t-escalation .tag {
+  color: var(--upstream);
+}
+
+.timeline .t-recover .tag {
+  color: var(--rapids);
+}
+
+/* -------------------------------------------------------------------- diff */
 .diff {
   margin: 8px 0 0;
-  padding: 12px;
-  background: #0d1320;
-  border: 1px solid var(--border);
+  padding: 10px 0;
+  background: var(--ink);
+  border: 1px solid var(--line);
   border-radius: 8px;
   overflow-x: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--mono);
   font-size: 12.5px;
-  line-height: 1.5;
+  line-height: 1.55;
+}
+
+.diff span {
+  display: block;
+  padding: 0 14px;
+  white-space: pre;
 }
 
 .dl-add {
-  color: var(--done);
-  background: rgba(70, 201, 139, 0.08);
+  color: #86dcb0;
+  background: rgba(70, 201, 139, 0.09);
 }
 
 .dl-del {
-  color: var(--failed);
-  background: rgba(240, 106, 106, 0.08);
+  color: #f29b93;
+  background: rgba(239, 102, 89, 0.09);
 }
 
 .dl-hunk {
-  color: var(--accent);
+  color: var(--channel);
+  padding-top: 4px;
+}
+
+.dl-file {
+  color: var(--foam);
+  font-weight: 700;
+  border-top: 1px solid var(--line);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.diff span.dl-file:first-child {
+  border-top: none;
+  margin-top: 0;
+  padding-top: 0;
 }
 
 .dl-meta {
-  color: var(--muted);
+  color: var(--mist);
+}
+
+/* ------------------------------------------------------------------ motion */
+@keyframes pulse-amber {
+  0% {
+    box-shadow: 0 0 0 0 rgba(227, 169, 79, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(227, 169, 79, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(227, 169, 79, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
 }
