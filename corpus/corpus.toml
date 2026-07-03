@@ -1,0 +1,12 @@
+# Portage eval corpus — the pinned benchmark set (plan §11).
+# Every entry must be reproducible: bundled fixtures ship in-repo; remote repos get a
+# pinned `ref` (commit SHA). Selection criteria live in README.md next to this file.
+
+version = 1
+
+[[repos]]
+name = "flask-items-fixture"
+repo_url = "/fixtures/flask_app"
+recipe = "flask_to_fastapi"
+source = "bundled"
+notes = "Bundled Phase-2 fixture: app factory, blueprint, query/JSON parsing, error handlers, 6 behavioural tests. Offline-clean dependencies."

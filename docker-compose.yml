@@ -58,6 +58,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # The Phase 1 fixture repo, so Ingest can clone it (repo_url=/fixtures/sample_repo).
       - ./apps/backend/tests/fixtures:/fixtures:ro
+      # Eval corpus manifest (Phase 4). The harness runs as `docker compose run --rm
+      # worker python -m portage_agent.eval` and reads /corpus/corpus.toml.
+      - ./corpus:/corpus:ro
     depends_on:
       db:
         condition: service_healthy

@@ -1,8 +1,9 @@
 "use client";
 
 // Job detail — the "what migrated, what changed, how" view.
-// Task tree (file tasks + transformation subtasks), per-file diffs, the per-attempt
-// tier/model timeline (the measured-escalation record), and the full migration diff.
+// The hero is the route: the agent's actual state machine drawn as a waypoint trail
+// between the two waters (source framework → target framework). Every light on it is
+// derived from real state (job row, task rows, report) — nothing is decorative.
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
@@ -18,21 +19,78 @@ import {
   getJobTasks,
 } from "../../lib/api";
 
+type WpState = "done" | "active" | "pending" | "off" | "detour";
+type Waypoint = { name: string; state: WpState; diamond?: boolean };
+
+// Derive each pipeline stage's state from what the run has actually produced.
+// While running: tasks appear when Plan persists them; attempts_log streams during
+// Execute/Recover; the report exists only once the run finishes.
+function deriveRoute(job: Job | null, tasks: Task[], report: Report | null): Waypoint[] {
+  const fileTasks = tasks.filter((t) => t.target_path);
+  const planned = fileTasks.length > 0;
+  const allSettled =
+    planned && fileTasks.every((t) => t.status === "done" || t.status === "skipped");
+  const recovered =
+    (report?.recovery?.visits ?? 0) > 0 ||
+    tasks.some((t) =>
+      t.attempts_log.some((a) => (a.action ?? "").startsWith("rollback"))
+    );
+  const finished = job?.status === "done" || job?.status === "failed";
+  const running = job?.status === "running";
+
+  const st = (done: boolean, active: boolean): WpState =>
+    done ? "done" : active ? "active" : "pending";
+
+  return [
+    { name: "ingest", state: st(planned || finished, running && !planned) },
+    { name: "plan", state: st(planned || finished, false) },
+    { name: "execute", state: st(allSettled || finished, running && planned && !allSettled) },
+    { name: "verify", state: st(finished, running && allSettled) },
+    {
+      name: "recover",
+      state: recovered ? "detour" : "off",
+      diamond: true,
+    },
+    { name: "integrate", state: st(finished, false) },
+    { name: "report", state: st(finished, false) },
+  ];
+}
+
+function Route({ job, tasks, report }: { job: Job | null; tasks: Task[]; report: Report | null }) {
+  const migrating = job?.migration_recipe === "flask_to_fastapi";
+  const src = migrating ? "flask" : "repo";
+  const dst = migrating ? "fastapi" : "report";
+  return (
+    <div className="panel route" aria-label="migration pipeline">
+      <span className="water water-src">{src}</span>
+      <ol className="waypoints">
+        {deriveRoute(job, tasks, report).map((w) => (
+          <li key={w.name} className={`wp is-${w.state}${w.diamond ? " wp-diamond" : ""}`}>
+            <span className="wp-dot" />
+            <span className="wp-name">{w.name}</span>
+          </li>
+        ))}
+      </ol>
+      <span className="water water-dst">{dst}</span>
+    </div>
+  );
+}
+
 function DiffBlock({ diff }: { diff: string }) {
   if (!diff.trim()) return <p className="muted">No changes.</p>;
   return (
     <pre className="diff">
       {diff.split("\n").map((line, i) => {
-        let cls = "";
-        if (line.startsWith("+++") || line.startsWith("---")) cls = "dl-meta";
-        else if (line.startsWith("diff --git") || line.startsWith("index ")) cls = "dl-meta";
+        let cls = "dl-ctx";
+        if (line.startsWith("diff --git")) cls = "dl-file";
+        else if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("index "))
+          cls = "dl-meta";
         else if (line.startsWith("@@")) cls = "dl-hunk";
         else if (line.startsWith("+")) cls = "dl-add";
         else if (line.startsWith("-")) cls = "dl-del";
         return (
           <span key={i} className={cls}>
-            {line}
-            {"\n"}
+            {line || " "}
           </span>
         );
       })}
@@ -40,11 +98,11 @@ function DiffBlock({ diff }: { diff: string }) {
   );
 }
 
-function TestsBadge({ s }: { s: TestSummary | null | undefined }) {
+function TestsCell({ s }: { s: TestSummary | null | undefined }) {
   if (!s || !s.total) return <span className="muted">—</span>;
   const ok = s.failed + s.errors === 0;
   return (
-    <span className={`badge ${ok ? "s-done" : "s-failed"}`}>
+    <span className={`mono ${ok ? "s-done" : "s-failed"}`} style={{ fontWeight: 650 }}>
       {s.passed}/{s.total}
     </span>
   );
@@ -53,21 +111,19 @@ function TestsBadge({ s }: { s: TestSummary | null | undefined }) {
 function AttemptLine({ a }: { a: AttemptEntry }) {
   const when = a.at ? new Date(a.at).toLocaleTimeString() : "";
   if (a.action === "migrate") {
+    const esc = a.tier === "escalation";
     return (
-      <li>
-        <span className={`badge ${a.tier === "escalation" ? "s-running" : "s-queued"}`}>
-          attempt {a.attempt} · {a.tier}
-        </span>{" "}
-        <code>{a.model}</code> <span className="muted">{when}</span>
+      <li className={esc ? "t-escalation" : ""}>
+        <span className="tag">{esc ? "escalation" : "driver"}</span>
+        attempt {a.attempt} · {a.model} <span className="muted">{when}</span>
       </li>
     );
   }
   return (
-    <li>
-      <span className="badge s-failed">{a.action}</span>{" "}
-      <span className="muted">
-        {a.reason ? `after ${a.reason} failure` : ""} · recover visit {a.visit} · {when}
-      </span>
+    <li className="t-recover">
+      <span className="tag">{(a.action ?? "recover").replaceAll("_", " ")}</span>
+      {a.reason ? `${a.reason} failure` : ""} · visit {a.visit}{" "}
+      <span className="muted">{when}</span>
     </li>
   );
 }
@@ -101,110 +157,103 @@ export default function JobDetail() {
 
   const recovery = report?.recovery;
   const fileTasks = tasks.filter((t) => t.target_path);
+  const done = fileTasks.filter((t) => t.status === "done").length;
 
   return (
     <main>
-      <p style={{ marginBottom: 8 }}>
-        <Link href="/" className="muted">
-          ← Jobs
-        </Link>
-      </p>
-      <h1 style={{ marginBottom: 4 }}>
-        Job <code>{id?.slice(0, 8)}</code>{" "}
-        {job && <span className={`badge s-${job.status}`}>{job.status}</span>}
-      </h1>
-      {job && (
-        <p className="muted" style={{ marginTop: 0 }}>
-          <code>{job.migration_recipe}</code> on <code>{job.repo_url}</code> · updated{" "}
-          {new Date(job.updated_at).toLocaleTimeString()}
-        </p>
-      )}
-      {error && <p className="s-failed badge">{error}</p>}
-      {job?.error && (
-        <p className="s-failed badge" style={{ whiteSpace: "pre-wrap" }}>
-          {job.error}
-        </p>
-      )}
+      <header className="masthead">
+        <h1 className="wordmark">
+          <Link href="/">PORTAGE</Link>
+          <span className="tagline mono">
+            run {id?.slice(0, 8)} · {job?.migration_recipe ?? "…"} ·{" "}
+            {job?.repo_url ?? ""}
+          </span>
+        </h1>
+        {job && <span className={`status s-${job.status}`}>{job.status}</span>}
+      </header>
 
-      <div className="cards">
-        <div className="panel card">
-          <div className="muted">Full suite</div>
-          <div className="big">
-            <TestsBadge s={job?.test_summary} />
+      {error && <p className="errband">{error}</p>}
+      {job?.error && <p className="errband">{job.error}</p>}
+
+      <Route job={job} tasks={tasks} report={report} />
+
+      <div className="statgrid">
+        <div className="stat">
+          <div className="stat-label">full suite</div>
+          <div className="stat-value">
+            <TestsCell s={job?.test_summary} />
           </div>
         </div>
-        <div className="panel card">
-          <div className="muted">Affected subset (Verify)</div>
-          <div className="big">
-            <TestsBadge s={report?.verify_summary} />
+        <div className="stat">
+          <div className="stat-label">affected subset</div>
+          <div className="stat-value">
+            <TestsCell s={report?.verify_summary} />
           </div>
         </div>
-        <div className="panel card">
-          <div className="muted">Tasks</div>
-          <div className="big">
-            {fileTasks.filter((t) => t.status === "done").length}/{fileTasks.length}{" "}
-            <span className="muted" style={{ fontSize: 13 }}>
-              done
-            </span>
-          </div>
-        </div>
-        <div className="panel card">
-          <div className="muted">Recovery</div>
-          <div className="big">
-            {recovery ? (
+        <div className="stat">
+          <div className="stat-label">files migrated</div>
+          <div className="stat-value">
+            {fileTasks.length ? (
               <>
-                {recovery.visits}{" "}
-                <span className="muted" style={{ fontSize: 13 }}>
-                  visit{recovery.visits === 1 ? "" : "s"}
-                  {recovery.escalation_attempted > 0 &&
-                    ` · escalation rescued ${recovery.escalation_rescued}/${recovery.escalation_attempted}`}
-                  {recovery.tasks_skipped > 0 && ` · ${recovery.tasks_skipped} skipped`}
-                </span>
+                {done}/{fileTasks.length}
               </>
             ) : (
               <span className="muted">—</span>
             )}
           </div>
         </div>
+        <div className="stat">
+          <div className="stat-label">recovery</div>
+          <div className="stat-value">
+            {recovery && recovery.visits > 0 ? (
+              <>
+                {recovery.visits}{" "}
+                <small>
+                  visit{recovery.visits === 1 ? "" : "s"}
+                  {recovery.escalation_attempted > 0 &&
+                    ` · escalation ${recovery.escalation_rescued}/${recovery.escalation_attempted}`}
+                  {recovery.tasks_skipped > 0 && ` · ${recovery.tasks_skipped} skipped`}
+                </small>
+              </>
+            ) : (
+              <span className="muted">{recovery ? "not needed" : "—"}</span>
+            )}
+          </div>
+        </div>
       </div>
 
-      <h2 style={{ marginTop: 32 }}>Migration tasks</h2>
+      <h2 className="eyebrow">Migrated files</h2>
       {fileTasks.length === 0 && (
         <div className="panel muted">
-          No migration tasks — this recipe didn&apos;t apply to the repo (verify-only run).
+          No migration tasks — the recipe didn&apos;t apply, so the run verified the repo
+          as-is.
         </div>
       )}
       {fileTasks.map((t) => (
-        <div className="panel" style={{ marginBottom: 12 }} key={t.id}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <div>
-              <code>{t.target_path}</code>{" "}
-              <span className="badge s-queued">{t.type}</span>{" "}
-              <span className={`badge s-${t.status === "skipped" ? "failed" : t.status}`}>
-                {t.status}
+        <div className="taskcard" key={t.id}>
+          <div className="taskhead">
+            <span className="taskpath">
+              {t.target_path}
+              <span className="rolelabel">{t.type}</span>
+            </span>
+            <span className="row" style={{ gap: 14 }}>
+              <span className="muted mono" style={{ fontSize: 12 }}>
+                {t.attempts} attempt{t.attempts === 1 ? "" : "s"}
               </span>
-            </div>
-            <div className="muted">
-              {t.attempts} attempt{t.attempts === 1 ? "" : "s"}
-            </div>
+              <span className={`status s-${t.status}`}>{t.status}</span>
+            </span>
           </div>
-          <div style={{ marginTop: 8 }}>
+          <div className="chips">
             {t.subtasks.map((s) => (
               <span className="chip" key={s.id} title={s.title}>
-                {s.type}
+                {s.type.replaceAll("_", " ")}
               </span>
             ))}
           </div>
-          {t.error && (
-            <p className="s-failed badge" style={{ marginTop: 8 }}>
-              {t.error}
-            </p>
-          )}
+          {t.error && <p className="errband">{t.error}</p>}
           {t.attempts_log.length > 0 && (
-            <details style={{ marginTop: 8 }}>
-              <summary className="muted">
-                Attempt timeline ({t.attempts_log.length} entries)
-              </summary>
+            <details>
+              <summary>attempt log · {t.attempts_log.length}</summary>
               <ul className="timeline">
                 {t.attempts_log.map((a, i) => (
                   <AttemptLine a={a} key={i} />
@@ -213,8 +262,8 @@ export default function JobDetail() {
             </details>
           )}
           {t.diff && (
-            <details style={{ marginTop: 8 }}>
-              <summary className="muted">What changed (diff)</summary>
+            <details>
+              <summary>diff</summary>
               <DiffBlock diff={t.diff} />
             </details>
           )}
@@ -223,8 +272,8 @@ export default function JobDetail() {
 
       {report?.diff ? (
         <>
-          <h2 style={{ marginTop: 32 }}>Full migration diff</h2>
-          <div className="panel">
+          <h2 className="eyebrow">Full migration diff</h2>
+          <div className="panel" style={{ padding: "6px 10px 10px" }}>
             <DiffBlock diff={report.diff} />
           </div>
         </>

@@ -42,6 +42,16 @@ async def report_node(state: GraphState) -> GraphState:
         "escalation_rescued": sum(1 for t in escalation_tasks if t.get("status") == "done"),
     }
 
+    # Job-level LLM usage, summed over every attempt of every task (retries included) —
+    # cost-per-migration is a first-class eval metric (plan §11).
+    attempts = [a for t in plan for a in t.get("attempts_log", [])]
+    llm_usage = {
+        "calls": sum(1 for a in attempts if a.get("action") == "migrate"),
+        "prompt_tokens": sum(a.get("prompt_tokens", 0) for a in attempts),
+        "completion_tokens": sum(a.get("completion_tokens", 0) for a in attempts),
+        "cost_usd": round(sum(a.get("cost_usd", 0.0) for a in attempts), 6),
+    }
+
     report = {
         "job_id": job_id,
         "repo_url": state.get("repo_url"),
@@ -54,6 +64,7 @@ async def report_node(state: GraphState) -> GraphState:
         "tasks_done": tasks_done,
         "affected_tests": state.get("affected_tests", []),
         "recovery": recovery,
+        "llm_usage": llm_usage,
         "verify_summary": verify_summary,
         "integrate_summary": integrate_summary,
         "test_summary": final,

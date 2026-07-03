@@ -1,9 +1,10 @@
 """Domain ORM models.
 
-Phase 0–1: ``jobs``. Phase 2 adds ``tasks`` — the hierarchical migration plan (Job → Tasks
-→ Subtasks), modelled as one self-referential table (``parent_id`` NULL = a top-level file
-Task; non-NULL = a Subtask). The richer events/artifacts/metrics tables from plan §10 stay
-deferred to Phase 4 — adding them now would be premature.
+Phase 0–1: ``jobs``. Phase 2: ``tasks`` — the hierarchical migration plan (Job → Tasks →
+Subtasks), one self-referential table (``parent_id`` NULL = a top-level file Task; non-NULL
+= a Subtask). Phase 4: ``runs`` + ``metrics`` — the eval harness's output and the contract
+the Phase 6 leaderboard reads (plan §10/§11). The ``events`` table stays deferred until
+something needs it.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -124,3 +125,77 @@ class Task(Base):
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         kind = "Subtask" if self.parent_id else "Task"
         return f"<{kind} {self.type} {self.target_path or ''} {self.status}>"
+
+
+class EvalRun(Base):
+    """One harness-driven migration run: (suite, corpus repo, scenario, k) → one job,
+    harvested into a flat row the leaderboard and the aggregator read. `suite` identifies
+    one harness invocation (a batch of runs compared together)."""
+
+    __tablename__ = "runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    suite: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    corpus_name: Mapped[str] = mapped_column(String, nullable=False)
+    repo_url: Mapped[str] = mapped_column(String, nullable=False)
+    recipe: Mapped[str] = mapped_column(String, nullable=False)
+    scenario: Mapped[str] = mapped_column(String(48), nullable=False)  # baseline | fault name
+    k_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    driver_model: Mapped[str] = mapped_column(String, nullable=False)
+    escalation_model: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Outcome. status: green (job done + full suite passed) | red (finished, suite not
+    # green) | error (job failed) | timeout (harness gave up waiting).
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    tests_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tests_passed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tasks_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tasks_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tasks_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recover_visits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    escalation_attempted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    escalation_rescued: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    llm_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    wall_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"<EvalRun {self.corpus_name}/{self.scenario} k={self.k_index} {self.status}>"
+
+
+class EvalMetric(Base):
+    """One aggregated statistic: (suite, corpus repo, scenario, driver model, metric) →
+    mean ± variance over the K runs. Written by the harness aggregator; read by the
+    leaderboard. K-runs with variance is the plan-§11 rigor signal."""
+
+    __tablename__ = "metrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    suite: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    corpus_name: Mapped[str] = mapped_column(String, nullable=False)
+    scenario: Mapped[str] = mapped_column(String(48), nullable=False)
+    driver_model: Mapped[str] = mapped_column(String, nullable=False)
+    metric: Mapped[str] = mapped_column(String(48), nullable=False)
+    k: Mapped[int] = mapped_column(Integer, nullable=False)
+    mean: Mapped[float] = mapped_column(Float, nullable=False)
+    variance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"<EvalMetric {self.metric} {self.mean:.3f}±{self.variance:.3f} k={self.k}>"

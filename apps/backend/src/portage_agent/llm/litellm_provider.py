@@ -52,9 +52,16 @@ class LiteLLMProvider:
 
         text = (resp.choices[0].message.content or "").strip()
         usage = getattr(resp, "usage", None)
+        try:
+            # Priced from the response's underlying model (e.g. gpt-4o-2024-08-06), so an
+            # Azure deployment alias still resolves. Unpriceable models cost 0.0, not an error.
+            cost = float(litellm.completion_cost(completion_response=resp))
+        except Exception:
+            cost = 0.0
         return LLMResponse(
             text=text,
             model=getattr(resp, "model", model) or model,
             prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
             completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            cost_usd=cost,
         )

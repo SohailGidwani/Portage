@@ -91,6 +91,10 @@ class LLMResponse:
     model: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Best-effort USD cost of this call (0.0 when the provider can't price the model).
+    # Cost-per-migration is a first-class eval metric (plan §11), so it's tracked from
+    # the response on down rather than re-derived later.
+    cost_usd: float = 0.0
 
 
 @dataclass(slots=True)
