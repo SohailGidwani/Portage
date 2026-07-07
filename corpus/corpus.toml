@@ -8,5 +8,28 @@ version = 1
 name = "flask-items-fixture"
 repo_url = "/fixtures/flask_app"
 recipe = "flask_to_fastapi"
+tier = "baseline"
+stresses = ["routing", "blueprints", "error_handlers", "query_json_parsing"]
 source = "bundled"
 notes = "Bundled Phase-2 fixture: app factory, blueprint, query/JSON parsing, error handlers, 6 behavioural tests. Offline-clean dependencies."
+
+[[repos]]
+name = "minimal-flask-api"
+repo_url = "https://github.com/markdouthwaite/minimal-flask-api"
+recipe = "flask_to_fastapi"
+ref = "91ae6abe493bef44fb21e4b9c34e8e94d9d2eae9"
+test_args = ["tests/test_api.py"]
+tier = "baseline"
+stresses = ["routing", "json_body", "error_handlers"]
+source = "github"
+notes = "MIT. 2 tests, green in sandbox 2026-07-07. Locust load test excluded via test_args (needs network)."
+
+[[repos]]
+name = "flask-restx-api"
+repo_url = "https://github.com/Anishmourya/flask-restx-api"
+recipe = "flask_to_fastapi"
+ref = "6e64a22ce14dd97d69809c3b50cb5781918fd1d4"
+tier = "framework"
+stresses = ["flask_restx", "namespaces", "marshalling"]
+source = "github"
+notes = "MIT. 4 tests, green in sandbox 2026-07-07. Flask-RESTX namespaces/marshalling -> routers + Pydantic: expected-hard (taxonomy tier 7); failures here feed the known-limitations finding. flask-restx==1.3.0 baked into the sandbox image."

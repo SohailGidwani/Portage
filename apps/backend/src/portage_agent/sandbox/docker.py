@@ -37,16 +37,24 @@ class DockerSandbox:
         self.mount = mount or settings.workspaces_mount
 
     async def run(
-        self, command: list[str], *, workdir: str, timeout: int | None = None
+        self, command: list[str], *, workdir: str, timeout: int | None = None,
+        env: dict[str, str] | None = None,
     ) -> SandboxResult:
+        """`env` = extra environment for the test process (e.g. a corpus repo's
+        TEST_DATABASE_URI pointed at sqlite so its suite runs offline). Values come from
+        the pinned corpus manifest — config, not user input."""
         timeout = timeout or settings.sandbox_timeout_seconds
         name = f"portage-sbx-{uuid.uuid4().hex[:12]}"
+        env_args: list[str] = []
+        for k, v in (env or {}).items():
+            env_args += ["-e", f"{k}={v}"]
         docker_args = [
             "docker", "run", "--rm", "--name", name,
             "--network", "none",
             "--cpus", settings.sandbox_cpus,
             "--memory", settings.sandbox_memory,
             "--pids-limit", str(settings.sandbox_pids_limit),
+            *env_args,
             "-v", f"{self.volume}:{self.mount}",
             "-w", workdir,
             self.image,

@@ -57,15 +57,20 @@ def _rel(path: str, workspace: str) -> str:
 
 
 async def _build_specs(
-    planned: list[PlannedFile], workspace: str
+    planned: list[PlannedFile], workspace: str, *, use_graph: bool = True
 ) -> tuple[list[dict], set[str]]:
-    """Turn the recipe's planned files into persistable task specs (+ affected tests)."""
-    provider = MCPRetrievalProvider(workspace)
+    """Turn the recipe's planned files into persistable task specs (+ affected tests).
+
+    ``use_graph=False`` (Ingest couldn't build a graph) skips blast-radius entirely —
+    Verify then runs the sanctioned/full suite, which is the conservative fallback."""
+    provider = MCPRetrievalProvider(workspace) if use_graph else None
     affected: set[str] = set()
     specs: list[dict] = []
     for pf in planned:
         vspec = pf.verify_spec()
         try:
+            if provider is None:
+                raise RuntimeError("no graph available")
             blast = await provider.blast_radius([pf.path])
             raw: set[str] = set()
             _collect_test_files(blast, raw)
@@ -73,7 +78,9 @@ async def _build_specs(
             vspec["affected_tests"] = sorted(tests)
             affected |= tests
         except Exception as exc:  # pragma: no cover - blast-radius is best-effort here
-            log.warning("blast-radius failed for %s: %s — falling back to full suite", pf.path, exc)
+            if provider is not None:
+                log.warning("blast-radius failed for %s: %s — falling back to full suite",
+                            pf.path, exc)
             vspec["affected_tests"] = []
         specs.append({
             "type": pf.role,
@@ -114,7 +121,8 @@ async def plan_node(state: GraphState) -> GraphState:
     log.info("PLAN node | job=%s recipe=%s replan=%s files=%s",
              job_id, recipe_name, replan, [pf.path for pf in planned])
 
-    specs, affected = await _build_specs(planned, workspace)
+    graph_ok = (state.get("graph_summary") or {}).get("total_nodes", 0) > 0
+    specs, affected = await _build_specs(planned, workspace, use_graph=graph_ok)
     if replan:
         snapshots = await task_store.append_tasks(uuid.UUID(job_id), specs)
     else:

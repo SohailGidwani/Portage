@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     sandbox_timeout_seconds: int = 600
     # code-review-graph MCP server command (installed isolated in the worker image).
     crg_command: str = "code-review-graph"
+    # Hard ceiling on any single CRG call. A hung graph build must never livelock a job —
+    # the worker's own heartbeat keeps the lease fresh, so nothing else would rescue it.
+    crg_timeout_seconds: int = 180
 
     # Artifact storage (LocalStorage). On the shared volume so reports survive the job.
     artifacts_dir: str = "/workspaces/_artifacts"

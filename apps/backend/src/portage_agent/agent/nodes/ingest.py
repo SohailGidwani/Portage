@@ -12,6 +12,7 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 
+from portage_agent.core.interfaces import GraphSummary
 from portage_agent.retrieval import MCPRetrievalProvider
 
 from ..repo_source import materialize_repo
@@ -24,20 +25,35 @@ log = logging.getLogger("portage.agent")
 async def ingest_node(state: GraphState) -> GraphState:
     job_id = state["job_id"]
     repo_url = state["repo_url"]
+    ref = str((state.get("config") or {}).get("repo_ref") or "")
     workspace = workspace_for(job_id)
-    log.info("INGEST node | job=%s repo=%s -> %s", job_id, repo_url, workspace)
+    log.info("INGEST node | job=%s repo=%s%s -> %s", job_id, repo_url,
+             f" @{ref[:12]}" if ref else "", workspace)
 
-    await materialize_repo(repo_url, workspace)
+    await materialize_repo(repo_url, workspace, ref=ref)
 
+    # The structural graph is an *enhancement* (better planning context, targeted test
+    # selection) — not a prerequisite. If CRG hangs (timeout) or crashes on a repo, the
+    # migration proceeds without it: Plan classifies from source, Verify falls back to the
+    # sanctioned/full suite. Degrading beats livelocking the queue.
     provider = MCPRetrievalProvider(workspace)
-    summary = await provider.build(full_rebuild=True)
+    try:
+        summary = await provider.build(full_rebuild=True)
+    except (TimeoutError, Exception) as exc:  # noqa: BLE001 - degrade on any CRG failure
+        log.warning("INGEST graph build failed (%s: %s) — continuing without a graph",
+                    type(exc).__name__, str(exc)[:200])
+        summary = GraphSummary(errors=[f"graph build failed: {type(exc).__name__}"])
 
     ws = Path(workspace)
-    rel_files = [str(p.relative_to(ws)) for p in ws.rglob("*.py")][:20]
-    if rel_files:
-        blast = await provider.blast_radius(rel_files)
+    if summary.ok:
+        rel_files = [str(p.relative_to(ws)) for p in ws.rglob("*.py")][:20]
+        try:
+            blast = await provider.blast_radius(rel_files) if rel_files else {
+                "status": "skipped", "reason": "no python files"}
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001
+            blast = {"status": "error", "reason": f"{type(exc).__name__}"}
     else:
-        blast = {"status": "skipped", "reason": "no python files"}
+        blast = {"status": "skipped", "reason": "no graph"}
 
     log.info(
         "INGEST done | job=%s nodes=%s edges=%s files=%s blast=%s",

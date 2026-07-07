@@ -177,52 +177,11 @@ export default function JobDetail() {
 
       <Route job={job} tasks={tasks} report={report} />
 
-      <div className="statgrid">
-        <div className="stat">
-          <div className="stat-label">full suite</div>
-          <div className="stat-value">
-            <TestsCell s={job?.test_summary} />
-          </div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">affected subset</div>
-          <div className="stat-value">
-            <TestsCell s={report?.verify_summary} />
-          </div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">files migrated</div>
-          <div className="stat-value">
-            {fileTasks.length ? (
-              <>
-                {done}/{fileTasks.length}
-              </>
-            ) : (
-              <span className="muted">—</span>
-            )}
-          </div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">recovery</div>
-          <div className="stat-value">
-            {recovery && recovery.visits > 0 ? (
-              <>
-                {recovery.visits}{" "}
-                <small>
-                  visit{recovery.visits === 1 ? "" : "s"}
-                  {recovery.escalation_attempted > 0 &&
-                    ` · escalation ${recovery.escalation_rescued}/${recovery.escalation_attempted}`}
-                  {recovery.tasks_skipped > 0 && ` · ${recovery.tasks_skipped} skipped`}
-                </small>
-              </>
-            ) : (
-              <span className="muted">{recovery ? "not needed" : "—"}</span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <h2 className="eyebrow">Migrated files</h2>
+      <div className="detail-grid">
+      <section>
+      <h2 className="eyebrow" style={{ marginTop: 0 }}>
+        Migrated files
+      </h2>
       {fileTasks.length === 0 && (
         <div className="panel muted">
           No migration tasks — the recipe didn&apos;t apply, so the run verified the repo
@@ -278,6 +237,65 @@ export default function JobDetail() {
           </div>
         </>
       ) : null}
+      </section>
+
+      <aside className="sidebar">
+        <div className="stat">
+          <div className="stat-label">full suite</div>
+          <div className="stat-value">
+            <TestsCell s={job?.test_summary} />
+          </div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">affected subset (verify)</div>
+          <div className="stat-value">
+            <TestsCell s={report?.verify_summary} />
+          </div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">files migrated</div>
+          <div className="stat-value">
+            {fileTasks.length ? (
+              <>
+                {done}/{fileTasks.length}
+              </>
+            ) : (
+              <span className="muted">—</span>
+            )}
+          </div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">recovery</div>
+          <div className="stat-value">
+            {recovery && recovery.visits > 0 ? (
+              <>
+                {recovery.visits}{" "}
+                <small>
+                  visit{recovery.visits === 1 ? "" : "s"}
+                  {recovery.escalation_attempted > 0 &&
+                    ` · escalation ${recovery.escalation_rescued}/${recovery.escalation_attempted}`}
+                  {recovery.tasks_skipped > 0 && ` · ${recovery.tasks_skipped} skipped`}
+                </small>
+              </>
+            ) : (
+              <span className="muted">{recovery ? "not needed" : "—"}</span>
+            )}
+          </div>
+        </div>
+        {report && report.affected_tests.length > 0 && (
+          <div className="stat">
+            <div className="stat-label">blast-radius tests</div>
+            <div style={{ marginTop: 6 }}>
+              {report.affected_tests.map((t) => (
+                <div className="mono muted" style={{ fontSize: 12 }} key={t}>
+                  {t}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </aside>
+      </div>
     </main>
   );
 }

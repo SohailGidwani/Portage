@@ -114,12 +114,17 @@ async def recover_node(state: GraphState) -> GraphState:
     # A crash traceback walks the import chain (conftest -> app -> api), naming every file
     # along the way; the file that is actually broken is the DEEPEST frame — the last
     # planned path to appear — so only that one is rolled back and regenerated.
+    # Scan only the traceback region: pytest's trailing "short test summary" repeats the
+    # TEST file's path after the traceback and would defeat the deepest-frame heuristic
+    # (observed: retrying the test module while the truly broken errors.py kept its bug).
+    cut = output.find("short test summary info")
+    trace_region = output[:cut] if cut != -1 else output
     crashed = any(m in output for m in _CRASH_MARKERS)
     mentioned = [
         t for t in file_tasks
-        if t.target_path and t.target_path in output
+        if t.target_path and t.target_path in trace_region
     ]
-    mentioned.sort(key=lambda t: output.rfind(t.target_path or ""))
+    mentioned.sort(key=lambda t: trace_region.rfind(t.target_path or ""))
     if crashed and mentioned:
         classification, targets = "crash", [mentioned[-1]]
     else:

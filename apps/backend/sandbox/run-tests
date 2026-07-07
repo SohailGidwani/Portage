@@ -15,6 +15,19 @@ if [ -f pyproject.toml ] || [ -f setup.py ]; then
     fi
 fi
 
+# Repo root on PYTHONPATH — the offline stand-in for `pip install -e .` in repos with no
+# packaging manifest (tests importing a top-level package would otherwise fail collection).
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+# Optional pre-test setup from the corpus entry (via test_env), e.g. creating the schema
+# a DB-backed suite assumes exists — the offline stand-in for the repo's documented
+# "provision a test database" step. Runs inside the network-off sandbox; failure is fatal
+# (a half-provisioned suite would produce misleading results).
+if [ -n "${PORTAGE_TEST_SETUP:-}" ]; then
+    echo "[run-tests] setup: $PORTAGE_TEST_SETUP"
+    sh -c "$PORTAGE_TEST_SETUP" || exit 70
+fi
+
 # Write the report to a stable path the worker reads back off the shared volume.
 # Do not let a non-zero pytest exit (failing tests) abort before the report is flushed —
 # pytest writes the XML before exiting, so we just propagate its code afterwards.

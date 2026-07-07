@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 
 from portage_agent.db import task_store
-from portage_agent.db.models import Job
+from portage_agent.db.models import EvalRun, Job
 from portage_agent.db.session import AsyncSessionLocal
 from portage_agent.logging_conf import setup_logging
 from portage_agent.worker.queue import PostgresJobQueue
@@ -81,6 +81,28 @@ async def list_jobs(limit: int = 50) -> list[Job]:
             await session.execute(select(Job).order_by(Job.created_at.desc()).limit(limit))
         ).scalars().all()
     return list(rows)
+
+
+@app.get("/eval/runs")
+async def list_eval_runs(limit: int = 25) -> list[dict]:
+    """Latest harness runs (the `runs` table) — the dashboard's eval panel."""
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(EvalRun).order_by(EvalRun.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
+    return [
+        {
+            "id": str(r.id), "suite": r.suite, "corpus_name": r.corpus_name,
+            "scenario": r.scenario, "k_index": r.k_index,
+            "job_id": str(r.job_id) if r.job_id else None, "status": r.status,
+            "tests_passed": r.tests_passed, "tests_total": r.tests_total,
+            "recover_visits": r.recover_visits, "cost_usd": r.cost_usd,
+            "wall_seconds": r.wall_seconds, "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
 
 
 @app.get("/jobs/{job_id}/tasks", response_model=list[TaskOut])
