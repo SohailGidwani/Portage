@@ -94,6 +94,28 @@ export type Report = {
   diff: string;
 };
 
+export type EvalRun = {
+  id: string;
+  suite: string;
+  corpus_name: string;
+  scenario: string;
+  k_index: number;
+  job_id: string | null;
+  status: "green" | "red" | "error" | "timeout";
+  tests_passed: number;
+  tests_total: number;
+  recover_visits: number;
+  cost_usd: number;
+  wall_seconds: number;
+  created_at: string;
+};
+
+export async function listEvalRuns(): Promise<EvalRun[]> {
+  const r = await fetch(`${API_BASE}/eval/runs`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`listEvalRuns ${r.status}`);
+  return r.json();
+}
+
 export async function getHealth(): Promise<{ status: string; db: string }> {
   const r = await fetch(`${API_BASE}/health`, { cache: "no-store" });
   if (!r.ok) throw new Error(`health ${r.status}`);
@@ -128,6 +150,7 @@ export async function listJobs(): Promise<Job[]> {
 export async function createJob(input: {
   repo_url: string;
   migration_recipe: string;
+  config?: Record<string, unknown>;
 }): Promise<Job> {
   const r = await fetch(`${API_BASE}/jobs`, {
     method: "POST",

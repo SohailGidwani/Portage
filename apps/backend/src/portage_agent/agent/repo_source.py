@@ -37,7 +37,7 @@ async def _run(*args: str, cwd: str | None = None) -> None:
         raise RuntimeError(f"{' '.join(args)} failed ({proc.returncode}): {detail}")
 
 
-async def materialize_repo(repo_url: str, workspace: str) -> None:
+async def materialize_repo(repo_url: str, workspace: str, *, ref: str = "") -> None:
     ws = Path(workspace)
     if (ws / ".git").exists():
         log.info("workspace already materialized (.git present) — skipping clone: %s", workspace)
@@ -46,10 +46,20 @@ async def materialize_repo(repo_url: str, workspace: str) -> None:
     ws.parent.mkdir(parents=True, exist_ok=True)
 
     if _is_git_url(repo_url):
-        log.info("git clone %s -> %s", repo_url, workspace)
         if ws.exists():
             await asyncio.to_thread(shutil.rmtree, ws)
-        await _run("git", "clone", "--depth", "1", repo_url, workspace)
+        if ref:
+            # Pinned corpus clone: fetch exactly the SHA/tag so eval K-runs are
+            # reproducible even if the upstream branch moves (plan §11: version and pin).
+            log.info("git fetch %s @ %s -> %s", repo_url, ref, workspace)
+            ws.mkdir(parents=True)
+            await _run("git", "init", "-q", cwd=workspace)
+            await _run("git", "remote", "add", "origin", repo_url, cwd=workspace)
+            await _run("git", "fetch", "--depth", "1", "origin", ref, cwd=workspace)
+            await _run("git", "checkout", "-q", "--detach", "FETCH_HEAD", cwd=workspace)
+        else:
+            log.info("git clone %s -> %s", repo_url, workspace)
+            await _run("git", "clone", "--depth", "1", repo_url, workspace)
         return
 
     # Local path (optionally file://). Copy the tree and make it a git repo for CRG.

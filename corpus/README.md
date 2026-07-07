@@ -46,5 +46,55 @@ notes = "License MIT. 12 tests. Uses flask-sqlalchemy (baked into sandbox image 
 
 ## Status
 
+Candidate source: `portage-corpus-candidates.md` (repo root). Vetting log (2026-07-07):
+
+**In corpus (green in sandbox at pinned SHA):**
 - [x] `flask-items-fixture` — bundled, offline-clean (the Phase-2 fixture).
-- [ ] 10–15 curated OSS repos — **collection in progress** (the Phase-4 long pole).
+- [x] `minimal-flask-api` @ `91ae6ab` — baseline tier, 2 tests (locust excluded via test_args).
+- [x] `flask-restx-api` @ `6e64a22` — framework tier, 4 tests (flask-restx baked).
+
+**Parked (needs more accommodation):**
+- `flask_for_startups` @ `3cc7ba4` — deps solved (sqlalchemy/flask-login/marshmallow/bcrypt/
+  bleach/email-validator baked) and the `PORTAGE_TEST_SETUP` schema hook gets 2/8 green, but
+  the remaining tests assume PG-backed transaction semantics the sqlite substitute can't
+  honor. Unlock = a DB-sidecar sandbox variant (breaks pure --network none; design later).
+
+**Dropped (with reasons — keep for the methodology writeup):**
+- `flask-pytest-example` — package-by-checkout-dir-name convention (root `__init__.py`,
+  imports `flask_pytest_example.*`); incompatible with uuid-named workspaces. 2 tests only.
+- `todo-list-python` — pymongo + requires a running MongoDB: impossible offline.
+- `sdetAutomation/flask-api` — a connexion (OpenAPI-first) app, not plain Flask; out of the
+  v1 recipe's scope (candidate for a future `connexion_to_fastapi` recipe).
+
+**Still to vet** (from the candidates doc): flask-celery, flasky, microblog, testing-goat,
+pallets/flask examples/tutorial (needs `subdir` support), watchlist, todoism,
+flask-sqlalchemy-tutorial.
+
+## First results (suite `corpus-run-2`, baseline K=1, 2026-07-07)
+
+| repo | result | notes |
+|---|---|---|
+| minimal-flask-api | **GREEN 2/2**, 0 recovery, $0.0096 | first real OSS repo migrated autonomously |
+| flask-restx-api | red 0/0, 3 recover visits + escalation, $0.018 | tier-7 failure, analyzed below |
+
+**Known-limitations findings so far** (feeds the Phase-4 taxonomy writeup):
+1. *Blueprint-level error handlers* (taxonomy #4): model produced `router.exception_handler`,
+   which doesn't exist — APIRouter has no exception handlers. Fixed with recipe rules 9/10
+   (generic FastAPI facts); minimal-flask-api went green after.
+2. *Cross-file naming contracts* (taxonomy #5/#7): a migrated importer expected `router`
+   from a sibling migrated earlier without that knowledge. Mitigated by rule 10; fully
+   solved only by planning module interfaces up front (Phase-5-era improvement).
+3. *Flask-RESTX marshalling* (taxonomy #7 — expected-hard): namespaces + `@marshal_with`
+   have no mechanical FastAPI equivalent; migration completes tasks but the suite can't
+   collect. Standing red entry — documented, not hidden.
+4. *Ops*: a wedged code-review-graph MCP call livelocked a job (fresh heartbeat = no
+   rescue). Fixed: `CRG_TIMEOUT_SECONDS` + graceful no-graph degradation; also the
+   deepest-frame recovery heuristic had to exclude pytest's trailing summary section.
+
+## Sandbox accommodations (honest-oracle preserving)
+
+These stand in for the repo's own documented dev setup, never for test logic:
+- repo root on PYTHONPATH (≙ `pip install -e .`),
+- `test_args` scoping (≙ the repo's own CI test selection; excludes Selenium/load tests),
+- `test_env` (≙ the repo's documented test-env vars, e.g. TEST_DATABASE_URI → sqlite),
+- `PORTAGE_TEST_SETUP` via test_env (≙ the repo's documented "provision test DB" step).

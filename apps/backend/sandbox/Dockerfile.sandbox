@@ -8,7 +8,10 @@
 # pre-migration baseline can also run offline. The LLM is told this is the only set available.
 FROM python:3.12-slim-bookworm
 
-# Pinned so the runner image is reproducible.
+# Pinned so the runner image is reproducible. Two layers of deps:
+#   core     — the migration pair (flask pre / fastapi post) + pytest tooling
+#   corpus   — what curated corpus repos need to run offline (see corpus/README.md; every
+#              addition is pinned and noted on the corpus entry that needs it)
 RUN pip install --no-cache-dir \
         "pytest==8.3.4" \
         "pydantic==2.13.4" \
@@ -18,7 +21,17 @@ RUN pip install --no-cache-dir \
         "httpx==0.28.1" \
         "flask==3.1.0" \
         "setuptools==75.6.0" \
-        "wheel==0.45.1"
+        "wheel==0.45.1" \
+    && pip install --no-cache-dir \
+        "sqlalchemy==2.0.36" \
+        "flask-login==0.6.3" \
+        "marshmallow==3.23.1" \
+        "bcrypt==4.2.1" \
+        "python-dotenv==1.0.1" \
+        "email-validator==2.2.0" \
+        "bleach==6.2.0" \
+        "flask-restx==1.3.0" \
+        "requests==2.32.3"
 
 COPY run-tests /usr/local/bin/run-tests
 RUN chmod +x /usr/local/bin/run-tests

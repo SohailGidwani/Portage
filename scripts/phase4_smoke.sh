@@ -25,9 +25,11 @@ $COMPOSE up -d db api worker >/dev/null
 for _ in $(seq 1 30); do curl -sf localhost:8000/health >/dev/null 2>&1 && break; sleep 1; done
 curl -sf localhost:8000/health >/dev/null || fail "api /health never came up"
 
-log "run harness: suite=$SUITE k=$K scenarios=$SCENARIOS"
+log "run harness: suite=$SUITE k=$K scenarios=$SCENARIOS (fixture only — this smokes the
+     harness CONTRACT; the full corpus grid is a deliberate, separate run)"
 $COMPOSE run --rm worker python -m portage_agent.eval \
-  --corpus /corpus/corpus.toml --k "$K" --scenarios "$SCENARIOS" --suite "$SUITE"
+  --corpus /corpus/corpus.toml --k "$K" --scenarios "$SCENARIOS" --suite "$SUITE" \
+  --repos flask-items-fixture
 
 log "assert the runs/metrics contract"
 $COMPOSE exec -T db psql -U portage -d portage -tA -c "

@@ -219,7 +219,7 @@ async def run_suite(repos: list[CorpusRepo], cfg: HarnessConfig) -> list[EvalMet
                 n += 1
                 job_id = await queue.enqueue(
                     repo_url=repo.repo_url, migration_recipe=repo.recipe,
-                    config=dict(SCENARIOS[scenario]),
+                    config=repo.job_config(SCENARIOS[scenario]),
                 )
                 log.info("[%s/%s] %s/%s k=%s -> job=%s",
                          n, total, repo.name, scenario, k_index, job_id)

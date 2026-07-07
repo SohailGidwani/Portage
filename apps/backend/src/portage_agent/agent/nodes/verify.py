@@ -43,13 +43,40 @@ def _summarize(workdir: str, result) -> dict:
     }
 
 
-async def _run_tests(workdir: str, targets: list[str]) -> tuple[dict, object]:
+async def _run_tests(
+    workdir: str, targets: list[str], env: dict[str, str] | None = None
+) -> tuple[dict, object]:
     # Only pass targets that actually exist in the workdir — a stale blast-radius path
     # shouldn't make pytest collect nothing and look like a failure.
     existing = [t for t in targets if (Path(workdir) / t).exists()]
     cmd = ["run-tests", *existing]
-    result = await DockerSandbox().run(cmd, workdir=workdir)
+    result = await DockerSandbox().run(cmd, workdir=workdir, env=env)
     return _summarize(workdir, result), result
+
+
+def _test_env(cfg: dict) -> dict[str, str]:
+    """Per-repo test environment from the job config (corpus `test_env`) — e.g. pointing a
+    repo's TEST_DATABASE_URI at sqlite so its suite runs under --network none."""
+    return {str(k): str(v) for k, v in (cfg.get("test_env") or {}).items()}
+
+
+def _in_scope(path: str, scopes: list[str]) -> bool:
+    return any(path == s or path.startswith(s.rstrip("/") + "/") for s in scopes)
+
+
+def _scoped_targets(affected: list[str], test_args: list[str]) -> list[str]:
+    """Constrain the tests we run to the repo's sanctioned suite.
+
+    Corpus entries can carry `test_args` (job config) — the paths that ARE the oracle —
+    because real repos ship tests we must not run (Selenium suites, locust load tests)
+    that would fail under the network-off sandbox and corrupt the score. Blast-radius
+    picks from ALL test files, so its selection is filtered to that scope; nothing in
+    scope falls back to the whole sanctioned suite.
+    """
+    if not test_args:
+        return affected
+    scoped = [t for t in affected if _in_scope(t, test_args)]
+    return scoped or list(test_args)
 
 
 async def verify_node(state: GraphState) -> GraphState:
@@ -71,8 +98,10 @@ async def verify_node(state: GraphState) -> GraphState:
         if i % 5 == 0 or i == delay:
             log.info("VERIFY pre-test delay %s/%ss | job=%s", i, delay, job_id)
 
-    targets = state.get("affected_tests", []) if migrate else []
-    summary, result = await _run_tests(workdir, targets)
+    test_args = [str(a) for a in (cfg.get("test_args") or [])]
+    affected = state.get("affected_tests", []) if migrate else []
+    targets = _scoped_targets(affected, test_args)
+    summary, result = await _run_tests(workdir, targets, env=_test_env(cfg))
     passed = summary.get("total", 0) > 0 and summary.get("failed", 0) == 0 \
         and summary.get("errors", 0) == 0
 
@@ -96,14 +125,18 @@ async def verify_node(state: GraphState) -> GraphState:
 
 
 async def integrate_node(state: GraphState) -> GraphState:
-    """Run the full suite (the DoD gate). For a non-migration run, reuse Verify's result."""
+    """Run the full sanctioned suite (the DoD gate). For a non-migration run, reuse
+    Verify's result. `test_args` (job config) scopes "full suite" for corpus repos whose
+    tree carries tests that can't run in the sandbox (Selenium, load tests)."""
     job_id = state["job_id"]
     if not state.get("migrate"):
         log.info("INTEGRATE node | job=%s (no migration) reuse verify result", job_id)
         return {"integrate_summary": state.get("test_summary", {}), "step_log": ["integrate"]}
 
     workdir = state["worktree"]
-    summary, _ = await _run_tests(workdir, [])  # [] => full suite
+    cfg = state.get("config") or {}
+    test_args = [str(a) for a in (cfg.get("test_args") or [])]
+    summary, _ = await _run_tests(workdir, test_args, env=_test_env(cfg))  # [] => whole suite
     diff = state.get("diff") or await worktree_diff(workdir)
     log.info("INTEGRATE node | job=%s full-suite total=%s passed=%s failed=%s errors=%s",
              job_id, summary.get("total"), summary.get("passed"), summary.get("failed"),

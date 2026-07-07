@@ -15,6 +15,7 @@ so a later session's query reads it back without rebuilding.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -67,10 +68,16 @@ class MCPRetrievalProvider:
         return payload
 
     async def build(self, *, full_rebuild: bool = True) -> GraphSummary:
-        async with self._session() as session:
-            d = await self._call(
-                session, "build_or_update_graph_tool", {"full_rebuild": full_rebuild}
-            )
+        # wait_for around the WHOLE session: a wedged CRG subprocess (observed in the
+        # wild on a corpus repo) must never hang Ingest — the worker's heartbeat keeps
+        # the job leased, so a hang here would livelock the queue forever.
+        async def _do() -> dict:
+            async with self._session() as session:
+                return await self._call(
+                    session, "build_or_update_graph_tool", {"full_rebuild": full_rebuild}
+                )
+
+        d = await asyncio.wait_for(_do(), timeout=settings.crg_timeout_seconds)
         summary = GraphSummary(
             files_parsed=d.get("files_parsed", 0),
             total_nodes=d.get("total_nodes", 0),
@@ -87,9 +94,12 @@ class MCPRetrievalProvider:
         return summary
 
     async def blast_radius(self, changed_files: list[str], *, max_depth: int = 2) -> dict:
-        async with self._session() as session:
-            return await self._call(
-                session,
-                "get_impact_radius_tool",
-                {"changed_files": changed_files, "max_depth": max_depth},
-            )
+        async def _do() -> dict:
+            async with self._session() as session:
+                return await self._call(
+                    session,
+                    "get_impact_radius_tool",
+                    {"changed_files": changed_files, "max_depth": max_depth},
+                )
+
+        return await asyncio.wait_for(_do(), timeout=settings.crg_timeout_seconds)

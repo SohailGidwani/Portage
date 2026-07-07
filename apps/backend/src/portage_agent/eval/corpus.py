@@ -18,8 +18,27 @@ class CorpusRepo:
     repo_url: str  # local path (bundled) or git URL (curated, with ref pinned)
     recipe: str
     ref: str = ""  # git SHA/tag for remote repos; empty for bundled fixtures
+    # The sanctioned test paths (pytest targets). Empty = the whole repo suite. Set it for
+    # repos whose tree carries tests that can't run offline (Selenium, load tests).
+    test_args: tuple[str, ...] = ()
+    # Extra env for the sandboxed test run (e.g. TEST_DATABASE_URI=sqlite:///... so a
+    # DB-backed suite runs under --network none).
+    test_env: dict[str, str] | None = None
+    tier: str = ""  # baseline | structural | framework | heavy | caveated
+    stresses: tuple[str, ...] = ()  # taxonomy hooks this repo exercises
     source: str = ""  # "bundled" | "github" | ...
     notes: str = ""
+
+    def job_config(self, scenario_config: dict) -> dict:
+        """The job config for one harness run: fault scenario + this repo's pinning/scope."""
+        cfg = dict(scenario_config)
+        if self.ref:
+            cfg["repo_ref"] = self.ref
+        if self.test_args:
+            cfg["test_args"] = list(self.test_args)
+        if self.test_env:
+            cfg["test_env"] = dict(self.test_env)
+        return cfg
 
 
 def load_corpus(path: str | Path) -> list[CorpusRepo]:
@@ -31,12 +50,21 @@ def load_corpus(path: str | Path) -> list[CorpusRepo]:
         missing = [k for k in ("name", "repo_url", "recipe") if not entry.get(k)]
         if missing:
             raise ValueError(f"corpus entry #{i} missing required keys: {missing}")
+        if entry["repo_url"].startswith(("http://", "https://", "git@")) and not entry.get("ref"):
+            raise ValueError(
+                f"corpus entry {entry['name']!r} is remote but has no pinned ref "
+                "(reproducibility rule: never track a moving branch)"
+            )
         repos.append(
             CorpusRepo(
                 name=entry["name"],
                 repo_url=entry["repo_url"],
                 recipe=entry["recipe"],
                 ref=entry.get("ref", ""),
+                test_args=tuple(entry.get("test_args", [])),
+                test_env={str(k): str(v) for k, v in entry.get("test_env", {}).items()} or None,
+                tier=entry.get("tier", ""),
+                stresses=tuple(entry.get("stresses", [])),
                 source=entry.get("source", ""),
                 notes=entry.get("notes", ""),
             )
