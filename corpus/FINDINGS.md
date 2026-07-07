@@ -4,6 +4,11 @@ The Phase-4 "known limitations" report (plan v2 §15): what the autonomous migra
 handles reliably, what breaks, and *why* — with the evidence. A results table that includes
 analyzed failures is the point; an all-green sheet would mean the corpus is too easy.
 
+Status: **this report closes Phase 4** (decision 2026-07-08): the corpus ships at 6 pinned
+repos across 4 tiers — the original ≥10 target was traded for the documented
+shared-sandbox dependency-conflict finding (last section), which blocks the dropped
+candidates and defines the unlock (per-repo sandbox images).
+
 Methodology: every number comes from the `runs`/`metrics` tables (nothing hand-collected);
 K runs per (repo × scenario) with mean±variance; **green = full suite passes AND every
 planned task completed AND none rolled back** — a run that recovery rolls back to original
