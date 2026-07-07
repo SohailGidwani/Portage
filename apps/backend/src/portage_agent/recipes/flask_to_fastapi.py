@@ -23,6 +23,13 @@ _REQUEST_PARSE = re.compile(r"request\.(args|get_json|json|form|values|data)\b")
 _ERRORHANDLER = re.compile(r"\berrorhandler\s*\(")
 _APP_FACTORY = re.compile(r"\bFlask\s*\(|def\s+create_app\b")
 _TEST_CLIENT = re.compile(r"\.test_client\s*\(|get_json\s*\(")
+_TEMPLATES = re.compile(r"\brender_template\s*\(|\bget_flashed_messages\b")
+_SESSION_FLASH = re.compile(r"\bflash\s*\(|\bsession\[|\bsession\.get\b|\bsession\.clear\b")
+_G_CONTEXT = re.compile(r"\bg\.[a-zA-Z_]|before_app_request|before_request|\bcurrent_app\b")
+_FLASK_LOGIN = re.compile(
+    r"\bflask_login\b|\blogin_required\b|\bcurrent_user\b|\blogin_user\b|\blogout_user\b"
+)
+_FLASK_SQLALCHEMY = re.compile(r"\bflask_sqlalchemy\b|\bSQLAlchemy\s*\(")
 
 
 _SUBTASKS: dict[str, Subtask] = {
@@ -31,7 +38,12 @@ _SUBTASKS: dict[str, Subtask] = {
         "Migrate the application factory",
         "Replace the Flask app factory with a FastAPI one: `create_app()` must build a "
         "`FastAPI()` instance and `include_router(...)` the migrated router, keeping the "
-        "function name `create_app` and its factory shape (other modules import it).",
+        "function name `create_app` and its factory shape (other modules import it). "
+        "Flask's `app.config` is a PLAIN DICT — migrate it as one: `app.state.config = {}` "
+        "(a real dict), `config.from_mapping(...)`/`.update(...)` → dict update, "
+        "`app.config['X']` → `app.state.config['X']`. Never call methods on "
+        "`starlette.datastructures.State` itself (it has no update/get). Keep "
+        "`app.instance_path` semantics with plain `os.path` code.",
     ),
     "error_handler": Subtask(
         "error_handler",
@@ -64,15 +76,93 @@ _SUBTASKS: dict[str, Subtask] = {
     "test_harness": Subtask(
         "test_harness",
         "Migrate the test client seam",
-        "Rewrite the client fixture from Flask's `app.test_client()` to "
-        "`fastapi.testclient.TestClient(app)`, and the body helper from `resp.get_json()` to "
-        "`resp.json()`. Do NOT change any test assertions or other fixtures' behaviour.",
+        "Rewrite framework PLUMBING only; every assertion must keep its exact meaning. "
+        "Flask's `app.test_client()` → `fastapi.testclient.TestClient(app)`; "
+        "`resp.get_json()` → `resp.json()`; `resp.get_data(as_text=True)` → `resp.text`; "
+        "`client.get(..., follow_redirects=True)` keeps the same kwarg. A test that "
+        "inspects `flask.session`/`g` directly (e.g. inside `with client:`) must assert "
+        "the SAME fact through observable behaviour instead (response content, cookies, a "
+        "follow-up request) — never delete or weaken the assertion. PRESERVE THE FILE'S "
+        "STRUCTURE: do not add module-level statements the original didn't have (e.g. "
+        "never call `create_app()` at import time if the original built the app inside a "
+        "fixture or setUp).",
+    ),
+    "templates_render": Subtask(
+        "templates_render",
+        "render_template → Jinja2Templates",
+        "Replace `render_template(name, **ctx)` with `fastapi.templating.Jinja2Templates`. "
+        "Create ONE module-level `templates = Jinja2Templates(directory=...)` pointing at "
+        "the EXISTING templates directory and return "
+        "`templates.TemplateResponse(request, name, ctx)`. The .html files must NOT be "
+        "edited, so every Jinja global they use must keep working: give every route a "
+        "`name=` equal to its old Flask endpoint name (e.g. `name=\"blog.index\"`) so the "
+        "templates' `url_for(...)` resolves via Starlette; inject anything else the "
+        "templates reference (`g`, `get_flashed_messages`) into the context dict on every "
+        "render (a small shared `render(request, name, **ctx)` helper is the clean way). "
+        "`redirect(url)` becomes `RedirectResponse(url, status_code=302)` — NEVER the "
+        "default 307, which re-sends POST bodies and breaks form flows.",
+    ),
+    "sessions_flash": Subtask(
+        "sessions_flash",
+        "session / flash → SessionMiddleware",
+        "Add `starlette.middleware.sessions.SessionMiddleware` (a `secret_key` is required) "
+        "to the app. Flask's `session[...]` maps to `request.session[...]`. Implement "
+        "`flash(msg)` as appending to `request.session.setdefault('_flashes', [])`, and "
+        "provide `get_flashed_messages()` to templates as a per-render callable that POPS "
+        "'_flashes' from the session (Flask semantics: read-once).",
+    ),
+    "auth_login": Subtask(
+        "auth_login",
+        "flask_login → session-based auth",
+        "`flask_login` is Flask-only and there is NO drop-in FastAPI package in the "
+        "allowed set (do NOT import `fastapi_login`/`fastapi_users` — they don't exist "
+        "here). Reimplement the small surface actually used: `login_user(u)` → store the "
+        "user id in `request.session`; `logout_user()` → remove it/clear the session; "
+        "`current_user` → a dependency/helper that loads the user from the session and "
+        "returns an anonymous stand-in with `is_authenticated=False` when absent (keep "
+        "the attribute names templates/tests read); `@login_required` → a check that "
+        "redirects (302) to the login page exactly like flask_login did.",
+    ),
+    "sqlalchemy_plain": Subtask(
+        "sqlalchemy_plain",
+        "flask_sqlalchemy → plain SQLAlchemy",
+        "`flask_sqlalchemy` needs a Flask app — replace it with PLAIN SQLAlchemy while "
+        "keeping the module-level `db`-like surface everything imports: an `engine` + "
+        "`SessionLocal = sessionmaker(...)` + a `Base(DeclarativeBase)`. `db.Model` "
+        "subclasses become `Base` subclasses with the same `__tablename__`/columns "
+        "(`db.Column(db.String(20))` → `Column(String(20))` — same types, same "
+        "constraints). `db.session` uses become an explicit session (module-level scoped "
+        "session is acceptable to keep call sites unchanged: `db_session.add/commit/...`). "
+        "`db.create_all()`/`drop_all()` → `Base.metadata.create_all(engine)`/`drop_all`. "
+        "Configure the engine from the SAME config value the app used "
+        "(`SQLALCHEMY_DATABASE_URI`), resolved at create_app/init time.",
+    ),
+    "request_context": Subtask(
+        "request_context",
+        "g / before_request → dependencies",
+        "Replace the `g` object and `before_app_request`/`before_request` hooks with "
+        "explicit per-request wiring: a dependency (or helper called at the top of each "
+        "endpoint) that computes what the hook stored on `g` (e.g. `g.user` from the "
+        "session, `g.db` connection) and passes it to the endpoint and into the template "
+        "context under the SAME attribute names the templates use. `current_app.config` "
+        "moves to module-level config or the app instance. Per-request resources with "
+        "teardown (`g.db` + `teardown_appcontext(close_db)`) become ONE yield dependency: "
+        "`def get_db(): db = connect(); try: yield db; finally: db.close()` — do NOT "
+        "register teardown as middleware (wrong signature) and do NOT use `app.state` as "
+        "a context manager (it isn't one); `app.state` holds only config/constants.",
     ),
 }
 
 
-def _is_conftest(path: str) -> bool:
-    return path.endswith("conftest.py") or "/tests/" in f"/{path}"
+def _is_test_file(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1]
+    return (
+        base == "conftest.py"
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+        or base == "tests.py"
+        or "/tests/" in f"/{path}"
+    )
 
 
 class FlaskToFastAPIRecipe:
@@ -91,7 +181,28 @@ class FlaskToFastAPIRecipe:
         order = 100
 
         is_flask = bool(_FLASK_IMPORT.search(src))
-        if is_flask and (_BLUEPRINT.search(src) or _ROUTE.search(src)):
+
+        # Test files first: a flask-importing test module is harness to adapt (plumbing
+        # only, assertions preserved), never app code to redesign.
+        if _is_test_file(path):
+            if _TEST_CLIENT.search(src) or is_flask:
+                role = "test_harness"
+                order = 30
+                subtasks.append(_SUBTASKS["test_harness"])
+        # App factory before router: a file defining create_app()/Flask() migrates AFTER
+        # the routers it includes (order 20 > 10), so it sees their migrated form; its own
+        # routes are folded in below.
+        elif is_flask and _APP_FACTORY.search(src):
+            role = "app_factory"
+            order = 20
+            subtasks.append(_SUBTASKS["app_factory"])
+            if _ERRORHANDLER.search(src):
+                subtasks.append(_SUBTASKS["error_handler"])
+            if _ROUTE.search(src):
+                subtasks.append(_SUBTASKS["route_to_endpoint"])
+            if _REQUEST_PARSE.search(src):
+                subtasks.append(_SUBTASKS["request_parsing"])
+        elif is_flask and (_BLUEPRINT.search(src) or _ROUTE.search(src)):
             role = "router"
             order = 10
             if _BLUEPRINT.search(src):
@@ -100,22 +211,32 @@ class FlaskToFastAPIRecipe:
                 subtasks.append(_SUBTASKS["route_to_endpoint"])
             if _REQUEST_PARSE.search(src):
                 subtasks.append(_SUBTASKS["request_parsing"])
-        elif is_flask and _APP_FACTORY.search(src):
-            role = "app_factory"
-            order = 20
-            subtasks.append(_SUBTASKS["app_factory"])
-            if _ERRORHANDLER.search(src):
-                subtasks.append(_SUBTASKS["error_handler"])
-        elif _is_conftest(path) and _TEST_CLIENT.search(src):
-            role = "test_harness"
-            order = 30
-            subtasks.append(_SUBTASKS["test_harness"])
+        elif is_flask:
+            # Flask-importing support module (e.g. a db.py using g/current_app, an auth
+            # helper using session) — no routes of its own, but it must still be migrated.
+            role = "support"
+            order = 15
+
+        # Cross-cutting idioms: templates, sessions/flash, g/context (app code only —
+        # test files keep their single strict harness subtask).
+        if is_flask and role and role != "test_harness":
+            if _TEMPLATES.search(src):
+                subtasks.append(_SUBTASKS["templates_render"])
+            if _SESSION_FLASH.search(src):
+                subtasks.append(_SUBTASKS["sessions_flash"])
+            if _FLASK_LOGIN.search(src):
+                subtasks.append(_SUBTASKS["auth_login"])
+            if _FLASK_SQLALCHEMY.search(src):
+                subtasks.append(_SUBTASKS["sqlalchemy_plain"])
+            if _G_CONTEXT.search(src):
+                subtasks.append(_SUBTASKS["request_context"])
+        if role == "support" and not subtasks:
+            # Imports flask but uses none of the idioms we know — still needs the imports
+            # swapped; the generic system rules cover it.
+            subtasks.append(_SUBTASKS["request_context"])
 
         if not subtasks:
             return None
-        # A file may legitimately be both factory + routes; fold those in if present.
-        if role == "app_factory" and _ROUTE.search(src):
-            subtasks.append(_SUBTASKS["route_to_endpoint"])
         return PlannedFile(path=path, role=role, subtasks=subtasks, order=order)
 
     def plan_files(self, files: dict[str, str]) -> list[PlannedFile]:
@@ -138,7 +259,9 @@ class FlaskToFastAPIRecipe:
             "never reimplement or modify framework-agnostic logic.\n"
             "5. The test suite runs OFFLINE (no network). Import ONLY the Python standard "
             "library, this project's own modules, and these packages: "
-            "fastapi, starlette, uvicorn, httpx, pydantic, pytest.\n"
+            "fastapi, starlette, uvicorn, httpx, pydantic, pytest, jinja2, itsdangerous, "
+            "sqlalchemy, python-multipart (needed for fastapi `Form(...)`; imported "
+            "implicitly).\n"
             "6. Keep `from __future__ import annotations` if the original had it.\n"
             "7. Return plain Python data (dict/list) from endpoints so the route's declared "
             "`status_code` is applied — do NOT wrap a normal return in `JSONResponse`/`Response` "

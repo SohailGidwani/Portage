@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 
+from portage_agent.db import task_store
 from portage_agent.storage import LocalStorage
 
 from ..state import GraphState
@@ -25,7 +27,14 @@ async def report_node(state: GraphState) -> GraphState:
     integrate_summary = state.get("integrate_summary") or {}
     final = integrate_summary if migrate else verify_summary
 
-    plan = state.get("plan") or []
+    # Reload the plan from Postgres — the truth. The state copy is Execute's LAST output
+    # and goes stale when a later Recover skips tasks (observed: a fully-rolled-back run
+    # reporting 5/6 done). The DB rows are updated by every node that touches a task.
+    if migrate:
+        snapshots = await task_store.load_tasks(uuid.UUID(job_id))
+        plan = [s.to_state_dict() for s in snapshots]
+    else:
+        plan = state.get("plan") or []
     tasks_done = sum(1 for t in plan if t.get("status") == "done")
 
     # Phase 3: the measured recovery/escalation record. "Rescued" = the task ended done and

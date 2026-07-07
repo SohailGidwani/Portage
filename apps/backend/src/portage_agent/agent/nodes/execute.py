@@ -43,6 +43,7 @@ from .common import (
     extract_code,
     file_diff,
     iter_py_files,
+    non_python_listing,
     read_file,
     worktree_diff,
     write_file,
@@ -88,6 +89,9 @@ def _gather_context(
     Skip the file being migrated and any not-yet-migrated sibling target (still old-framework
     code would mislead the model)."""
     ctx: dict[str, str] = {}
+    listing = non_python_listing(worktree)
+    if listing:
+        ctx["<repo file tree — non-Python files (templates, static, config)>"] = listing
     for rel in sorted(iter_py_files(worktree)):
         if rel == current:
             continue
@@ -101,7 +105,7 @@ def _gather_context(
 
 async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: str,
                         subtasks: list[Subtask], context: dict[str, str],
-                        verify_errors: str) -> tuple[str, dict]:
+                        verify_errors: str, prior_attempt: str = "") -> tuple[str, dict]:
     """Call the model for one file; return (migrated content, usage) — content not yet
     written. Usage feeds the attempts_log entry (cost-per-migration is an eval metric)."""
     source = read_file(worktree, path, limit=20000) or ""
@@ -116,6 +120,12 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
             "\n\nIMPORT CONTRACT — other files in this repo import these names from "
             f"{path}; the migrated file MUST still define/export every one of them: "
             f"{', '.join(contract)}"
+        )
+    if prior_attempt:
+        user += (
+            "\n\nYOUR PREVIOUS ATTEMPT at this file FAILED verification and was rolled "
+            "back. Its diff is below — debug it: keep what was right, fix what the test "
+            f"failure shows is wrong.\n{prior_attempt}"
         )
     if verify_errors:
         user += (
@@ -184,9 +194,15 @@ async def execute_node(state: GraphState) -> GraphState:
             context = _gather_context(worktree, current=path, target_paths=target_paths,
                                       done_paths=done_paths)
             subtasks = [Subtask(s.type, s.title, "") for s in t.subtasks]
+            prior = next(
+                (a.get("failing_diff", "") for a in reversed(t.attempts_log)
+                 if a.get("action") == "rollback_regenerate" and a.get("failing_diff")),
+                "",
+            )
             content, usage = await _migrate_file(
                 recipe, worktree, path=path, role=t.type, model=model,
                 subtasks=subtasks, context=context, verify_errors=verify_errors,
+                prior_attempt=prior,
             )
             if _should_corrupt(fault, path=path, first_path=first_path,
                                attempt=attempt, tier=tier):

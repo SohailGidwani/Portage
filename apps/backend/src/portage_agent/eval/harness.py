@@ -128,9 +128,6 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     ts = job.test_summary or {}
     r.tests_total = int(ts.get("total") or 0)
     r.tests_passed = int(ts.get("passed") or 0)
-    if job.status == "done":
-        green = r.tests_total > 0 and r.tests_passed == r.tests_total
-        r.status = "green" if green else "red"
     r.wall_seconds = round((job.updated_at - job.created_at).total_seconds(), 1)
 
     report: dict = {}
@@ -152,6 +149,15 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     r.prompt_tokens = int(usage.get("prompt_tokens") or 0)
     r.completion_tokens = int(usage.get("completion_tokens") or 0)
     r.cost_usd = float(usage.get("cost_usd") or 0.0)
+
+    # Green = the MIGRATION succeeded, not merely "tests passed": every planned task done
+    # (none skipped/rolled back) AND the full suite green. Skip-and-continue can roll the
+    # whole worktree back to original sources, whose suite then passes — that is an honest
+    # failure report, and it must never score as a green migration (observed on flaskr).
+    if job.status == "done":
+        suite_ok = r.tests_total > 0 and r.tests_passed == r.tests_total
+        fully_migrated = r.tasks_total > 0 and r.tasks_done == r.tasks_total
+        r.status = "green" if (suite_ok and fully_migrated) else "red"
     return r
 
 

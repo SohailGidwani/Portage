@@ -32,7 +32,7 @@ from portage_agent.db import task_store
 from portage_agent.db.models import TaskStatus
 
 from ..state import GraphState
-from .common import iter_py_files, run_git
+from .common import file_diff, iter_py_files, run_git
 
 log = logging.getLogger("portage.agent")
 
@@ -127,6 +127,18 @@ async def recover_node(state: GraphState) -> GraphState:
     mentioned.sort(key=lambda t: trace_region.rfind(t.target_path or ""))
     if crashed and mentioned:
         classification, targets = "crash", [mentioned[-1]]
+        # Widen on repeat: if the previous visit already crash-targeted this same lone
+        # file, single-file blame isn't converging — the deepest frame can be the crash
+        # SITE while the offending change lives in a caller (seen: a migrated test module
+        # calling create_app() at import; the factory takes the blame every round and
+        # burns its budget). Reset every active task so the true offender regenerates too.
+        prev = (state.get("recovery_actions") or [])
+        if prev:
+            last = prev[-1]
+            if (last.get("classification") == "crash"
+                    and last.get("targets") == [targets[0].target_path]):
+                classification = "crash_widened"
+                targets = [t for t in file_tasks if t.status != TaskStatus.skipped.value]
     else:
         classification = "behavioral"
         targets = [t for t in file_tasks if t.status != TaskStatus.skipped.value]
@@ -136,20 +148,29 @@ async def recover_node(state: GraphState) -> GraphState:
     for t in targets:
         assert t.target_path is not None
         if t.attempts >= settings.max_task_attempts:
+            # Preserve the losing attempt's diff BEFORE rolling back — a skipped task
+            # whose failing content is gone can't be post-mortemed (the taxonomy needs it).
+            failing_diff = await file_diff(worktree, t.target_path)
             await _rollback_file(worktree, t.target_path)
             await task_store.update_task(
                 t.id, status=TaskStatus.skipped.value, cascade_subtasks=True,
-                error=f"exhausted after {t.attempts} attempts",
+                error=f"exhausted after {t.attempts} attempts; last error: …{output[-400:]}",
+                diff=failing_diff,
                 append_attempt={"action": "rollback_skip", "reason": classification,
                                 "visit": visits, "at": _now()},
             )
             skipped_paths.append(t.target_path)
         else:
+            # Keep the losing attempt's diff in the log entry: Execute shows it to the
+            # model on retry, turning blind regeneration into debugging-your-own-code
+            # (the factory-convergence lever — 3 blind attempts kept making sibling bugs).
+            failing_diff = await file_diff(worktree, t.target_path)
             await _rollback_file(worktree, t.target_path)
             await task_store.update_task(
                 t.id, status=TaskStatus.pending.value, cascade_subtasks=True,
                 append_attempt={"action": "rollback_regenerate", "reason": classification,
-                                "visit": visits, "at": _now()},
+                                "visit": visits, "at": _now(),
+                                "failing_diff": failing_diff[:4000]},
             )
             retry_paths.append(t.target_path)
 
@@ -164,7 +185,8 @@ async def recover_node(state: GraphState) -> GraphState:
         "recovery_actions": [
             {"visit": visits, "classification": classification,
              "action": "rollback_regenerate" if retry_paths else "give_up",
-             "targets": retry_paths, "skipped": skipped_paths, "at": _now()}
+             "targets": retry_paths, "skipped": skipped_paths,
+             "error_head": output[:240], "at": _now()}
         ],
         "step_log": ["recover"],
     }

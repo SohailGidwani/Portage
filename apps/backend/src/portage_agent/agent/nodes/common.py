@@ -44,6 +44,27 @@ def iter_py_files(root: str) -> dict[str, str]:
     return out
 
 
+def non_python_listing(root: str, *, limit: int = 80) -> str:
+    """Relative paths of the repo's non-Python files (templates, static, config).
+
+    Shown to the model as context: template-rendering migrations need to know where the
+    templates directory actually is and what files it holds — that never appears in the
+    .py context files."""
+    base = Path(root)
+    out: list[str] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_file() or p.suffix == ".py":
+            continue
+        rel = p.relative_to(base)
+        if any(part in _SKIP_DIRS for part in rel.parts):
+            continue
+        out.append(str(rel))
+        if len(out) >= limit:
+            out.append("… (truncated)")
+            break
+    return "\n".join(out)
+
+
 def read_file(root: str, rel: str, *, limit: int = 8000) -> str | None:
     p = Path(root) / rel
     if not p.exists():

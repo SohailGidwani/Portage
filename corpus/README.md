@@ -70,6 +70,26 @@ Candidate source: `portage-corpus-candidates.md` (repo root). Vetting log (2026-
 pallets/flask examples/tutorial (needs `subdir` support), watchlist, todoism,
 flask-sqlalchemy-tutorial.
 
+## Template-app session (2026-07-08, suites template-recipe-1..4, honest-1)
+
+Recipe grew template/session/auth support (subtasks: `templates_render`, `sessions_flash`,
+`auth_login`, `request_context`; factory `app.config`-as-dict pattern; structure-preserving
+harness rule; classifier fixes: factory-after-routers, test-files-as-harness). Recovery
+grew **widen-on-repeat** (same lone crash target twice → reset all active tasks — escapes
+deepest-frame blame mis-assignment; demonstrated rescuing flaskr mid-run). Sandbox gained
+`python-multipart` (FastAPI `Form()` hard-requires it — environment gap, not model error).
+
+**Integrity fixes (important):** a fully-rolled-back run used to score GREEN (original
+app's suite passes!) with a stale 5/6 task count and stale diff. Now: Report reloads tasks
+from Postgres, Integrate always recomputes the diff, and harness green ⇐ suite green AND
+all tasks done AND none skipped. `template-recipe-4`'s flaskr "GREEN 24/24" was such a
+false green — reclassified honestly (suite `honest-1`: red, 5/6, factory skipped).
+
+Current honest state of the template tier: flaskr reaches 5/6 (factory keeps failing —
+instance-path/config edge branch), watchlist runs all 15 tests but fails behaviorally on
+the flask_sqlalchemy wall (taxonomy #7's hardest: `db` object + `app.extensions` woven
+through app AND tests). microblog untested since. **JSON APIs remain reliably green.**
+
 ## Grid results (suite `corpus-grid-1`, baseline K=1, all 6 repos, 2026-07-08)
 
 | repo | tier | result | recovery | cost | wall |

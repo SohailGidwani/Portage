@@ -137,7 +137,9 @@ async def integrate_node(state: GraphState) -> GraphState:
     cfg = state.get("config") or {}
     test_args = [str(a) for a in (cfg.get("test_args") or [])]
     summary, _ = await _run_tests(workdir, test_args, env=_test_env(cfg))  # [] => whole suite
-    diff = state.get("diff") or await worktree_diff(workdir)
+    # Always recompute: the state copy is Execute's last output and goes stale when a
+    # later Recover rolls files back (a fully-rolled-back run must report an EMPTY diff).
+    diff = await worktree_diff(workdir)
     log.info("INTEGRATE node | job=%s full-suite total=%s passed=%s failed=%s errors=%s",
              job_id, summary.get("total"), summary.get("passed"), summary.get("failed"),
              summary.get("errors"))
