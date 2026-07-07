@@ -70,6 +70,29 @@ Candidate source: `portage-corpus-candidates.md` (repo root). Vetting log (2026-
 pallets/flask examples/tutorial (needs `subdir` support), watchlist, todoism,
 flask-sqlalchemy-tutorial.
 
+## Grid results (suite `corpus-grid-1`, baseline K=1, all 6 repos, 2026-07-08)
+
+| repo | tier | result | recovery | cost | wall |
+|---|---|---|---|---|---|
+| flask-items-fixture | baseline | **GREEN 6/6** | 0 | $0.022 | 11s |
+| minimal-flask-api | baseline | **GREEN 2/2** | 0 | $0.010 | 9s |
+| flaskr | structural | red | 5 visits | $0.062 | 32s |
+| watchlist | structural | red | 5 visits | $0.049 | 24s |
+| microblog | heavy | red | 5 visits | $0.319 | 61s |
+| flask-restx-api | framework | red | 3 visits | $0.019 | 13s |
+
+The headline pattern: **JSON APIs migrate green; template-rendering apps are the current
+frontier.** New taxonomy entries from the reds:
+
+5. *Deprecated-API usage* (flaskr): model used `@app.on_event(...)`; pytest promotes the
+   DeprecationWarning to an import error. → recipe rule 11 (use lifespan handlers).
+6. *Hallucinated packages* (watchlist): model invented `fastapi_flash` to stand in for
+   Flask's `flash()`. → recipe rule 12 (never invent packages; inline session-based
+   equivalent). Rules 11/12 added 2026-07-08, **not yet re-verified by a grid run**.
+7. *Template/session idioms* (all three): `render_template`/`flash`/`url_for`/`session`
+   is a genuinely harder migration class than JSON APIs — the tier-6/8 wall the candidates
+   doc predicted. Next lever: recipe support for Jinja2Templates wiring + SessionMiddleware.
+
 ## First results (suite `corpus-run-2`, baseline K=1, 2026-07-07)
 
 | repo | result | notes |

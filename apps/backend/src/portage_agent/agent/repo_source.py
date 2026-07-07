@@ -37,7 +37,9 @@ async def _run(*args: str, cwd: str | None = None) -> None:
         raise RuntimeError(f"{' '.join(args)} failed ({proc.returncode}): {detail}")
 
 
-async def materialize_repo(repo_url: str, workspace: str, *, ref: str = "") -> None:
+async def materialize_repo(
+    repo_url: str, workspace: str, *, ref: str = "", subdir: str = ""
+) -> None:
     ws = Path(workspace)
     if (ws / ".git").exists():
         log.info("workspace already materialized (.git present) — skipping clone: %s", workspace)
@@ -48,18 +50,37 @@ async def materialize_repo(repo_url: str, workspace: str, *, ref: str = "") -> N
     if _is_git_url(repo_url):
         if ws.exists():
             await asyncio.to_thread(shutil.rmtree, ws)
+        # `subdir`: the app lives in a subdirectory of a larger repo (e.g. pallets/flask's
+        # examples/tutorial). Clone aside, lift the subdir out as the workspace root, and
+        # snapshot it as a fresh git repo — same shape as the local-path flow, so the
+        # worktree/rollback machinery sees a normal repo either way.
+        target = f"{workspace}.clone-tmp" if subdir else workspace
         if ref:
             # Pinned corpus clone: fetch exactly the SHA/tag so eval K-runs are
             # reproducible even if the upstream branch moves (plan §11: version and pin).
-            log.info("git fetch %s @ %s -> %s", repo_url, ref, workspace)
-            ws.mkdir(parents=True)
-            await _run("git", "init", "-q", cwd=workspace)
-            await _run("git", "remote", "add", "origin", repo_url, cwd=workspace)
-            await _run("git", "fetch", "--depth", "1", "origin", ref, cwd=workspace)
-            await _run("git", "checkout", "-q", "--detach", "FETCH_HEAD", cwd=workspace)
+            log.info("git fetch %s @ %s -> %s", repo_url, ref, target)
+            Path(target).mkdir(parents=True)
+            await _run("git", "init", "-q", cwd=target)
+            await _run("git", "remote", "add", "origin", repo_url, cwd=target)
+            await _run("git", "fetch", "--depth", "1", "origin", ref, cwd=target)
+            await _run("git", "checkout", "-q", "--detach", "FETCH_HEAD", cwd=target)
         else:
-            log.info("git clone %s -> %s", repo_url, workspace)
-            await _run("git", "clone", "--depth", "1", repo_url, workspace)
+            log.info("git clone %s -> %s", repo_url, target)
+            await _run("git", "clone", "--depth", "1", repo_url, target)
+        if subdir:
+            src = Path(target) / subdir
+            if not src.is_dir():
+                await asyncio.to_thread(shutil.rmtree, target)
+                raise FileNotFoundError(f"subdir {subdir!r} not found in {repo_url}")
+            log.info("lifting subdir %s -> %s", subdir, workspace)
+            await asyncio.to_thread(shutil.copytree, src, ws)
+            await asyncio.to_thread(shutil.rmtree, target)
+            await _run("git", "init", "-q", cwd=workspace)
+            await _run("git", "add", "-A", cwd=workspace)
+            await _run(
+                "git", "-c", "user.email=portage@local", "-c", "user.name=portage",
+                "commit", "-qm", "portage: initial workspace snapshot", cwd=workspace,
+            )
         return
 
     # Local path (optionally file://). Copy the tree and make it a git repo for CRG.

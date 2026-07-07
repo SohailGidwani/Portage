@@ -25,6 +25,38 @@ source = "github"
 notes = "MIT. 2 tests, green in sandbox 2026-07-07. Locust load test excluded via test_args (needs network)."
 
 [[repos]]
+name = "flaskr"
+repo_url = "https://github.com/pallets/flask"
+recipe = "flask_to_fastapi"
+ref = "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81"
+subdir = "examples/tutorial"
+tier = "structural"
+stresses = ["app_factory", "blueprints", "auth_views", "sqlite_db", "templates"]
+source = "github"
+notes = "BSD (pallets/flask). The canonical Flask tutorial app, lifted from examples/tutorial. 24 tests, green in sandbox 2026-07-08."
+
+[[repos]]
+name = "watchlist"
+repo_url = "https://github.com/helloflask/watchlist"
+recipe = "flask_to_fastapi"
+ref = "006f830f6bb10f97e86e5adfe162bde0efe58210"
+tier = "structural"
+stresses = ["flask_sqlalchemy", "flask_login", "templates", "forms"]
+source = "github"
+notes = "MIT (Grey Li tutorial app). 15 tests, green in sandbox 2026-07-08. flask-sqlalchemy 3.1.1 + flask-login baked into sandbox."
+
+[[repos]]
+name = "microblog"
+repo_url = "https://github.com/miguelgrinberg/microblog"
+recipe = "flask_to_fastapi"
+ref = "a975ef64864354867c88e0ed3a17ba7d17dca752"
+test_args = ["tests.py"]
+tier = "heavy"
+stresses = ["flask_login", "flask_sqlalchemy", "flask_mail", "babel", "tokens", "unittest_style_tests"]
+source = "github"
+notes = "MIT (Grinberg mega-tutorial). 34 py files. 4 unittest-style tests in tests.py (pytest collects them). mail/migrate/moment/httpauth/wtf/pyjwt/langdetect/elasticsearch/rq baked."
+
+[[repos]]
 name = "flask-restx-api"
 repo_url = "https://github.com/Anishmourya/flask-restx-api"
 recipe = "flask_to_fastapi"

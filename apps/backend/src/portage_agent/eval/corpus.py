@@ -18,6 +18,9 @@ class CorpusRepo:
     repo_url: str  # local path (bundled) or git URL (curated, with ref pinned)
     recipe: str
     ref: str = ""  # git SHA/tag for remote repos; empty for bundled fixtures
+    # The app lives in this subdirectory of the repo (e.g. pallets/flask examples/tutorial);
+    # Ingest lifts it out as the workspace root.
+    subdir: str = ""
     # The sanctioned test paths (pytest targets). Empty = the whole repo suite. Set it for
     # repos whose tree carries tests that can't run offline (Selenium, load tests).
     test_args: tuple[str, ...] = ()
@@ -34,6 +37,8 @@ class CorpusRepo:
         cfg = dict(scenario_config)
         if self.ref:
             cfg["repo_ref"] = self.ref
+        if self.subdir:
+            cfg["repo_subdir"] = self.subdir
         if self.test_args:
             cfg["test_args"] = list(self.test_args)
         if self.test_env:
@@ -61,6 +66,7 @@ def load_corpus(path: str | Path) -> list[CorpusRepo]:
                 repo_url=entry["repo_url"],
                 recipe=entry["recipe"],
                 ref=entry.get("ref", ""),
+                subdir=entry.get("subdir", ""),
                 test_args=tuple(entry.get("test_args", [])),
                 test_env={str(k): str(v) for k, v in entry.get("test_env", {}).items()} or None,
                 tier=entry.get("tier", ""),

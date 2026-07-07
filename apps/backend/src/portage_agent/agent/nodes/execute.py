@@ -39,6 +39,7 @@ from portage_agent.recipes.base import PlannedFile, Subtask
 from ..state import GraphState
 from .common import (
     content_hash,
+    export_contract,
     extract_code,
     file_diff,
     iter_py_files,
@@ -106,6 +107,16 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
     source = read_file(worktree, path, limit=20000) or ""
     planned = PlannedFile(path=path, role=role, subtasks=subtasks)
     user = recipe.build_user_prompt(file=planned, source=source, context=context)
+    # The export contract, stated explicitly: what sibling files import from this module.
+    # Cross-file naming breaks are a measured top failure mode (corpus finding #2) —
+    # don't leave the interface for the model to infer from context files.
+    contract = export_contract(worktree, path)
+    if contract:
+        user += (
+            "\n\nIMPORT CONTRACT — other files in this repo import these names from "
+            f"{path}; the migrated file MUST still define/export every one of them: "
+            f"{', '.join(contract)}"
+        )
     if verify_errors:
         user += (
             "\n\nA previous attempt produced these test failures — fix the migration so they "

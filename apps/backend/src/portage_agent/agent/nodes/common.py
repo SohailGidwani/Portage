@@ -4,6 +4,7 @@ content hashing, and parsing the LLM's fenced-code output.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import logging
@@ -100,3 +101,42 @@ async def file_diff(worktree: str, rel: str) -> str:
     """One file's migration diff vs the worktree's clean HEAD."""
     _, out = await run_git("diff", "--", rel, cwd=worktree)
     return out
+
+
+def _module_names(rel: str) -> set[str]:
+    """Module names under which `rel` can be imported (absolute or relative)."""
+    parts = Path(rel).with_suffix("").parts
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    names = set()
+    for i in range(len(parts)):
+        names.add(".".join(parts[i:]))
+    return names
+
+
+def export_contract(root: str, target: str) -> list[str]:
+    """Names other files in the repo import FROM `target` — the interface a migration of
+    `target` must keep exporting. Cross-file naming breaks (importer expects `router`/
+    `create_app`, migrated module dropped it) are a measured top failure mode; stating the
+    contract explicitly in the prompt removes the guesswork. AST-based, best-effort:
+    unparseable files are skipped."""
+    wanted = _module_names(target)
+    names: set[str] = set()
+    for rel, src in iter_py_files(root).items():
+        if rel == target:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            # Relative imports: resolve against the importer's package.
+            mod = node.module
+            if node.level:
+                base = Path(rel).parts[: -node.level]
+                mod = ".".join((*base, *mod.split("."))) if base else mod
+            if mod in wanted or mod.split(".")[-1] in {w.split(".")[-1] for w in wanted}:
+                names.update(a.name for a in node.names if a.name != "*")
+    return sorted(names)
