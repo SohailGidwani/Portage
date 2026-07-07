@@ -25,12 +25,15 @@ log = logging.getLogger("portage.agent")
 async def ingest_node(state: GraphState) -> GraphState:
     job_id = state["job_id"]
     repo_url = state["repo_url"]
-    ref = str((state.get("config") or {}).get("repo_ref") or "")
+    cfg = state.get("config") or {}
+    ref = str(cfg.get("repo_ref") or "")
+    subdir = str(cfg.get("repo_subdir") or "")
     workspace = workspace_for(job_id)
-    log.info("INGEST node | job=%s repo=%s%s -> %s", job_id, repo_url,
-             f" @{ref[:12]}" if ref else "", workspace)
+    log.info("INGEST node | job=%s repo=%s%s%s -> %s", job_id, repo_url,
+             f" @{ref[:12]}" if ref else "", f" subdir={subdir}" if subdir else "",
+             workspace)
 
-    await materialize_repo(repo_url, workspace, ref=ref)
+    await materialize_repo(repo_url, workspace, ref=ref, subdir=subdir)
 
     # The structural graph is an *enhancement* (better planning context, targeted test
     # selection) — not a prerequisite. If CRG hangs (timeout) or crashes on a repo, the

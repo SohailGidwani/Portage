@@ -43,10 +43,19 @@ class MCPRetrievalProvider:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[ClientSession]:
+        # CRG_PARSE_EXECUTOR=thread is load-bearing. CRG parses repos with >=8 files in
+        # parallel, defaulting to ProcessPoolExecutor on Linux; forking from its stdio
+        # server (a threaded asyncio process whose pipe FDs the children inherit) deadlocks
+        # the build — CRG's own fix for this (issues #46/#136) only auto-applies on
+        # Windows. Thread mode is upstream's documented override and keeps the parallelism
+        # (tree-sitter releases the GIL). Symptom if lost: every repo with >=8 Python
+        # files times out in Ingest and degrades to no-graph mode.
+        env = {**os.environ}
+        env.setdefault("CRG_PARSE_EXECUTOR", "thread")
         params = StdioServerParameters(
             command=self.command,
             args=["serve", "--repo", self.repo_root, "--tools", _TOOLS],
-            env={**os.environ},
+            env=env,
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
