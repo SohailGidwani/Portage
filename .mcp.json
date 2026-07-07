@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "portage": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "apps/backend",
+        "python",
+        "-m",
+        "portage_agent.mcp"
+      ]
+    }
+  }
+}

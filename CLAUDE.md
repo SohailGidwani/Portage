@@ -75,7 +75,9 @@ apps/backend/src/portage_agent/
   recipes/         # migration recipes; v1: flask_to_fastapi/
   llm/             # LiteLLM provider ladder (driver/escalation tiers, provider = env config)
   eval/            # Phase 4 harness: corpus loader + scenario runner -> runs/metrics tables
-  cli/ mcp/        # stubs — Phase 5
+  cli/             # Phase 5a: `portage` console script (thin httpx client over the API)
+  mcp/             # Phase 5b: FastMCP stdio server (verify_patch_in_sandbox, repo_graph,
+                   #   blast_radius) — wired into Claude Code via /.mcp.json
 corpus/                 # pinned eval corpus (corpus.toml + curation criteria in README)
 apps/backend/alembic/   # migrations (Alembic owns domain tables only)
 apps/frontend/          # Next.js App Router dashboard (REST client; observability surface)
@@ -159,21 +161,30 @@ Backend dev loop (host): `cd apps/backend && uv sync --extra dev && uv run ruff 
   fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`), content-hash
   idempotency, checkpoint-resume. Job-detail API (`/jobs/{id}/tasks`, `/jobs/{id}/report`) +
   dashboard job-inspection page. *DoD:* injected faults survived (`scripts/phase3_check.sh`).
-- **Phase 4 — Eval harness (the hireable core; now the critical path).** Recipe-agnostic
-  harness; curated corpus of ~10–15 small Flask apps with real test suites (**the long pole —
-  start collecting immediately**); the phase3_check fault scenarios promoted into harness eval
-  cases; K runs per repo with mean±variance; per-model rows; cost per migration. **The harness
-  writes results to `runs`/`metrics` tables — that's the contract the Phase 6 leaderboard
-  reads.** Include a **"known limitations" finding**: document the failure taxonomy honestly
-  (which Flask patterns break it, why) — a results table with analyzed failures is more
-  credible than all-green. *DoD:* metrics report across ≥10 repos with variance.
-- **Phase 5a — CLI (do right after Phase 4).** `portage migrate <repo> --recipe
-  flask-to-fastapi`. Small; makes the eval harness and demos dramatically easier to drive.
-  Not cuttable.
-- **Phase 5b — MCP server (the product wedge; ships after eval numbers exist).**
-  `verify_patch_in_sandbox` / `repo_graph` / `blast_radius`; Claude Code + Cursor configs.
-  The eval numbers are its credibility. **If time gets tight, 5b is the cuttable item.**
-  *DoD:* Claude Code calls `verify_patch_in_sandbox` to test its own work before writing.
+- **Phase 4 — Eval harness ✅ (closed 2026-07-08).** Recipe-agnostic harness driving the
+  real queue/worker; fault scenarios promoted into standing eval cases; K=3 grid with
+  mean±variance; cost per migration; results persisted to `runs`/`metrics` (**the contract
+  the Phase 6 leaderboard reads**). **Corpus decision (user, 2026-07-08): shipped with 6
+  pinned repos across 4 tiers instead of the original ≥10** — four candidates fell to a
+  shared-sandbox dependency-conflict class that is itself documented as a finding
+  (per-repo sandbox images = the future unlock). The **failure taxonomy lives in
+  `corpus/FINDINGS.md`** — 9 categories, each SOLVED/PARTIAL/OPEN with evidence; headline:
+  JSON APIs migrate green (100% fault recovery on the stable tier), template/extension
+  apps are the honest frontier (cross-file call-shape drift is the named residual).
+- **Phase 5a — CLI ✅.** `portage migrate <repo> [--ref SHA] [--subdir D] --watch` +
+  `status`/`jobs`/`report --diff` — a thin sync httpx client over the REST API (never
+  touches DB/queue; same boundary as the dashboard). Console script via
+  `[project.scripts]`; `uv run portage …` from `apps/backend`; `PORTAGE_API` or `--api`
+  selects the control plane. Exit codes: 0 = fully migrated + full suite green (the
+  harness's honesty bar), 1 = red migration, 2 = usage/infra.
+- **Phase 5b — MCP server ✅.** `portage_agent/mcp` (FastMCP, stdio;
+  `python -m portage_agent.mcp`): `verify_patch_in_sandbox` (diff → copy of repo →
+  network-off sandbox → structured pass/fail + failing test names; never mutates the
+  caller's tree), `repo_graph` (full build first time, incremental after), `blast_radius`.
+  Tools return readable error dicts, never protocol errors. `.mcp.json` at repo root wires
+  Claude Code; Cursor snippet in README. *DoD verified over the real MCP protocol:* clean
+  repo 6/6 pass; a breaking diff applied + honestly failed with named tests; junk diff →
+  clear error. Host needs Docker + sandbox image; graph tools need CRG installed.
 - **Phase 6 — Dashboard-as-proof + packaging (reduced scope).** The dashboard already exists
   (jobs list + job-detail with task tree / diffs / recovery timeline), so what remains:
   leaderboard view over the Phase 4 metrics tables, chaos-recovery demo view, the

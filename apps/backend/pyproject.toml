@@ -26,7 +26,12 @@ dependencies = [
     # LLM model ladder — one interface across Bedrock / Azure OpenAI / Gemini / Anthropic.
     # Wired in Phase 2 (Execute node). Pinned via uv.lock.
     "litellm>=1.55",
+    # CLI (Phase 5a) — thin sync REST client over the control-plane API.
+    "httpx>=0.27",
 ]
+
+[project.scripts]
+portage = "portage_agent.cli:main"
 
 [project.optional-dependencies]
 dev = [

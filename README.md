@@ -89,7 +89,18 @@ docker compose up            # db -> api (runs migrations) -> worker -> frontend
 - API: <http://localhost:8000> (`/docs` for the OpenAPI UI)
 - Dashboard: <http://localhost:3000>
 
-Submit a migration of the bundled fixture Flask app:
+Submit a migration of the bundled fixture Flask app — via the CLI (the dev front door):
+
+```bash
+cd apps/backend && uv sync
+uv run portage migrate /fixtures/flask_app --recipe flask_to_fastapi --watch
+# streams task progress, prints the verdict; exit 0 iff fully migrated + suite green
+uv run portage jobs                     # recent runs
+uv run portage status <job-id>          # task tree + verdict
+uv run portage report <job-id> --diff   # the migration diff
+```
+
+or raw REST:
 
 ```bash
 curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
@@ -137,10 +148,33 @@ full suite green plus the expected recovery evidence in the report.
 ## Roadmap
 
 Phase 0 skeleton ✅ → Phase 1 ingest + sandbox ✅ → Phase 2 autonomous Flask→FastAPI ✅ →
-Phase 3 recovery ✅ → **Phase 4 eval harness (in progress)** — harness + `runs`/`metrics`
-tables + fault-scenario eval cases are done; remaining: grow the corpus to ≥10 pinned repos,
-run the K≥3 grid, and write the failure-taxonomy ("known limitations") report → Phase 5a CLI
-→ Phase 5b MCP server (`verify_patch_in_sandbox`, `repo_graph`, `blast_radius`) → Phase 6
-leaderboard + packaging. Known open bug: code-review-graph hangs on some real repos'
-content (Ingest degrades to no-graph mode after a timeout — migrations still complete, but
-without blast-radius test selection). See `CLAUDE.md` for the definition-of-done per phase.
+Phase 3 recovery ✅ → **Phase 4 eval harness ✅** — K=3 grid across a 6-repo pinned corpus
+(4 difficulty tiers) with mean±variance and cost, 100% injected-fault recovery on the
+stable tier, and the failure-taxonomy report in **`corpus/FINDINGS.md`** (9 categories,
+each with evidence and a fix direction; the corpus-breadth trade-off is itself a
+documented finding) → **Phase 5a CLI (next)** → Phase 5b MCP server
+(`verify_patch_in_sandbox`, `repo_graph`, `blast_radius`) → Phase 6 leaderboard +
+packaging. See `CLAUDE.md` for the definition-of-done per phase.
+
+Phase 5a is done: the `portage` CLI (above) is the terminal front door — a thin client
+over the same REST API the dashboard uses, with honest exit codes (0 only when every task
+completed AND the full suite passed).
+
+Phase 5b is done: the **MCP server** exposes the verified core to other agents. In this
+repo, Claude Code picks it up automatically via `.mcp.json`; for Cursor, add the same
+entry to `~/.cursor/mcp.json`:
+
+```json
+{ "mcpServers": { "portage": {
+    "command": "uv",
+    "args": ["run", "--project", "/path/to/Portage/apps/backend",
+             "python", "-m", "portage_agent.mcp"] } } }
+```
+
+Tools: `verify_patch_in_sandbox(repo_path, diff, test_args)` — apply a proposed unified
+diff to a *copy* of the repo and run its tests in the network-off sandbox (the same
+sandbox the eval numbers were measured on), returning structured pass/fail with failing
+test names, so an agent can test its work *before* writing to disk; `repo_graph(repo_path)`
+and `blast_radius(repo_path, changed_files)` — the structural map and impact set.
+Requires Docker + the sandbox image (`docker compose --profile tools build sandbox`);
+graph tools need `uv tool install code-review-graph`.
