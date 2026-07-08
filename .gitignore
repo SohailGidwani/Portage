@@ -35,3 +35,6 @@ pnpm-debug.log*
 .idea/
 .vscode/
 *.swp
+
+# v3 strategy draft (candid cost/security notes) — deliberately not committed
+portage-v3-cloud-plan.md

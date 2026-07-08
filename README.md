@@ -10,19 +10,26 @@ request/response handling, async, blueprints→routers need *understanding*, not
 rewriting). Migrations are pluggable "recipes", so the architecture generalizes; the
 differentiator is the durability/recovery story plus the eval harness.
 
-**Status: Phase 4 (eval harness) in progress — the first real OSS repo has been migrated
-autonomously** (`minimal-flask-api`, suite green 2/2, ~$0.01, no recovery needed). The
-recipe-agnostic harness drives (corpus × fault-scenarios × K runs) through the real
-pipeline and persists mean±variance metrics to the `runs`/`metrics` tables; the corpus is
-at 3 pinned entries and growing (curation criteria + vetting log in `corpus/README.md`,
-including honestly-documented failures — Flask-RESTX marshalling is the first standing
-"known limitation").
+**Status: Phases 0–5 complete.** The engine migrates real OSS repos autonomously and its
+reliability is *measured*, not claimed: a K=3 eval grid over a 6-repo pinned corpus (4
+difficulty tiers) with mean±variance, cost, and **100% injected-fault recovery on the
+stable tier** — JSON-API repos migrate green for ~$0.01–0.02 each; template/extension-
+heavy apps are an honestly-documented frontier (the failure taxonomy, with evidence and
+fix directions per category, lives in [`corpus/FINDINGS.md`](corpus/FINDINGS.md)). One
+core, two interfaces: the **`portage` CLI** drives autonomous migrations from the
+terminal; the **MCP server** lets other AI agents (Claude Code, Cursor) use the verified
+sandbox and code graph as tools. What remains is Phase 6: packaging (leaderboard,
+chaos-recovery demo, methodology writeup).
+
 A submitted job runs the full **Ingest → Plan → Execute → Verify → (Recover) → Integrate →
-Report** graph: it clones the repo, builds a structural knowledge graph, plans a per-file task
-DAG, migrates each file with an LLM on a git worktree, runs the affected tests in an ephemeral
-network-off Docker sandbox, and, when verification fails, classifies the failure and picks a
-bounded recovery strategy before reporting honestly. Everything is checkpointed to Postgres,
-so killing the worker mid-run resumes from the last node without re-doing finished work.
+Report** graph: it clones the repo (optionally SHA-pinned), builds a structural knowledge
+graph, plans a per-file task DAG, migrates each file with an LLM on a git worktree, runs
+the blast-radius-affected tests in an ephemeral network-off Docker sandbox, and, when
+verification fails, classifies the failure and picks a bounded recovery strategy before
+reporting honestly. Everything is checkpointed to Postgres, so killing the worker mid-run
+resumes from the last node without re-doing finished work — and a run that recovery rolls
+back never scores as a success (green requires every task completed *and* the full suite
+passing).
 
 ## What "recovery" means (Phase 3)
 
@@ -89,26 +96,122 @@ docker compose up            # db -> api (runs migrations) -> worker -> frontend
 - API: <http://localhost:8000> (`/docs` for the OpenAPI UI)
 - Dashboard: <http://localhost:3000>
 
-Submit a migration of the bundled fixture Flask app — via the CLI (the dev front door):
+Then migrate something — see the next section.
+
+## The CLI — autonomous mode from the terminal
+
+The `portage` command is a thin client over the same REST API the dashboard uses; it
+never touches the DB or queue directly.
 
 ```bash
-cd apps/backend && uv sync
+cd apps/backend && uv sync              # installs the `portage` console script
+```
+
+**Migrate and watch** (the 30-second demo — streams task progress, prints the verdict):
+
+```bash
 uv run portage migrate /fixtures/flask_app --recipe flask_to_fastapi --watch
-# streams task progress, prints the verdict; exit 0 iff fully migrated + suite green
-uv run portage jobs                     # recent runs
-uv run portage status <job-id>          # task tree + verdict
-uv run portage report <job-id> --diff   # the migration diff
 ```
 
-or raw REST:
+```
+submitted 32a69b0f-…  (flask_to_fastapi on /fixtures/flask_app)
+  running  src/flaskapp/api.py (attempt 1)
+  done     src/flaskapp/api.py (attempt 1)
+  …
+tests    : 6/6
+tasks    : 3/3 done
+verdict  : GREEN — migrated, full suite passing
+```
+
+**Real repos, reproducibly** — pin a commit; apps living in a subdirectory work too:
 
 ```bash
-curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
-  -d '{"repo_url":"/fixtures/flask_app","migration_recipe":"flask_to_fastapi"}'
+uv run portage migrate https://github.com/markdouthwaite/minimal-flask-api \
+  --ref 91ae6abe493bef44fb21e4b9c34e8e94d9d2eae9 --watch
+
+uv run portage migrate https://github.com/pallets/flask \
+  --ref 36e4a824f340fdee7ed50937ba8e7f6bc7d17f81 \
+  --subdir examples/tutorial --watch                       # the Flaskr tutorial
 ```
 
-A recipe the planner doesn't recognize degrades gracefully: the run becomes
-ingest→verify→report (test the repo, build its graph, report; no changes).
+**Inspect** any job later:
+
+```bash
+uv run portage jobs --limit 10          # one line per run
+uv run portage status <job-id>          # task tree, attempts, verdict
+uv run portage report <job-id>          # report.json: recovery actions, LLM cost, …
+uv run portage report <job-id> --diff > migration.patch
+```
+
+**Exit codes are honest** (the same bar the eval harness scores) — safe to gate CI on:
+
+| exit | meaning |
+|---|---|
+| 0 | every planned task completed, none rolled back, full test suite green |
+| 1 | job finished but the migration is not complete-and-green |
+| 2 | usage/infra: unknown job id, unreachable API, bad arguments |
+
+A run where recovery gave up and rolled files back exits 1 even though the (original)
+suite passes — the CLI cannot be fooled by a giving-up run. `PORTAGE_API` (or `--api`)
+points at a remote control plane. A recipe that doesn't match the repo degrades
+gracefully: the run becomes ingest→verify→report (tests run, nothing changed, verdict
+RED). Raw REST works too: `POST /jobs` with `{"repo_url", "migration_recipe", "config"}`.
+
+## The MCP server — Portage as tools for other agents
+
+The co-pilot interface: expose the *verified core* (the same sandbox and code graph the
+eval numbers were measured on) to Claude Code, Cursor, or any MCP client, so an agent can
+**test its proposed changes before writing them to your tree**.
+
+**Wiring.** In this repo, Claude Code picks the server up automatically from `.mcp.json`.
+Anywhere else:
+
+```bash
+claude mcp add portage -- uv run --project /path/to/Portage/apps/backend \
+  python -m portage_agent.mcp
+```
+
+Cursor (`~/.cursor/mcp.json`):
+
+```json
+{ "mcpServers": { "portage": {
+    "command": "uv",
+    "args": ["run", "--project", "/path/to/Portage/apps/backend",
+             "python", "-m", "portage_agent.mcp"] } } }
+```
+
+Prerequisites: Docker + the sandbox image (`docker compose --profile tools build
+sandbox`); the graph tools additionally need `uv tool install code-review-graph`. The
+compose stack does **not** need to be running — the MCP server is standalone.
+
+**The tools:**
+
+- **`verify_patch_in_sandbox(repo_path, diff, test_args?, timeout_seconds?)`** — applies
+  a unified diff to a *copy* of the repo (the caller's tree is never modified) and runs
+  the tests under `--network none`. Returns structured results either way:
+
+  ```json
+  {"ok": true, "applied": true, "passed": false,
+   "tests": {"total": 6, "passed": 3, "failed": 3, "errors": 0, "skipped": 0},
+   "failing": ["tests.test_api::test_create_and_fetch_item", "…"],
+   "output_tail": "…pytest output…"}
+  ```
+
+  An empty diff answers "is this repo green as-is?"; a malformed diff returns a readable
+  `{"ok": false, "error": "diff does not apply", …}` instead of a protocol error.
+- **`repo_graph(repo_path)`** — builds/refreshes the structural knowledge graph
+  (full build first time, incremental after) and returns its summary (files, nodes,
+  edges). Requires the repository root (a `.git` directory).
+- **`blast_radius(repo_path, changed_files)`** — the impact set of a proposed change:
+  affected callers/dependents/tests, the same query Portage's own planner uses to scope
+  verification.
+
+**The intended loop** — an agent asked to change code in repo R: `repo_graph(R)` once →
+`blast_radius(R, files)` to know what it might break → draft a diff *without writing it*
+→ `verify_patch_in_sandbox(R, diff, test_args=affected)` → green: write to disk; red:
+iterate on `failing` + `output_tail`.
+
+**Every scenario for both interfaces, with full examples: [`docs/USAGE.md`](docs/USAGE.md).**
 
 ## Verifying the DoDs
 
@@ -137,8 +240,9 @@ full suite green plus the expected recovery evidence in the report.
 - `apps/frontend`: Next.js (App Router, TS, pnpm). Observability dashboard: full-width
   jobs+eval view (launch form with pinned-ref support, status filters, windowed table),
   job-detail with the live pipeline route, per-file diffs, attempt timelines, recovery.
-- `corpus/`: the pinned eval corpus (`corpus.toml`) + curation criteria, vetting log, and
-  first findings (`corpus/README.md`).
+- `corpus/`: the pinned eval corpus (`corpus.toml`), curation criteria + vetting log
+  (`corpus/README.md`), and the failure taxonomy (`corpus/FINDINGS.md`).
+- `docs/`: the full usage guide (`docs/USAGE.md`) — every CLI and MCP scenario.
 - `scripts/`: per-phase DoD checks + `vet_corpus_repo.sh`.
 - `infra/terraform/`: IaC (minimal; later phases).
 - `code-migration-agent-planV2.md`: the full architecture & build plan (**source of truth**),
@@ -148,33 +252,28 @@ full suite green plus the expected recovery evidence in the report.
 ## Roadmap
 
 Phase 0 skeleton ✅ → Phase 1 ingest + sandbox ✅ → Phase 2 autonomous Flask→FastAPI ✅ →
-Phase 3 recovery ✅ → **Phase 4 eval harness ✅** — K=3 grid across a 6-repo pinned corpus
+Phase 3 recovery ✅ → Phase 4 eval harness ✅ — K=3 grid across the 6-repo pinned corpus
 (4 difficulty tiers) with mean±variance and cost, 100% injected-fault recovery on the
 stable tier, and the failure-taxonomy report in **`corpus/FINDINGS.md`** (9 categories,
 each with evidence and a fix direction; the corpus-breadth trade-off is itself a
-documented finding) → **Phase 5a CLI (next)** → Phase 5b MCP server
-(`verify_patch_in_sandbox`, `repo_graph`, `blast_radius`) → Phase 6 leaderboard +
-packaging. See `CLAUDE.md` for the definition-of-done per phase.
+documented finding) → Phase 5a CLI ✅ → Phase 5b MCP server ✅ (both above) →
+**Phase 6 (next): packaging** — leaderboard over the `runs`/`metrics` tables, the
+chaos-recovery demo view, the kill-and-resume demo, and the methodology writeup. See
+`CLAUDE.md` for the definition-of-done per phase.
 
-Phase 5a is done: the `portage` CLI (above) is the terminal front door — a thin client
-over the same REST API the dashboard uses, with honest exit codes (0 only when every task
-completed AND the full suite passed).
+### Headline numbers (K=3 baseline grid, GPT-4o driver — from the `runs` table)
 
-Phase 5b is done: the **MCP server** exposes the verified core to other agents. In this
-repo, Claude Code picks it up automatically via `.mcp.json`; for Cursor, add the same
-entry to `~/.cursor/mcp.json`:
+| corpus repo | tier | green | avg test-pass | avg cost | avg wall |
+|---|---|---|---|---|---|
+| flask-items-fixture | baseline | 3/3 | 1.00 | $0.022 | 10s |
+| minimal-flask-api | baseline | 2/3 | 0.67 | $0.013 | 10s |
+| flask-restx-api | framework | 1/3 | 0.67 | $0.044 | 17s |
+| flaskr (Flask tutorial) | structural | 0/3 | 0.67 | $0.250 | 55s |
+| watchlist | structural | 0/3 | 0.67 | $0.261 | 61s |
+| microblog | heavy | 0/3 | 0.00 | $1.503 | 165s |
 
-```json
-{ "mcpServers": { "portage": {
-    "command": "uv",
-    "args": ["run", "--project", "/path/to/Portage/apps/backend",
-             "python", "-m", "portage_agent.mcp"] } } }
-```
-
-Tools: `verify_patch_in_sandbox(repo_path, diff, test_args)` — apply a proposed unified
-diff to a *copy* of the repo and run its tests in the network-off sandbox (the same
-sandbox the eval numbers were measured on), returning structured pass/fail with failing
-test names, so an agent can test its work *before* writing to disk; `repo_graph(repo_path)`
-and `blast_radius(repo_path, changed_files)` — the structural map and impact set.
-Requires Docker + the sandbox image (`docker compose --profile tools build sandbox`);
-graph tools need `uv tool install code-review-graph`.
+Plus fault injection on the stable tier: corrupted patches and escalation-requiring
+corruption both recovered **3/3** (rollback+regenerate; measured model escalation).
+"Green" is strict — full task completion *and* full suite passing; a 0.67 test-pass row
+means most tests pass but the all-or-nothing bar isn't met. The reds are analyzed, not
+hidden: see `corpus/FINDINGS.md`.
