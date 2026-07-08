@@ -34,6 +34,8 @@ services:
       # Read-only: GET /jobs/{id}/report serves report.json off the shared volume. Only
       # the worker writes to it.
       - workspaces:/workspaces:ro
+      # Corpus manifest, for tier labels on the /eval/leaderboard proof page.
+      - ./corpus:/corpus:ro
     depends_on:
       db:
         condition: service_healthy
