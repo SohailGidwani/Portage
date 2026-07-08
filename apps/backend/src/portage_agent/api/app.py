@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import bindparam, select, text
 
 from portage_agent.db import task_store
 from portage_agent.db.models import EvalRun, Job
@@ -83,15 +83,86 @@ async def list_jobs(limit: int = 50) -> list[Job]:
     return list(rows)
 
 
-@app.get("/eval/runs")
-async def list_eval_runs(limit: int = 25) -> list[dict]:
-    """Latest harness runs (the `runs` table) — the dashboard's eval panel."""
+@app.get("/eval/leaderboard")
+async def eval_leaderboard(suites: str = "") -> dict:
+    """The proof-page aggregate: per (corpus repo × scenario) over the `runs` table —
+    green rate, test-pass mean±variance, cost, wall, recovery/escalation. Aggregate
+    numbers only (rev-C isolation rule: no user repo contents on shared surfaces).
+    ``suites``: optional comma-separated filter; response lists distinct suites so the
+    client can offer a selector."""
+    wanted = [s.strip() for s in suites.split(",") if s.strip()]
+    where = "WHERE suite IN :suites" if wanted else ""
+    sql = text(f"""
+        SELECT corpus_name, scenario,
+               count(*)                                    AS runs,
+               count(*) FILTER (WHERE status = 'green')    AS green,
+               avg(tests_passed::float / nullif(tests_total, 0))      AS test_pass_mean,
+               variance(tests_passed::float / nullif(tests_total, 0)) AS test_pass_variance,
+               avg(cost_usd)                               AS cost_mean,
+               avg(wall_seconds)                           AS wall_mean,
+               avg(recover_visits)                         AS recover_visits_mean,
+               sum(escalation_attempted)                   AS escalation_attempted,
+               sum(escalation_rescued)                     AS escalation_rescued
+          FROM runs {where}
+      GROUP BY corpus_name, scenario
+      ORDER BY scenario, corpus_name
+    """)
+    if wanted:
+        sql = sql.bindparams(bindparam("suites", expanding=True))
     async with AsyncSessionLocal() as session:
-        rows = (
+        params = {"suites": wanted} if wanted else {}
+        rows = (await session.execute(sql, params)).mappings().all()
+        suite_rows = (
             await session.execute(
-                select(EvalRun).order_by(EvalRun.created_at.desc()).limit(limit)
+                text("SELECT suite, max(created_at) AS latest FROM runs "
+                     "GROUP BY suite ORDER BY latest DESC")
             )
-        ).scalars().all()
+        ).mappings().all()
+
+    # Tier/notes come from the corpus manifest when it's mounted (compose mounts
+    # ./corpus into api); the endpoint degrades to tierless rows without it.
+    tiers: dict[str, str] = {}
+    try:
+        from portage_agent.eval.corpus import load_corpus
+
+        tiers = {r.name: r.tier for r in load_corpus("/corpus/corpus.toml")}
+    except Exception:  # noqa: BLE001 - manifest optional here
+        pass
+
+    return {
+        "suites": [s["suite"] for s in suite_rows],
+        "rows": [
+            {
+                "corpus_name": r["corpus_name"],
+                "tier": tiers.get(r["corpus_name"], ""),
+                "scenario": r["scenario"],
+                "runs": r["runs"],
+                "green": r["green"],
+                "green_rate": round(r["green"] / r["runs"], 3) if r["runs"] else 0.0,
+                "test_pass_mean": round(float(r["test_pass_mean"] or 0), 3),
+                "test_pass_variance": round(float(r["test_pass_variance"] or 0), 5),
+                "cost_mean": round(float(r["cost_mean"] or 0), 4),
+                "wall_mean": round(float(r["wall_mean"] or 0), 1),
+                "recover_visits_mean": round(float(r["recover_visits_mean"] or 0), 1),
+                "escalation_attempted": int(r["escalation_attempted"] or 0),
+                "escalation_rescued": int(r["escalation_rescued"] or 0),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/eval/runs")
+async def list_eval_runs(limit: int = 25, scenario: str = "") -> list[dict]:
+    """Latest harness runs (the `runs` table) — the dashboard's eval panel.
+    ``scenario=faults`` filters to fault-injection runs (the chaos-recovery view)."""
+    async with AsyncSessionLocal() as session:
+        q = select(EvalRun).order_by(EvalRun.created_at.desc()).limit(limit)
+        if scenario == "faults":
+            q = q.where(EvalRun.scenario != "baseline")
+        elif scenario:
+            q = q.where(EvalRun.scenario == scenario)
+        rows = (await session.execute(q)).scalars().all()
     return [
         {
             "id": str(r.id), "suite": r.suite, "corpus_name": r.corpus_name,

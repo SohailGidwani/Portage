@@ -110,9 +110,35 @@ export type EvalRun = {
   created_at: string;
 };
 
-export async function listEvalRuns(): Promise<EvalRun[]> {
-  const r = await fetch(`${API_BASE}/eval/runs`, { cache: "no-store" });
+export async function listEvalRuns(scenario?: string): Promise<EvalRun[]> {
+  const q = scenario ? `?scenario=${encodeURIComponent(scenario)}&limit=50` : "";
+  const r = await fetch(`${API_BASE}/eval/runs${q}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`listEvalRuns ${r.status}`);
+  return r.json();
+}
+
+export type LeaderboardRow = {
+  corpus_name: string;
+  tier: string;
+  scenario: string;
+  runs: number;
+  green: number;
+  green_rate: number;
+  test_pass_mean: number;
+  test_pass_variance: number;
+  cost_mean: number;
+  wall_mean: number;
+  recover_visits_mean: number;
+  escalation_attempted: number;
+  escalation_rescued: number;
+};
+
+export type Leaderboard = { suites: string[]; rows: LeaderboardRow[] };
+
+export async function getLeaderboard(suites?: string[]): Promise<Leaderboard> {
+  const q = suites && suites.length ? `?suites=${encodeURIComponent(suites.join(","))}` : "";
+  const r = await fetch(`${API_BASE}/eval/leaderboard${q}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`getLeaderboard ${r.status}`);
   return r.json();
 }
 

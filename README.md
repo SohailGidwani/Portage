@@ -31,6 +31,17 @@ resumes from the last node without re-doing finished work — and a run that rec
 back never scores as a success (green requires every task completed *and* the full suite
 passing).
 
+## The durability story, in one GIF
+
+Kill the worker mid-migration; a restarted worker reclaims the job lease, resumes from
+the Postgres checkpoint (Ingest runs exactly once — the clone and graph build are never
+repeated), and finishes the migration green:
+
+![kill the worker mid-run, watch it resume from checkpoint](docs/assets/kill-resume.gif)
+
+Reproduce it yourself: `bash scripts/demo_kill_resume.sh` (or the stricter assertion
+version, `scripts/dod_check.sh`).
+
 ## What "recovery" means (Phase 3)
 
 A failed Verify routes to the **Recover** node, which classifies the failure and picks one of
@@ -276,4 +287,6 @@ Plus fault injection on the stable tier: corrupted patches and escalation-requir
 corruption both recovered **3/3** (rollback+regenerate; measured model escalation).
 "Green" is strict — full task completion *and* full suite passing; a 0.67 test-pass row
 means most tests pass but the all-or-nothing bar isn't met. The reds are analyzed, not
-hidden: see `corpus/FINDINGS.md`.
+hidden: see `corpus/FINDINGS.md`. **How these numbers are produced (and what they don't
+show): [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).** Live rendering: the dashboard's
+`/eval` proof page (leaderboard + chaos-recovery view over the `runs`/`metrics` tables).

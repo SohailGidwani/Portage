@@ -118,6 +118,8 @@ export default function Home() {
           </span>
         </h1>
         <span className="syscheck">
+          <Link href="/eval">eval proof</Link>
+          {" · "}
           {health ? (
             <>
               api <span className="ok">ok</span> · db{" "}
