@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # Global daily LLM spend cap (USD): past it, new jobs get 503 "at capacity". 0 disables.
     global_daily_spend_cap_usd: float = 0.0
 
+    # --- Phase 8: hosted deployment ---
+    # Path prefix the public reverse proxy serves the API under ("/api" behind Caddy's
+    # handle_path, which strips it before proxying). Affects *generated* URLs — docs,
+    # OAuth redirect_uri, the refresh-cookie path — not routing. Empty for local dev.
+    api_root_path: str = ""
+    # Container runtime for sandbox containers ("runsc" = gVisor on the hosted box).
+    # Empty => the daemon default (runc); local dev hosts usually lack runsc.
+    sandbox_runtime: str = ""
+
     # --- Phase 2/3: Execute / recovery budgets ---
     # Optional per-task delay in Execute (seconds) — a deterministic window to kill the
     # worker mid-Execute and prove content-hash resume skips already-applied tasks. 0 normally.

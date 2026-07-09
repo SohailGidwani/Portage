@@ -1,0 +1,15 @@
+# Stage-1 IP smoke test (P8 runbook A9): publish the API on ALL interfaces so
+# `http://<elastic-ip>:8000` works before DNS/TLS exist. Requires the EC2 security group
+# to temporarily allow inbound 8000. Browser login won't fully work over plain HTTP
+# (the refresh cookie is Secure) — that's expected at this stage.
+#
+# Never part of the default `up`; opt in explicitly:
+#   docker compose -f docker-compose.yml -f docker-compose.stage1.yml up -d
+#
+# (Named stage1, NOT docker-compose.override.yml — compose auto-loads that filename into
+# every plain `docker compose up`, which is exactly what this must not do.)
+
+services:
+  api:
+    ports: !override
+      - "8000:8000"

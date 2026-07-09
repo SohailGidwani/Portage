@@ -33,7 +33,10 @@ from .schemas import JobCreate, JobOut, TaskOut
 setup_logging()
 log = logging.getLogger("portage.api")
 
-app = FastAPI(title="Portage API", version="0.0.0")
+# root_path: hosted deployments serve the API behind a proxy prefix (Caddy strips /api
+# before proxying). Routing is unchanged; docs URLs, url_for (the OAuth redirect_uri) and
+# the refresh-cookie path pick the prefix up from here.
+app = FastAPI(title="Portage API", version="0.0.0", root_path=settings.api_root_path)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter

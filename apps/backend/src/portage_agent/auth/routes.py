@@ -25,6 +25,10 @@ log = logging.getLogger("portage.auth")
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _COOKIE = "portage_refresh"
+# Cookie paths are matched against what the BROWSER sees: behind the hosted proxy that is
+# `/api/auth/...` (Caddy strips `/api` before the app routes it), so the scope must carry
+# the root_path prefix or the cookie never returns to /auth/refresh.
+_COOKIE_PATH = f"{settings.api_root_path}/auth"
 
 
 def _cookie_kwargs() -> dict:
@@ -32,7 +36,7 @@ def _cookie_kwargs() -> dict:
         "httponly": True,
         "secure": settings.frontend_origin.startswith("https"),
         "samesite": "lax",  # top-level redirect from GitHub must carry it
-        "path": "/auth",
+        "path": _COOKIE_PATH,
         "max_age": settings.refresh_token_ttl_days * 86400,
     }
 
@@ -76,7 +80,7 @@ async def refresh_session(request: Request, response: Response) -> dict:
         raise HTTPException(status_code=401, detail="no session")
     rotated = await service.rotate_refresh(plaintext)
     if rotated is None:
-        response.delete_cookie(_COOKIE, path="/auth")
+        response.delete_cookie(_COOKIE, path=_COOKIE_PATH)
         raise HTTPException(status_code=401, detail="session expired or reused")
     user, new_refresh = rotated
     response.set_cookie(_COOKIE, new_refresh, **_cookie_kwargs())
@@ -91,7 +95,7 @@ async def logout(request: Request, response: Response) -> dict:
     plaintext = request.cookies.get(_COOKIE, "")
     if plaintext:
         await service.revoke_refresh(plaintext)
-    response.delete_cookie(_COOKIE, path="/auth")
+    response.delete_cookie(_COOKIE, path=_COOKIE_PATH)
     return {"ok": True}
 
 

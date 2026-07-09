@@ -1,18 +1,25 @@
 # Portage — canonical local/VM stack. `docker compose up` brings up the whole thing.
-# Phase 0 services: db (Postgres+pgvector), api (FastAPI), worker (LangGraph), frontend.
+# Services: db (Postgres+pgvector), api (FastAPI), worker (LangGraph), frontend, and —
+# hosted only — caddy (TLS edge; enable with COMPOSE_PROFILES=edge in .env).
 #
 # Startup ordering via healthchecks:  db (healthy) -> api (migrates, then healthy) -> worker.
 # The worker waiting on api means the schema exists before it claims jobs.
+#
+# Port policy (P8): app services bind to 127.0.0.1 only — on the hosted box the sole
+# public listener is Caddy on 80/443; on a dev machine localhost:8000/3000 keep working
+# (the DoD scripts and the Stage-2 smoke test in the runbook rely on host-local curl).
+# Stage-1 IP smoke testing re-publishes the API via docker-compose.stage1.yml.
 
 services:
   db:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-portage}
       POSTGRES_USER: ${POSTGRES_USER:-portage}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-portage}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -24,12 +31,13 @@ services:
   api:
     build:
       context: ./apps/backend
+    restart: unless-stopped
     env_file: .env
     environment:
       POSTGRES_HOST: db
     command: ["sh", "docker/entrypoint-api.sh"]
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       # Read-only: GET /jobs/{id}/report serves report.json off the shared volume. Only
       # the worker writes to it.
@@ -49,6 +57,7 @@ services:
   worker:
     build:
       context: ./apps/backend
+    restart: unless-stopped
     env_file: .env
     environment:
       POSTGRES_HOST: db
@@ -72,14 +81,38 @@ services:
   frontend:
     build:
       context: ./apps/frontend
-    environment:
-      # Browser-side fetches hit the host-mapped API port (NOT the `api` service name).
-      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+      args:
+        # NEXT_PUBLIC_* is inlined into the client bundle at BUILD time — it must be a
+        # build arg, not runtime environment. Local default: the host-mapped API port.
+        # Hosted: https://<domain>/api (same origin, through Caddy).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       api:
         condition: service_healthy
+
+  # TLS edge (hosted only): the single public listener. Terminates HTTPS for the DuckDNS
+  # hostname (automatic Let's Encrypt) and reverse-proxies /api/* -> api, rest -> frontend.
+  # Behind the `edge` profile so local `docker compose up` never starts it; the hosted box
+  # sets COMPOSE_PROFILES=edge in .env.
+  caddy:
+    image: caddy:2
+    profiles: ["edge"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_started
 
   # Ephemeral test-runner image. Behind the `tools` profile so `docker compose up` never
   # starts it; the worker `docker run`s it per verification. Build it explicitly with:
@@ -95,3 +128,5 @@ services:
 volumes:
   pgdata:
   workspaces:
+  caddy_data:
+  caddy_config:

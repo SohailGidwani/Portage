@@ -1,0 +1,20 @@
+# Portage hosted edge (P8). Caddy is the only public listener on the box: it terminates
+# TLS for the DuckDNS hostname (automatic Let's Encrypt — needs port 80 open + DNS
+# resolving) and reverse-proxies into the compose network.
+#
+# handle_path STRIPS the /api prefix before proxying, so external /api/jobs hits the
+# FastAPI app at /jobs. The app knows about the prefix only via API_ROOT_PATH=/api
+# (generated URLs: docs, OAuth redirect_uri, cookie path) — never prefix routes in code.
+#
+# Cert-issuance rehearsal without burning LE rate limits: temporarily add inside the
+# site block ->  tls { ca https://acme-staging-v02.api.letsencrypt.org/directory }
+
+portage-agent.duckdns.org {
+    encode gzip
+    handle_path /api/* {
+        reverse_proxy api:8000
+    }
+    handle {
+        reverse_proxy frontend:3000
+    }
+}

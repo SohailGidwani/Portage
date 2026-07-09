@@ -1,8 +1,8 @@
 // Thin REST client. NO ORM, NO DB — the backend is the single schema source of truth.
-// Browser-side calls hit the host-mapped API port (set via NEXT_PUBLIC_API_BASE).
+// Browser-side calls hit the host-mapped API port (set via NEXT_PUBLIC_API_URL).
 
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // ---------------------------------------------------------------------------- auth
 // Access JWT lives in module memory only (dies with the tab). The refresh token is an

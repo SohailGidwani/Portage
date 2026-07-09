@@ -31,10 +31,14 @@ class DockerSandbox:
         image: str | None = None,
         volume: str | None = None,
         mount: str | None = None,
+        runtime: str | None = None,
     ) -> None:
         self.image = image or settings.sandbox_image
         self.volume = volume or settings.workspaces_volume
         self.mount = mount or settings.workspaces_mount
+        # SANDBOX_RUNTIME=runsc puts every sandbox under gVisor (hosted, P8). Installing
+        # runsc on the host only makes it available — it must be requested per-run.
+        self.runtime = runtime if runtime is not None else settings.sandbox_runtime
 
     async def run(
         self, command: list[str], *, workdir: str, timeout: int | None = None,
@@ -50,6 +54,7 @@ class DockerSandbox:
             env_args += ["-e", f"{k}={v}"]
         docker_args = [
             "docker", "run", "--rm", "--name", name,
+            *(["--runtime", self.runtime] if self.runtime else []),
             "--network", "none",
             "--cpus", settings.sandbox_cpus,
             "--memory", settings.sandbox_memory,
