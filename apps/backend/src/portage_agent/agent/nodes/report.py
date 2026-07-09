@@ -16,6 +16,7 @@ from portage_agent.db import task_store
 from portage_agent.storage import LocalStorage
 
 from ..state import GraphState
+from .redaction import scrub
 
 log = logging.getLogger("portage.agent")
 
@@ -77,7 +78,9 @@ async def report_node(state: GraphState) -> GraphState:
         "verify_summary": verify_summary,
         "integrate_summary": integrate_summary,
         "test_summary": final,
-        "diff": state.get("diff", ""),
+        # Scrubbed (Phase 7): the diff's removed lines carry original file content, and
+        # the report is served over the API.
+        "diff": scrub(state.get("diff", "")),
     }
     path = await LocalStorage().put(
         f"{job_id}/report.json",

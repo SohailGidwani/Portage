@@ -28,6 +28,9 @@ dependencies = [
     "litellm>=1.55",
     # CLI (Phase 5a) — thin sync REST client over the control-plane API.
     "httpx>=0.27",
+    # Auth (Phase 7): access JWTs + per-route rate limiting.
+    "pyjwt>=2.8",
+    "slowapi>=0.1.9",
 ]
 
 [project.scripts]
@@ -53,9 +56,15 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# B008: `Depends(...)` in argument defaults is THE FastAPI dependency idiom.
+extend-per-file-ignores = { "src/portage_agent/api/**" = ["B008"], "src/portage_agent/auth/**" = ["B008"] }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# One event loop for the whole session: the module-level async engine pools connections
+# bound to a loop; per-test loops would poison the pool ("Event loop is closed").
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 # The fixture repo under tests/fixtures is a separate package with its own tests — it is
 # ingested/run by the sandbox, never collected by the backend's own suite.
 addopts = "--ignore=tests/fixtures"

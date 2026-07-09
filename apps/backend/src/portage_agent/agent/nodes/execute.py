@@ -48,6 +48,7 @@ from .common import (
     worktree_diff,
     write_file,
 )
+from .redaction import is_denied_path, scrub
 
 log = logging.getLogger("portage.agent")
 
@@ -97,9 +98,11 @@ def _gather_context(
             continue
         if rel in target_paths and rel not in done_paths:
             continue
+        if is_denied_path(rel):
+            continue
         body = read_file(worktree, rel)
         if body is not None:
-            ctx[rel] = body
+            ctx[rel] = scrub(body)
     return ctx
 
 
@@ -108,7 +111,7 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
                         verify_errors: str, prior_attempt: str = "") -> tuple[str, dict]:
     """Call the model for one file; return (migrated content, usage) — content not yet
     written. Usage feeds the attempts_log entry (cost-per-migration is an eval metric)."""
-    source = read_file(worktree, path, limit=20000) or ""
+    source = scrub(read_file(worktree, path, limit=20000) or "")
     planned = PlannedFile(path=path, role=role, subtasks=subtasks)
     user = recipe.build_user_prompt(file=planned, source=source, context=context)
     # The export contract, stated explicitly: what sibling files import from this module.
@@ -165,11 +168,28 @@ async def execute_node(state: GraphState) -> GraphState:
     log.info("EXECUTE node | job=%s tasks=%s pending=%s fault=%s", job_id, len(file_tasks),
              sum(t.status == TaskStatus.pending.value for t in file_tasks), fault or "-")
 
+    # Rev-C demo protection: a retry/escalation spiral that crosses the per-job cost
+    # ceiling stops migrating and skips the remaining tasks — the run finishes with an
+    # honest red report instead of draining the demo's LLM quota.
+    ceiling = settings.job_cost_ceiling_usd
+    spent = sum(
+        a.get("cost_usd", 0.0) for t in file_tasks for a in t.attempts_log
+    )
+
     done_paths: set[str] = set()
     for t in file_tasks:
         path = t.target_path
         assert path is not None
         if t.status == TaskStatus.skipped.value:
+            continue
+        if ceiling > 0 and spent >= ceiling and t.status != TaskStatus.done.value:
+            log.warning("  cost ceiling $%.2f reached (spent $%.4f) — skipping %s",
+                        ceiling, spent, path)
+            await task_store.update_task(
+                t.id, status=TaskStatus.skipped.value, cascade_subtasks=True,
+                error=f"job cost ceiling ${ceiling:.2f} reached",
+                append_attempt={"action": "cost_ceiling_skip", "at": _now()},
+            )
             continue
         current = read_file(worktree, path, limit=20000) or ""
         # Idempotent skip (resume): already migrated and unchanged on disk.
@@ -214,6 +234,7 @@ async def execute_node(state: GraphState) -> GraphState:
             await task_store.update_task(t.id, status=TaskStatus.done.value,
                                          content_hash=h, diff=diff, cascade_subtasks=True,
                                          amend_last_attempt=usage)
+            spent += usage.get("cost_usd", 0.0)
             done_paths.add(path)
             log.info("  migrated %s (attempt=%s tier=%s model=%s, %s chars)",
                      path, attempt, tier, model_label, len(content))

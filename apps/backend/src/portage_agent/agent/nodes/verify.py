@@ -118,9 +118,12 @@ async def verify_node(state: GraphState) -> GraphState:
     if not passed and migrate:
         # Both streams: a conftest-chain import/syntax error is printed to pytest's STDERR
         # (with no test output at all), and that traceback is exactly what Recover needs
-        # to classify the failure and Execute needs as retry context.
+        # to classify the failure and Execute needs as retry context. Scrubbed (Phase 7):
+        # test output can echo credential-shaped strings, and this text re-enters prompts.
+        from .redaction import scrub
+
         combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
-        out["last_verify_errors"] = combined[-3000:]
+        out["last_verify_errors"] = scrub(combined[-3000:])
     return out
 
 
