@@ -113,6 +113,26 @@ not a single average.
 - **Escalation, measured**: with driver == escalation model (same GPT-4o deployment),
   escalation-rescue rates measure the *retry ladder machinery*, not stronger-model lift —
   swap `LLM_ESCALATION_MODEL` to a stronger deployment to measure real lift (env-only).
+- **Two-model escalation lift, MEASURED (2026-07-09, suites `qwen-ladder` vs
+  `qwen-control`)**: driver = Qwen3 Coder Next (Ollama cloud) in both arms; escalation =
+  GPT-4o (ladder) vs Qwen itself (control). Same grid: fixture + minimal-flask-api
+  baselines and fixture `bad_patch_until_escalation`, K=3 each.
+
+  | arm | green | fault-scenario green | total cost | avg wall |
+  |---|---|---|---|---|
+  | ladder (qwen → GPT-4o) | **8/9** | **3/3** | $0.093 | 39s |
+  | control (qwen → qwen) | 5/9 | 1/3 | $0.00* | 78s |
+
+  The stronger escalation tier is worth **+3 greens of 9** under identical conditions —
+  concentrated exactly where it should be: the injected-fault scenario (3/3 vs 1/3) and
+  a fixture baseline the weak driver couldn't converge alone. The ladder also halves
+  wall time (GPT-4o resolves in fewer attempts than qwen burning full budgets). Bonus
+  integrity demo: one control run went red with the suite at 6/6 — all three tasks
+  exhausted and rolled back, the ORIGINAL suite passed, and the honest-green bar refused
+  it. (*Ollama-hosted models are absent from LiteLLM's price map, so their calls cost
+  $0.00 in the ledger — the ladder arm's $0.093 is the GPT-4o share only. That
+  cost-blindness is also why the hosted demo keeps GPT-4o: the demo-protection spend
+  caps cannot see unpriceable models.)
 
 ## Corpus admission findings
 
