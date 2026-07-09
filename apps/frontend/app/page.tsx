@@ -9,11 +9,16 @@ import { useCallback, useEffect, useState } from "react";
 import {
   EvalRun,
   Job,
+  Me,
   TestSummary,
   createJob,
   getHealth,
+  getMe,
   listEvalRuns,
   listJobs,
+  loginUrl,
+  logout,
+  tryRefresh,
 } from "./lib/api";
 
 function relTime(iso: string): string {
@@ -45,6 +50,7 @@ export default function Home() {
   const [health, setHealth] = useState<{ api: boolean; db: boolean } | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
+  const [me, setMe] = useState<Me | null>(null);
   const [repoUrl, setRepoUrl] = useState("/fixtures/flask_app");
   const [repoRef, setRepoRef] = useState("");
   const [recipe, setRecipe] = useState("flask_to_fastapi");
@@ -73,6 +79,15 @@ export default function Home() {
     const t = setInterval(refresh, 2000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // Session bootstrap: try the refresh cookie once, then ask who we are. In
+  // AUTH_MODE=disabled deployments /auth/me answers without either.
+  useEffect(() => {
+    (async () => {
+      await tryRefresh();
+      setMe(await getMe());
+    })();
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -118,6 +133,26 @@ export default function Home() {
           </span>
         </h1>
         <span className="syscheck">
+          {me && me.auth_mode === "github" ? (
+            <>
+              <span className="ok">@{me.login}</span>{" "}
+              <button
+                type="button"
+                className="chip chip-btn"
+                onClick={async () => {
+                  await logout();
+                  setMe(await getMe());
+                }}
+              >
+                sign out
+              </button>
+            </>
+          ) : me === null ? (
+            <a href={loginUrl()} className="chip chip-btn" style={{ textDecoration: "none" }}>
+              sign in with GitHub
+            </a>
+          ) : null}
+          {" · "}
           <Link href="/eval">eval proof</Link>
           {" · "}
           {health ? (

@@ -87,6 +87,30 @@ class Settings(BaseSettings):
     # combined with litellm drop_params=True this is safe across providers.
     llm_temperature: float | None = 0.0
 
+    # --- Phase 7: auth & demo protection (rev-C: free demo, limits protect uptime) ---
+    # "disabled" (local default): every request acts as a synthetic local admin — DoD
+    # scripts and dev flows stay frictionless. "github": full enforcement (hosted).
+    auth_mode: str = "disabled"
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    # HS256 secret for access JWTs. MUST be overridden in hosted mode.
+    jwt_secret: str = "dev-only-not-a-secret"
+    access_token_ttl_seconds: int = 900  # 15 min
+    refresh_token_ttl_days: int = 14
+    # Where the OAuth callback sends the browser after setting the session cookie.
+    frontend_origin: str = "http://localhost:3000"
+    # CORS allowlist (comma-separated). Hosted mode must NOT include "*".
+    cors_origins: str = "http://localhost:3000"
+
+    # Demo-protection limits (env-tunable from week-1 usage; rev-C §1).
+    max_concurrent_jobs_per_user: int = 1
+    max_jobs_per_day_per_user: int = 5
+    # Per-job LLM cost ceiling (USD): a retry spiral past this aborts remaining tasks
+    # gracefully (skip path -> honest red report). 0 disables.
+    job_cost_ceiling_usd: float = 2.0
+    # Global daily LLM spend cap (USD): past it, new jobs get 503 "at capacity". 0 disables.
+    global_daily_spend_cap_usd: float = 0.0
+
     # --- Phase 2/3: Execute / recovery budgets ---
     # Optional per-task delay in Execute (seconds) — a deterministic window to kill the
     # worker mid-Execute and prove content-hash resume skips already-applied tasks. 0 normally.

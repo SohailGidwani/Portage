@@ -4,6 +4,62 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+// ---------------------------------------------------------------------------- auth
+// Access JWT lives in module memory only (dies with the tab). The refresh token is an
+// httpOnly cookie scoped to /auth — JS never sees it. `authedFetch` attaches the bearer
+// and, on 401, tries one refresh before giving up (AUTH_MODE=disabled backends never
+// 401, so local dev works with zero ceremony).
+
+let accessToken: string | null = null;
+
+export type Me = {
+  login: string;
+  role: string;
+  avatar_url: string | null;
+  auth_mode: string;
+};
+
+export async function tryRefresh(): Promise<Me | null> {
+  const r = await fetch(`${API_BASE}/auth/refresh`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!r.ok) return null;
+  const data = await r.json();
+  accessToken = data.access_token;
+  return data.user;
+}
+
+export async function getMe(): Promise<Me | null> {
+  const r = await authedFetch(`${API_BASE}/auth/me`);
+  return r.ok ? r.json() : null;
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
+  accessToken = null;
+}
+
+export function loginUrl(): string {
+  return `${API_BASE}/auth/github/login`;
+}
+
+async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
+  const withAuth = (): RequestInit => ({
+    ...init,
+    headers: {
+      ...(init?.headers ?? {}),
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+    cache: "no-store",
+  });
+  let r = await fetch(url, withAuth());
+  if (r.status === 401 && (await tryRefresh())) {
+    r = await fetch(url, withAuth());
+  }
+  return r;
+}
+
 export type TestSummary = {
   total: number;
   passed: number;
@@ -149,26 +205,26 @@ export async function getHealth(): Promise<{ status: string; db: string }> {
 }
 
 export async function getJob(id: string): Promise<Job> {
-  const r = await fetch(`${API_BASE}/jobs/${id}`, { cache: "no-store" });
+  const r = await authedFetch(`${API_BASE}/jobs/${id}`);
   if (!r.ok) throw new Error(`getJob ${r.status}`);
   return r.json();
 }
 
 export async function getJobTasks(id: string): Promise<Task[]> {
-  const r = await fetch(`${API_BASE}/jobs/${id}/tasks`, { cache: "no-store" });
+  const r = await authedFetch(`${API_BASE}/jobs/${id}/tasks`);
   if (!r.ok) throw new Error(`getJobTasks ${r.status}`);
   return r.json();
 }
 
 export async function getJobReport(id: string): Promise<Report | null> {
-  const r = await fetch(`${API_BASE}/jobs/${id}/report`, { cache: "no-store" });
+  const r = await authedFetch(`${API_BASE}/jobs/${id}/report`);
   if (r.status === 404) return null; // no report yet (job still running)
   if (!r.ok) throw new Error(`getJobReport ${r.status}`);
   return r.json();
 }
 
 export async function listJobs(): Promise<Job[]> {
-  const r = await fetch(`${API_BASE}/jobs`, { cache: "no-store" });
+  const r = await authedFetch(`${API_BASE}/jobs`);
   if (!r.ok) throw new Error(`listJobs ${r.status}`);
   return r.json();
 }
@@ -178,7 +234,7 @@ export async function createJob(input: {
   migration_recipe: string;
   config?: Record<string, unknown>;
 }): Promise<Job> {
-  const r = await fetch(`${API_BASE}/jobs`, {
+  const r = await authedFetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),

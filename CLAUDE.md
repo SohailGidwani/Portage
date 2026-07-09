@@ -195,6 +195,20 @@ Backend dev loop (host): `cd apps/backend && uv sync --extra dev && uv run ruff 
   fault-injection deltas, corpus curation, measured cost, explicit non-claims).
   Next per the v3 plan (gitignored `portage-v3-cloud-plan.md`): P7 auth (GitHub OAuth) →
   P8 hosting → P9 launch package.
+- **Phase 7 — Auth & demo protection ✅ (v3 rev-C).** `AUTH_MODE`: `disabled` (local
+  default — synthetic local admin; DoD scripts unchanged) vs `github` (hosted). GitHub
+  OAuth is the SOLE provider (no passwords/email flows). Browser sessions: 15-min access
+  JWT (frontend memory) + rotating refresh cookie (`httpOnly`, `/auth` path) with family
+  reuse-detection; machines: `pk_` API keys (sha256 at rest, revocable) — see
+  `portage_agent/auth/`. Ownership-or-admin on every `/jobs*` route (404, never 403);
+  eval endpoints stay public/aggregate-only. Demo-uptime limits: per-user concurrency +
+  daily quota, per-job LLM cost ceiling (Execute skips remaining tasks → honest red),
+  global daily spend cap off the attempts_log ledger (503 "at capacity"). Secret
+  redaction (`agent/nodes/redaction.py`): path deny-list + pattern scrub at every seam
+  where repo content leaves the sandbox (prompt context, retry errors, report diff).
+  Tests: `tests/test_auth_service.py` (rotation/reuse/keys/jwt),
+  `tests/test_redaction.py`. *DoD:* `scripts/phase7_check.sh` (unit suites + live
+  github-mode API: 401s, key auth, cross-user isolation, quota 429, public eval).
 
 ## Model ladder (Phase 2+, via LiteLLM)
 

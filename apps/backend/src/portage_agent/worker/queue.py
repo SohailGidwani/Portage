@@ -45,13 +45,17 @@ class PostgresJobQueue:
     """Concrete JobQueue. Each method uses its own short-lived session/connection, so the
     heartbeat task never shares a connection with anything running concurrently."""
 
-    async def enqueue(self, *, repo_url: str, migration_recipe: str, config: dict) -> uuid.UUID:
+    async def enqueue(
+        self, *, repo_url: str, migration_recipe: str, config: dict,
+        user_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
         job = Job(
             id=uuid.uuid4(),
             repo_url=repo_url,
             migration_recipe=migration_recipe,
             status=JobStatus.queued.value,
             config=config or {},
+            user_id=user_id,
         )
         async with AsyncSessionLocal() as session, session.begin():
             session.add(job)

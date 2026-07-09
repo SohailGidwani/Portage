@@ -50,6 +50,12 @@ class Job(Base):
 
     error: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Phase 7: owner (NULL = pre-auth legacy jobs and disabled-mode local runs).
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+        index=True,
+    )
+
     # Phase 1 results (filled by the Report node).
     report_path: Mapped[str | None] = mapped_column(String, nullable=True)
     test_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -125,6 +131,76 @@ class Task(Base):
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         kind = "Subtask" if self.parent_id else "Task"
         return f"<{kind} {self.type} {self.target_path or ''} {self.status}>"
+
+
+class User(Base):
+    """A GitHub-authenticated user (Phase 7; rev-C: GitHub OAuth is the sole provider —
+    no passwords, no email flows). `role` gates admin surfaces server-side."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    github_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False, index=True)
+    login: Mapped[str] = mapped_column(String, nullable=False)
+    avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    disabled: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"<User {self.login} {self.role}>"
+
+
+class ApiKey(Base):
+    """Machine credential (CLI/MCP/CI). Only the SHA-256 hash is stored; the plaintext
+    (prefix `pk_`) is shown once at creation. High-entropy random tokens don't need a
+    slow hash — revocation is the security property, per key."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+
+class RefreshToken(Base):
+    """One rotating browser session. `family_id` groups a rotation chain: presenting an
+    already-rotated (revoked) token is reuse — the whole family is revoked (stolen-token
+    containment). The active-session list per user IS this table."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    family_id: Mapped[uuid.UUID] = mapped_column(PgUUID(as_uuid=True), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class EvalRun(Base):

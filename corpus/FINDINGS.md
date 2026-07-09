@@ -104,6 +104,12 @@ not a single average.
   original suite then passes. Caught live (a "GREEN 24/24" with an empty diff): now the
   report reloads task truth from Postgres, the diff is always recomputed, and green
   requires full completion. The eval cannot be gamed by giving up.
+- **Skip-out false pass** (found 2026-07-09, fixed): a model migrated a test file by
+  decorating every test with skip — pytest reported total>0, failed=0, errors=0, and
+  Verify's predicate called that a PASS, so recovery never fired (the strict harness
+  green bar still scored the run red, but recovery deserved its chance). Verify now
+  additionally requires **passed > 0**: an all-skipped suite is a failure to recover
+  from, never a pass. Regression: baseline + fault + replan scenarios re-run green.
 - **Escalation, measured**: with driver == escalation model (same GPT-4o deployment),
   escalation-rescue rates measure the *retry ladder machinery*, not stronger-model lift —
   swap `LLM_ESCALATION_MODEL` to a stronger deployment to measure real lift (env-only).
