@@ -102,8 +102,15 @@ async def verify_node(state: GraphState) -> GraphState:
     affected = state.get("affected_tests", []) if migrate else []
     targets = _scoped_targets(affected, test_args)
     summary, result = await _run_tests(workdir, targets, env=_test_env(cfg))
-    passed = summary.get("total", 0) > 0 and summary.get("failed", 0) == 0 \
+    # `passed > 0` is load-bearing: a migration that SKIPS every test produces
+    # total>0, failed=0, errors=0 — observed in the wild (the model decorated tests with
+    # skip instead of porting them). Zero passing tests is a failure to recover from,
+    # never a pass.
+    passed = (
+        summary.get("passed", 0) > 0
+        and summary.get("failed", 0) == 0
         and summary.get("errors", 0) == 0
+    )
 
     log.info("VERIFY done | job=%s total=%s passed=%s failed=%s errors=%s -> %s",
              job_id, summary.get("total"), summary.get("passed"), summary.get("failed"),
