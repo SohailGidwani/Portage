@@ -60,6 +60,34 @@ async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
   return r;
 }
 
+export type ApiKeySummary = {
+  id: string;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+};
+
+export async function listApiKeys(): Promise<ApiKeySummary[]> {
+  const r = await authedFetch(`${API_BASE}/auth/keys`);
+  if (!r.ok) throw new Error(`listApiKeys ${r.status}`);
+  return r.json();
+}
+
+export async function createApiKey(name: string): Promise<{ name: string; key: string; note: string }> {
+  const r = await authedFetch(`${API_BASE}/auth/keys`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok) throw new Error(`createApiKey ${r.status}`);
+  return r.json();
+}
+
+export async function revokeApiKey(id: string): Promise<void> {
+  const r = await authedFetch(`${API_BASE}/auth/keys/${id}`, { method: "DELETE" });
+  if (!r.ok) throw new Error(`revokeApiKey ${r.status}`);
+}
+
 export type TestSummary = {
   total: number;
   passed: number;
@@ -92,12 +120,16 @@ export type Job = {
 // One migration attempt / recovery action on a task (Phase 3 attempts_log entry).
 export type AttemptEntry = {
   attempt?: number;
-  tier?: "driver" | "escalation";
+  tier?: "driver" | "escalation" | "deterministic";
   model?: string;
-  action?: string; // migrate | rollback_regenerate | rollback_skip
+  action?: string;
   reason?: string;
   visit?: number;
   at?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost_usd?: number;
+  violations?: string[];
 };
 
 export type Subtask = {
@@ -136,13 +168,47 @@ export type RecoverySummary = {
   tasks_skipped: number;
   escalation_attempted: number;
   escalation_rescued: number;
+  integration_visits?: number;
+  no_progress_retries?: number;
+  last_classification?: string | null;
+};
+
+export type OracleIntegrity = {
+  protected_files: number;
+  checked_files: number;
+  clean_files: number;
+  integrity_rate: number;
+  violations: { path: string; violations: string[] }[];
+  files?: { path: string; strategy: string; byte_preserved: boolean; violations: string[] }[];
+};
+
+export type LlmUsage = {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+};
+
+export type VerifiedBatch = {
+  batch?: number;
+  tasks?: string[];
+  passed?: boolean;
+  summary?: TestSummary;
 };
 
 export type Report = {
+  job_id?: string;
+  repo_url?: string;
+  migration_recipe?: string;
   migrated: boolean;
+  migration_outcome?: "success" | "failed" | "unsupported" | "not_applicable";
   tasks_total: number;
   tasks_done: number;
   affected_tests: string[];
+  unsupported_test_seams?: string[];
+  oracle_integrity?: OracleIntegrity;
+  verified_batches?: VerifiedBatch[];
+  llm_usage?: LlmUsage;
   recovery?: RecoverySummary;
   verify_summary?: TestSummary;
   integrate_summary?: TestSummary;
@@ -160,6 +226,9 @@ export type EvalRun = {
   status: "green" | "red" | "error" | "timeout";
   tests_passed: number;
   tests_total: number;
+  tasks_total?: number;
+  tasks_done?: number;
+  tasks_skipped?: number;
   recover_visits: number;
   cost_usd: number;
   wall_seconds: number;
@@ -182,6 +251,7 @@ export type LeaderboardRow = {
   green_rate: number;
   test_pass_mean: number;
   test_pass_variance: number;
+  completion_mean?: number;
   cost_mean: number;
   wall_mean: number;
   recover_visits_mean: number;

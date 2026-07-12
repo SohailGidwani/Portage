@@ -16,6 +16,7 @@ class TestCaseResult:
     classname: str
     outcome: str  # passed | failed | error | skipped
     time: float = 0.0
+    details: str = ""
 
 
 @dataclass(slots=True)
@@ -45,11 +46,12 @@ def parse_junit_xml(xml_text: str) -> TestReport:
     for suite in suites:
         report.duration_seconds += float(suite.get("time", 0) or 0)
         for case in suite.findall("testcase"):
-            if case.find("error") is not None:
+            issue = case.find("error")
+            if issue is not None:
                 outcome = "error"
-            elif case.find("failure") is not None:
+            elif (issue := case.find("failure")) is not None:
                 outcome = "failed"
-            elif case.find("skipped") is not None:
+            elif (issue := case.find("skipped")) is not None:
                 outcome = "skipped"
             else:
                 outcome = "passed"
@@ -59,6 +61,8 @@ def parse_junit_xml(xml_text: str) -> TestReport:
                     classname=case.get("classname", ""),
                     outcome=outcome,
                     time=float(case.get("time", 0) or 0),
+                    details=(issue.text or issue.get("message", ""))[:6000]
+                    if issue is not None else "",
                 )
             )
 

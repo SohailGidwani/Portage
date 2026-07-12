@@ -2,9 +2,12 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Portage",
+  title: {
+    default: "Portage · Migration Agent",
+    template: "%s · Portage",
+  },
   description:
-    "Autonomous code-migration agent — plans, migrates, verifies, recovers",
+    "Plan, migrate, verify, recover, and review framework migrations.",
 };
 
 export default function RootLayout({
@@ -13,7 +16,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" style={{ colorScheme: "dark" }}>
       <body>{children}</body>
     </html>
   );

@@ -26,6 +26,21 @@ class Subtask:
     instruction: str  # guidance fed to the LLM for this transformation
 
 
+@dataclass(frozen=True, slots=True)
+class PinRule:
+    """A symbol-aware target-interface rule. Applies to a symbol iff the DEFINING file's
+    task carries `subtask` AND `applies(contract)` is true — a file with several idiom
+    subtasks pins each symbol by what it IS. `note` (may use `{name}`) is the SAME string
+    object the corresponding Subtask instruction embeds: single source of truth."""
+
+    subtask: str
+    applies: object  # Callable[[SymbolContract], bool] — kept loose to avoid import cycle
+    note: str
+    preserve_shape: bool = False
+    target_kind: str | None = None
+    additional_exports: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class PlannedFile:
     """A file the recipe wants migrated, with its applicable subtasks (a Plan Task)."""

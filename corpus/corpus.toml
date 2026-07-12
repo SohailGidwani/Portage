@@ -14,6 +14,15 @@ source = "bundled"
 notes = "Bundled Phase-2 fixture: app factory, blueprint, query/JSON parsing, error handlers, 6 behavioural tests. Offline-clean dependencies."
 
 [[repos]]
+name = "flask-structural-fixture"
+repo_url = "/fixtures/flask_structural"
+recipe = "flask_to_fastapi"
+tier = "structural"
+stresses = ["app_factory", "sqlite_db", "request_context", "test_harness", "cli"]
+source = "bundled"
+notes = "Bundled R1.1 fixture: generic Flask app factory + g/current_app SQLite lifecycle + Click command + blueprint + framework-neutral behavioural tests. Designed as a fast framework-seam regression, not from any corpus repo."
+
+[[repos]]
 name = "minimal-flask-api"
 repo_url = "https://github.com/markdouthwaite/minimal-flask-api"
 recipe = "flask_to_fastapi"

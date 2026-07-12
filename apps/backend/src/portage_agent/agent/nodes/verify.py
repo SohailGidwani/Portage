@@ -12,18 +12,29 @@ Rich failure classification / recovery is Phase 3; Verify here is basic pass/fai
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 from pathlib import Path
 
 from portage_agent.config import settings
 from portage_agent.sandbox import DockerSandbox, parse_junit_xml
 
 from ..state import GraphState
-from .common import worktree_diff
+from .common import read_file, worktree_diff, write_file
 
 log = logging.getLogger("portage.agent")
 
 _REPORT_FILE = ".portage-report.xml"
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_VOLATILE = re.compile(r"(?:(?<=line )\d+|\b\d+(?:\.\d+)?s\b|/tmp/[^\s:]+)")
+
+
+def failure_fingerprint(output: str, diff: str, batch_paths: list[str]) -> str:
+    """Stable identity for a repeated failure with an unchanged generated draft."""
+    normalized = _VOLATILE.sub("<volatile>", _ANSI.sub("", output))
+    material = "\n".join([*sorted(batch_paths), normalized.strip(), diff.strip()])
+    return hashlib.sha256(material.encode()).hexdigest()
 
 
 def _workdir(state: GraphState) -> str:
@@ -43,6 +54,20 @@ def _summarize(workdir: str, result) -> dict:
     }
 
 
+def _failure_context(summary: dict, result, *, limit: int = 12000) -> str:
+    cases = [
+        f"{case.get('classname')}::{case.get('name')} ({case.get('outcome')}):\n"
+        f"{case.get('details', '')}"
+        for case in summary.get("cases", [])
+        if case.get("outcome") in {"failed", "error"}
+    ]
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+    streams = combined if len(combined) <= 6000 else (
+        combined[:3000] + "\n... output elided ...\n" + combined[-3000:]
+    )
+    return ("\n\n".join([*cases, streams])).strip()[-limit:]
+
+
 async def _run_tests(
     workdir: str, targets: list[str], env: dict[str, str] | None = None
 ) -> tuple[dict, object]:
@@ -50,6 +75,9 @@ async def _run_tests(
     # shouldn't make pytest collect nothing and look like a failure.
     existing = [t for t in targets if (Path(workdir) / t).exists()]
     cmd = ["run-tests", *existing]
+    # Pytest may crash during conftest import before its JUnit plugin initializes. A
+    # previous green XML file must never survive and turn that crash into a false green.
+    (Path(workdir) / _REPORT_FILE).unlink(missing_ok=True)
     result = await DockerSandbox().run(cmd, workdir=workdir, env=env)
     return _summarize(workdir, result), result
 
@@ -99,7 +127,7 @@ async def verify_node(state: GraphState) -> GraphState:
             log.info("VERIFY pre-test delay %s/%ss | job=%s", i, delay, job_id)
 
     test_args = [str(a) for a in (cfg.get("test_args") or [])]
-    affected = state.get("affected_tests", []) if migrate else []
+    affected = state.get("current_batch_tests", []) if migrate else []
     targets = _scoped_targets(affected, test_args)
     summary, result = await _run_tests(workdir, targets, env=_test_env(cfg))
     # `passed > 0` is load-bearing: a migration that SKIPS every test produces
@@ -120,8 +148,15 @@ async def verify_node(state: GraphState) -> GraphState:
         "test_summary": summary,
         "verify_passed": passed,
         "verify_attempts": attempts,
+        "recover_source": "verify",
         "step_log": ["verify"],
     }
+    if passed and migrate:
+        out["verified_batches"] = [{
+            "paths": list(state.get("current_batch_paths") or []),
+            "tests": targets,
+            "summary": summary,
+        }]
     if not passed and migrate:
         # Both streams: a conftest-chain import/syntax error is printed to pytest's STDERR
         # (with no test output at all), and that traceback is exactly what Recover needs
@@ -129,8 +164,13 @@ async def verify_node(state: GraphState) -> GraphState:
         # test output can echo credential-shaped strings, and this text re-enters prompts.
         from .redaction import scrub
 
-        combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
-        out["last_verify_errors"] = scrub(combined[-3000:])
+        cleaned = scrub(_failure_context(summary, result))
+        out["last_verify_errors"] = cleaned
+        out["last_failure_fingerprint"] = failure_fingerprint(
+            cleaned,
+            await worktree_diff(workdir),
+            list(state.get("current_batch_paths") or []),
+        )
     return out
 
 
@@ -141,16 +181,61 @@ async def integrate_node(state: GraphState) -> GraphState:
     job_id = state["job_id"]
     if not state.get("migrate"):
         log.info("INTEGRATE node | job=%s (no migration) reuse verify result", job_id)
-        return {"integrate_summary": state.get("test_summary", {}), "step_log": ["integrate"]}
+        return {
+            "integrate_summary": state.get("test_summary", {}),
+            "integration_passed": bool(state.get("verify_passed")),
+            "step_log": ["integrate"],
+        }
 
     workdir = state["worktree"]
     cfg = state.get("config") or {}
+    injected = bool(state.get("integration_fault_injected"))
+    if cfg.get("inject_fault") == "integration_only" and not injected:
+        target = next(
+            (
+                path for path in state.get("current_batch_paths", [])
+                if path.endswith(".py") and path != state.get("test_compat_path")
+                and path not in (state.get("oracle_manifest") or {})
+            ),
+            None,
+        )
+        if target:
+            source = read_file(workdir, target) or ""
+            write_file(
+                workdir, target,
+                source + "\n<<< portage integration-only fault >>>\n",
+            )
+            injected = True
+            log.warning("INTEGRATE injected full-suite-only regression in %s", target)
     test_args = [str(a) for a in (cfg.get("test_args") or [])]
-    summary, _ = await _run_tests(workdir, test_args, env=_test_env(cfg))  # [] => whole suite
+    summary, result = await _run_tests(
+        workdir, test_args, env=_test_env(cfg),
+    )  # [] => whole suite
+    passed = (
+        summary.get("passed", 0) > 0
+        and summary.get("failed", 0) == 0
+        and summary.get("errors", 0) == 0
+    )
     # Always recompute: the state copy is Execute's last output and goes stale when a
     # later Recover rolls files back (a fully-rolled-back run must report an EMPTY diff).
     diff = await worktree_diff(workdir)
     log.info("INTEGRATE node | job=%s full-suite total=%s passed=%s failed=%s errors=%s",
              job_id, summary.get("total"), summary.get("passed"), summary.get("failed"),
              summary.get("errors"))
-    return {"integrate_summary": summary, "diff": diff, "step_log": ["integrate"]}
+    out: GraphState = {
+        "integrate_summary": summary,
+        "integration_passed": passed,
+        "diff": diff,
+        "recover_source": "integrate",
+        "integration_fault_injected": injected,
+        "step_log": ["integrate"],
+    }
+    if not passed:
+        from .redaction import scrub
+
+        cleaned = scrub(_failure_context(summary, result))
+        out["last_integrate_errors"] = cleaned
+        out["last_failure_fingerprint"] = failure_fingerprint(
+            cleaned, diff, ["<integration>"],
+        )
+    return out

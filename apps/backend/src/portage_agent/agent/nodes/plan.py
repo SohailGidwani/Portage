@@ -24,9 +24,52 @@ from portage_agent.recipes.base import PlannedFile
 from portage_agent.retrieval import MCPRetrievalProvider
 
 from ..state import GraphState
-from .common import ensure_worktree, iter_py_files, workspace_for, worktree_for
+from .common import (
+    build_manifest,
+    build_migration_units,
+    dependency_order,
+    ensure_worktree,
+    imported_bindings,
+    iter_py_files,
+    workspace_for,
+    worktree_for,
+)
+from .oracle import build_oracle_manifest
 
 log = logging.getLogger("portage.agent")
+
+
+def complete_unit_dependencies(
+    root: str, planned: list[PlannedFile], units: list[dict], test_strategy: dict,
+    *, max_files: int = 4,
+) -> list[dict]:
+    """Fill spare unit capacity with direct planned dependencies of its members.
+
+    A coordinated app factory cannot be sandbox-verified while a router it registers is
+    still from the source framework. This is import-driven and bounded; large components
+    continue through the verifiable-batch scheduler instead of becoming unbounded prompts.
+    """
+    order = {file.path: index for index, file in enumerate(planned)}
+    eligible = [
+        file.path for file in planned
+        if file.role != "test_compat"
+        and test_strategy.get(file.path) not in {"adapter", "unchanged"}
+    ]
+    for unit in units:
+        while len(unit["paths"]) < max_files:
+            dependency = next((
+                candidate for candidate in eligible
+                if candidate not in unit["paths"]
+                and any(
+                    binding.importer in unit["paths"]
+                    for binding in imported_bindings(root, candidate)
+                )
+            ), None)
+            if dependency is None:
+                break
+            unit["paths"].append(dependency)
+        unit["paths"].sort(key=lambda path: (order[path], path))
+    return units
 
 
 def _collect_test_files(obj: object, found: set[str]) -> None:
@@ -108,6 +151,22 @@ async def plan_node(state: GraphState) -> GraphState:
         return {"migrate": False, "plan": [], "affected_tests": [], "step_log": ["plan"]}
 
     planned = recipe.plan_files(files)
+    oracle_manifest = build_oracle_manifest(workspace)
+    test_strategy = {path: entry["strategy"] for path, entry in oracle_manifest.items()}
+
+    planned = dependency_order(files, planned)
+    adapter_needed = any(
+        strategy in {"adapter", "adapter_wiring"}
+        for strategy in test_strategy.values()
+    ) and bool(getattr(recipe, "render_test_compat", None))
+    compat_path = getattr(recipe, "test_compat_path", "")
+    if adapter_needed and compat_path:
+        # This module must exist before any coordinated app/conftest batch imports it.
+        planned.insert(0, PlannedFile(
+            path=compat_path, role="test_compat", subtasks=[], order=25,
+        ))
+    for i, pf in enumerate(planned):
+        pf.order = i * 10
 
     # Injected fault (Phase 3 DoD): the planner "misses" the first file. Only on the
     # initial plan — the whole point is that Recover detects the residue and the replan
@@ -117,6 +176,92 @@ async def plan_node(state: GraphState) -> GraphState:
         dropped = planned.pop(0)
         log.warning("PLAN fault=drop_task | job=%s deliberately omitting %s",
                     job_id, dropped.path)
+
+    # R1: freeze the target-interface manifest. On replan only ADD new symbols — pins
+    # already made keep binding every retry/escalation/reset to the same decision.
+    # A pin conflict (ValueError) is a recipe bug: let it fail the job loudly.
+    rules = getattr(recipe, "pin_rules", [])
+    manifest = build_manifest(workspace, planned, rules)
+    if replan:
+        manifest = {**manifest, **(state.get("interface_manifest") or {})}
+
+    # R1.1: freeze framework-owned capability decisions next to symbol decisions, then
+    # identify only the small resource/factory/harness seams worth coordinating in one
+    # initial generation call. Recipes opt in; recipe #2 remains unaffected.
+    units = build_migration_units(files, planned, manifest)
+    for unit in units:
+        unit["paths"] = [
+            path for path in unit["paths"]
+            if test_strategy.get(path) not in {"adapter", "unchanged"}
+        ]
+    units = [unit for unit in units if len(unit["paths"]) >= 2]
+    # Compatibility wiring and the application factory it wraps must become visible in
+    # the same verification batch. Otherwise a dependency-first app rewrite is tested
+    # through the still-Flask conftest API before its adapter wiring exists.
+    order = {pf.path: i for i, pf in enumerate(planned)}
+    wiring_files = [
+        path for path, strategy in test_strategy.items()
+        if strategy == "adapter_wiring" and path in order
+    ]
+    factory_paths = [pf.path for pf in planned if pf.role == "app_factory"]
+    for wiring in wiring_files:
+        related = [
+            factory for factory in factory_paths
+            if any(binding.importer == wiring
+                   for binding in imported_bindings(workspace, factory))
+        ]
+        if not related and len(factory_paths) == 1:
+            related = factory_paths
+        if not related:
+            continue
+        factory = min(related, key=lambda path: (order[path], path))
+        existing = next(
+            (unit for unit in units if factory in unit["paths"] or wiring in unit["paths"]),
+            None,
+        )
+        if existing is not None:
+            for path in (factory, wiring):
+                if path not in existing["paths"] and len(existing["paths"]) < 4:
+                    existing["paths"].append(path)
+            existing["paths"].sort(key=lambda path: (order[path], path))
+            existing["reason"] = "application-factory/test-adapter seam"
+        else:
+            units.append({
+                "id": f"test-adapter-seam-{len(units) + 1}",
+                "paths": sorted([factory, wiring], key=lambda path: (order[path], path)),
+                "reason": "application-factory/test-adapter seam",
+            })
+    units = complete_unit_dependencies(workspace, planned, units, test_strategy)
+    seam_builder = getattr(recipe, "build_seam_plan", None)
+    seam_plan = seam_builder(files, planned, manifest, units) if seam_builder else {
+        "version": 1, "decisions": {}, "units": units,
+    }
+    if replan and state.get("seam_plan"):
+        old = state["seam_plan"]
+        seam_plan["decisions"] = {
+            **seam_plan.get("decisions", {}), **old.get("decisions", {}),
+        }
+        merged_units = {
+            tuple(unit.get("paths", [])): unit
+            for unit in [*old.get("units", []), *seam_plan.get("units", [])]
+        }
+        seam_plan["units"] = list(merged_units.values())
+    if adapter_needed:
+        for wiring in wiring_files:
+            seam_plan.get("decisions", {}).pop(f"test_harness:{wiring}", None)
+        seam_plan.setdefault("decisions", {})["test_compatibility"] = {
+            "kind": "test_compatibility",
+            "files": wiring_files,
+            "module": compat_path[:-3].replace("/", "."),
+            "instruction": (
+                f"Keep behavioural tests unchanged. Import `adapt_app` from "
+                f"`{compat_path[:-3]}` and wrap the real FastAPI app returned by "
+                "create_app. Pass real exported Click commands and the original instance "
+                "path when those seams exist. The adapter supplies test_client, "
+                "app_context, test_cli_runner, config, testing, instance_path, and "
+                "session_transaction; do not reimplement those APIs in conftest."
+            ),
+        }
 
     log.info("PLAN node | job=%s recipe=%s replan=%s files=%s",
              job_id, recipe_name, replan, [pf.path for pf in planned])
@@ -138,6 +283,11 @@ async def plan_node(state: GraphState) -> GraphState:
         "plan": [s.to_state_dict() for s in snapshots],
         "worktree": worktree,
         "affected_tests": sorted(affected),
+        "interface_manifest": manifest,
+        "seam_plan": seam_plan,
+        "oracle_manifest": oracle_manifest,
+        "test_strategy": test_strategy,
+        "test_compat_path": compat_path if adapter_needed else "",
         "verify_attempts": 0 if not replan else state.get("verify_attempts", 0),
         "replan_requested": False,
         "step_log": ["plan"],

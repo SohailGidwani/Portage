@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import re
 
-from .base import PlannedFile, Subtask, register
+from .base import PinRule, PlannedFile, Subtask, register
+from .flask_test_compat import render_flask_test_compat
 
 # --- marker → subtask detection -------------------------------------------------------
 _FLASK_IMPORT = re.compile(r"^\s*(from\s+flask\b|import\s+flask\b)", re.MULTILINE)
@@ -30,6 +31,44 @@ _FLASK_LOGIN = re.compile(
     r"\bflask_login\b|\blogin_required\b|\bcurrent_user\b|\blogin_user\b|\blogout_user\b"
 )
 _FLASK_SQLALCHEMY = re.compile(r"\bflask_sqlalchemy\b|\bSQLAlchemy\s*\(")
+_CLI_SEAM = re.compile(r"\bapp\.cli\b|\btest_cli_runner\s*\(|\bclick\.|\.invoke\s*\(")
+_CLICK_COMMAND = re.compile(
+    r"@click\.command\(\s*['\"]([^'\"]+)['\"]\s*\)\s*"
+    r"(?:@[^\n]+\s*)*def\s+(\w+)\s*\(",
+    re.MULTILINE,
+)
+
+# The flask_login API surface — single source for the auth_login pin rule's match set
+# AND the request_context pin rule's carve-out (see pin_rules below), so the two
+# function-kind rules stay disjoint by construction.
+_FLASK_LOGIN_NAMES = {"login_user", "logout_user", "current_user", "login_required"}
+_RESOURCE_FUNCTION = re.compile(
+    r"^(get|open|connect)_(db|database|session|connection)$"
+)
+
+
+# R1 target-interface notes: module constants used BOTH inside the matching _SUBTASKS
+# instruction and in pin_rules below — checklist and contract share the literal string,
+# so they cannot drift (v3: single source, not a mirror-by-convention comment).
+_NOTE_RESOURCE_FN = (
+    "{name}: KEEP the original callable shape — same args, same return, callers do not "
+    "change. For FastAPI DI, ADD a companion yield dependency that wraps it "
+    "(`def {name}_dep(): resource = {name}(); try: yield resource; finally: close`) and "
+    "use `Depends({name}_dep)` in endpoints; cleanup lives in the dependency, NEVER in "
+    "callers (no bare `next(gen())` anywhere — it leaks the generator). If the original "
+    "helper read Flask `current_app` configuration, keep its zero-argument public shape by "
+    "having the existing factory/init seam copy configuration into module-owned state; "
+    "NEVER make the helper read an undefined global app/request or FastAPI instance path."
+)
+_NOTE_LOGIN_SURFACE = (
+    "{name}: reimplemented on the session but importable under this exact name with the "
+    "attribute surface callers/templates read (is_authenticated, id, ...)."
+)
+_NOTE_DB_SURFACE = (
+    "{name}: the flask_sqlalchemy object becomes a plain-SQLAlchemy surface KEEPING this "
+    "module-level name and the attribute surface callers use (session/Model-equivalent: "
+    "engine + SessionLocal + Base, or a db_session facade)."
+)
 
 
 _SUBTASKS: dict[str, Subtask] = {
@@ -42,8 +81,9 @@ _SUBTASKS: dict[str, Subtask] = {
         "Flask's `app.config` is a PLAIN DICT — migrate it as one: `app.state.config = {}` "
         "(a real dict), `config.from_mapping(...)`/`.update(...)` → dict update, "
         "`app.config['X']` → `app.state.config['X']`. Never call methods on "
-        "`starlette.datastructures.State` itself (it has no update/get). Keep "
-        "`app.instance_path` semantics with plain `os.path` code.",
+        "`starlette.datastructures.State` itself (it has no update/get). FastAPI has no "
+        "`instance_path`: compute the equivalent directory as a plain local `os.path` value "
+        "and store only resulting config values, never `app.instance_path`.",
     ),
     "error_handler": Subtask(
         "error_handler",
@@ -55,8 +95,9 @@ _SUBTASKS: dict[str, Subtask] = {
     "blueprint_to_router": Subtask(
         "blueprint_to_router",
         "Blueprint → APIRouter",
-        "Replace `flask.Blueprint(...)` with `fastapi.APIRouter()`. Keep the module-level "
-        "variable name the importer expects (e.g. expose `router`).",
+        "Replace `flask.Blueprint(...)` with `fastapi.APIRouter()`. Keep the EXACT "
+        "module-level variable name importers expect (`bp`, `router`, or another original "
+        "name); do not rename it merely to `router`.",
     ),
     "route_to_endpoint": Subtask(
         "route_to_endpoint",
@@ -85,7 +126,11 @@ _SUBTASKS: dict[str, Subtask] = {
         "follow-up request) — never delete or weaken the assertion. PRESERVE THE FILE'S "
         "STRUCTURE: do not add module-level statements the original didn't have (e.g. "
         "never call `create_app()` at import time if the original built the app inside a "
-        "fixture or setUp).",
+        "fixture or setUp). If Flask's bound CLI runner becomes `click.testing.CliRunner`, "
+        "preserve the existing fixture/caller interface: either return a tiny adapter whose "
+        "`invoke(args=[command, ...])` dispatches to the real exported Click command, or "
+        "migrate only that invocation plumbing to `invoke(command, args=[...])`; never "
+        "attach a fake runner to FastAPI/app.state.",
     ),
     "templates_render": Subtask(
         "templates_render",
@@ -121,7 +166,8 @@ _SUBTASKS: dict[str, Subtask] = {
         "`current_user` → a dependency/helper that loads the user from the session and "
         "returns an anonymous stand-in with `is_authenticated=False` when absent (keep "
         "the attribute names templates/tests read); `@login_required` → a check that "
-        "redirects (302) to the login page exactly like flask_login did.",
+        "redirects (302) to the login page exactly like flask_login did."
+        + "\nInterface decision: " + _NOTE_LOGIN_SURFACE,
     ),
     "sqlalchemy_plain": Subtask(
         "sqlalchemy_plain",
@@ -135,7 +181,8 @@ _SUBTASKS: dict[str, Subtask] = {
         "session is acceptable to keep call sites unchanged: `db_session.add/commit/...`). "
         "`db.create_all()`/`drop_all()` → `Base.metadata.create_all(engine)`/`drop_all`. "
         "Configure the engine from the SAME config value the app used "
-        "(`SQLALCHEMY_DATABASE_URI`), resolved at create_app/init time.",
+        "(`SQLALCHEMY_DATABASE_URI`), resolved at create_app/init time."
+        + "\nInterface decision: " + _NOTE_DB_SURFACE,
     ),
     "request_context": Subtask(
         "request_context",
@@ -145,11 +192,13 @@ _SUBTASKS: dict[str, Subtask] = {
         "endpoint) that computes what the hook stored on `g` (e.g. `g.user` from the "
         "session, `g.db` connection) and passes it to the endpoint and into the template "
         "context under the SAME attribute names the templates use. `current_app.config` "
-        "moves to module-level config or the app instance. Per-request resources with "
-        "teardown (`g.db` + `teardown_appcontext(close_db)`) become ONE yield dependency: "
-        "`def get_db(): db = connect(); try: yield db; finally: db.close()` — do NOT "
-        "register teardown as middleware (wrong signature) and do NOT use `app.state` as "
-        "a context manager (it isn't one); `app.state` holds only config/constants.",
+        "moves to module-level config or the app instance. Preserve existing direct-call "
+        "resource helpers such as `get_db()` for non-endpoint callers; FastAPI endpoints "
+        "must acquire those resources through a companion yield dependency so teardown "
+        "runs reliably. Do NOT register teardown as middleware (wrong signature), call a "
+        "generator with bare `next(...)`, or use `app.state` as a context manager; "
+        "`app.state` holds only config/constants."
+        + "\nInterface decision for cross-file resource functions: " + _NOTE_RESOURCE_FN,
     ),
 }
 
@@ -170,7 +219,40 @@ class FlaskToFastAPIRecipe:
     source_framework = "flask"
     target_framework = "fastapi"
     # Exactly what the network-off sandbox image ships (see sandbox/Dockerfile.sandbox).
-    sandbox_packages = ["fastapi", "starlette", "uvicorn", "httpx", "pydantic", "pytest"]
+    sandbox_packages = [
+        "fastapi", "starlette", "uvicorn", "httpx", "pydantic", "pytest", "click",
+        "itsdangerous",
+    ]
+    test_compat_path = "_portage_fastapi_test_compat.py"
+
+    @staticmethod
+    def render_test_compat() -> str:
+        return render_flask_test_compat()
+
+    # R1: symbol-aware pin rules. applies() runs on the SymbolContract, so a file
+    # carrying several idiom subtasks pins each symbol by what it IS. Predicates must
+    # stay disjoint — build_manifest fails Plan loudly if two rules claim one symbol.
+    # Disjointness argument: sqlalchemy_plain checks `c.kind == "variable"` while
+    # request_context/auth_login only ever match `c.kind == "function"`, so the
+    # variable-kind rule never overlaps the two function-kind rules. Between those two,
+    # auth_login claims exactly the flask_login API names (_FLASK_LOGIN_NAMES);
+    # request_context claims every OTHER function via an explicit name carve-out — the
+    # same set feeds both predicates, so the two are disjoint by construction rather than
+    # by luck (flaskr's custom `login_required`, which is both a function AND one of
+    # these names, resolves to auth_login only).
+    pin_rules = [
+        PinRule(subtask="request_context",
+                applies=lambda c: c.kind == "function"
+                and bool(_RESOURCE_FUNCTION.match(c.name)),
+                note=_NOTE_RESOURCE_FN, preserve_shape=True, target_kind="function",
+                additional_exports=("{name}_dep",)),
+        PinRule(subtask="auth_login",
+                applies=lambda c: c.name in _FLASK_LOGIN_NAMES,
+                note=_NOTE_LOGIN_SURFACE, target_kind="function"),
+        PinRule(subtask="sqlalchemy_plain",
+                applies=lambda c: c.kind == "variable" and "SQLAlchemy(" in c.signature,
+                note=_NOTE_DB_SURFACE, target_kind="variable"),
+    ]
 
     def matches(self, files: dict[str, str]) -> bool:
         return any(_FLASK_IMPORT.search(src) for src in files.values())
@@ -244,6 +326,116 @@ class FlaskToFastAPIRecipe:
         planned.sort(key=lambda pf: (pf.order, pf.path))
         return planned
 
+    def build_seam_plan(
+        self, files: dict[str, str], planned: list[PlannedFile],
+        manifest: dict[str, dict], units: list[dict],
+    ) -> dict:
+        """Deterministic Flask→FastAPI framework-owned interface decisions.
+
+        Symbol pins decide Python call shapes. This companion artifact decides the
+        *framework capability* seams that models otherwise hallucinate independently
+        (`app_context`, fake `app.state` helpers, attached CLI runners). Rules are based
+        only on recipe roles/subtasks and source idioms — never corpus names or tests.
+        """
+        by_path = {pf.path: pf for pf in planned}
+        unit_for = {
+            path: unit for unit in units for path in unit.get("paths", [])
+        }
+        decisions: dict[str, dict] = {}
+
+        for pf in planned:
+            if pf.role != "app_factory":
+                continue
+            members = unit_for.get(pf.path, {}).get("paths", [pf.path])
+            decisions[f"application_factory:{pf.path}"] = {
+                "kind": "application_factory",
+                "files": list(members),
+                "instruction": (
+                    "The target app is a real FastAPI instance. `app.state.config` may "
+                    "hold a plain configuration dict, but app/app.state expose no invented "
+                    "context managers, resource openers, database containers, test clients, "
+                    "or CLI runners. Initialize framework-independent resources through "
+                    "real exported project helpers and real FastAPI lifespan/dependencies. "
+                    "FastAPI has no `instance_path`: compute any instance directory as a "
+                    "plain local filesystem path in the factory and store only resulting "
+                    "configuration values."
+                ),
+            }
+
+        for key, pin in manifest.items():
+            if not (pin.get("preserve_shape") and pin.get("additional_exports")):
+                continue
+            owner = pin["module"]
+            members = unit_for.get(owner, {}).get("paths", [owner])
+            decisions[f"resource_lifecycle:{key}"] = {
+                "kind": "resource_lifecycle",
+                "files": list(members),
+                "instruction": (
+                    f"Keep direct helper `{pin['symbol']}` callable exactly as pinned by "
+                    "the interface manifest for setup, CLI, and other non-endpoint code. "
+                    f"Endpoints acquire it through `{pin['additional_exports'][0]}`. "
+                    "Never add an app/request argument to the direct helper and never make "
+                    "callers drive a generator manually. The factory must first build "
+                    "`app.state.config` (including test overrides); the existing same-shape "
+                    "`init_app(app)` may then copy required values into private module-owned "
+                    "configuration used by the direct helper. The helper must not read a free "
+                    "global app/request, `current_app`, `g`, or invented app attributes."
+                ),
+                "module": owner,
+                "symbol": pin["symbol"],
+            }
+
+        for pf in planned:
+            if pf.role != "test_harness":
+                continue
+            members = unit_for.get(pf.path, {}).get("paths", [pf.path])
+            decisions[f"test_harness:{pf.path}"] = {
+                "kind": "test_harness",
+                "files": list(members),
+                "instruction": (
+                    "Use `fastapi.testclient.TestClient(app)` for HTTP plumbing. Remove "
+                    "Flask application-context blocks and call real exported setup helpers "
+                    "directly with their pinned signatures. Do not invent methods or state "
+                    "attributes on FastAPI to imitate Flask (`app.container`, resource "
+                    "openers, `test_client`, `test_cli_runner`, or similar). Preserve every "
+                    "assertion and its meaning."
+                ),
+            }
+
+        cli_paths = [p for p, src in files.items() if p in by_path and _CLI_SEAM.search(src)]
+        if cli_paths:
+            commands = {
+                function: command
+                for src in files.values()
+                for command, function in _CLICK_COMMAND.findall(src)
+            }
+            affected = sorted({
+                member
+                for path in cli_paths
+                for member in unit_for.get(path, {}).get("paths", [path])
+            })
+            decisions["standalone_cli"] = {
+                "kind": "standalone_cli",
+                "files": affected,
+                "instruction": (
+                    "FastAPI has no Flask-style `app.cli` or `test_cli_runner`. Preserve a "
+                    "real existing Click command as a standalone exported command and test "
+                    "it with `click.testing.CliRunner`; otherwise validate the same setup "
+                    "through public helpers/observable app behavior. Preserve an existing "
+                    "runner fixture's `invoke(args=[command, ...])` interface with a small "
+                    "dispatcher adapter when behavioural tests consume it; never attach a "
+                    "fake CLI runner to app.state. When dispatching a command selected by "
+                    "the first old-style args token, remove that command token before "
+                    "passing the remaining args to the Click command. The adapter must "
+                    "return `CliRunner().invoke(command, args=args[1:])` (a Click `Result`); "
+                    "never call low-level `Command.main()` and never store commands/runners "
+                    "on app.state."
+                ),
+                "commands": commands,
+            }
+
+        return {"version": 1, "decisions": decisions, "units": units}
+
     def system_prompt(self) -> str:
         return (
             "You are Portage, an expert code-migration agent. You migrate ONE Python source "
@@ -252,7 +444,7 @@ class FlaskToFastAPIRecipe:
             "1. Output ONLY the complete migrated file inside a single ```python fenced block. "
             "No prose before or after.\n"
             "2. Preserve all public names other modules rely on (module path, the "
-            "`create_app` factory, the `router` variable, function names imported elsewhere).\n"
+            "`create_app` factory, exact router variable names, functions imported elsewhere).\n"
             "3. Preserve exact HTTP behaviour: same paths, methods, status codes (incl. 201/204), "
             "and identical response JSON shapes.\n"
             "4. Keep importing the project's own modules unchanged (e.g. `from . import store`); "
@@ -260,7 +452,7 @@ class FlaskToFastAPIRecipe:
             "5. The test suite runs OFFLINE (no network). Import ONLY the Python standard "
             "library, this project's own modules, and these packages: "
             "fastapi, starlette, uvicorn, httpx, pydantic, pytest, jinja2, itsdangerous, "
-            "sqlalchemy, python-multipart (needed for fastapi `Form(...)`; imported "
+            "sqlalchemy, click, python-multipart (needed for fastapi `Form(...)`; imported "
             "implicitly).\n"
             "6. Keep `from __future__ import annotations` if the original had it.\n"
             "7. Return plain Python data (dict/list) from endpoints so the route's declared "
@@ -271,9 +463,9 @@ class FlaskToFastAPIRecipe:
             "exist only on the app. A Flask blueprint-level `errorhandler` moves to the file "
             "that creates the app (`@app.exception_handler`), or becomes an explicit "
             "try/except returning the same status/body if the app file is not being edited.\n"
-            "10. A module that other files import a router from MUST expose it as a "
-            "module-level name `router` (e.g. `router = APIRouter()`), and every name the "
-            "context files import from this module must still be defined.\n"
+            "10. A module that other files import a router from MUST expose the EXACT "
+            "module-level name importers use (`bp`, `router`, or another original name). Do "
+            "not rename it merely to `router`; every interface decision must be defined.\n"
             "11. NEVER use `@app.on_event(...)` (deprecated; the test runner promotes the "
             "deprecation warning to an error) — use a `lifespan` async context manager "
             "passed to `FastAPI(lifespan=...)` for startup/shutdown work.\n"
@@ -302,6 +494,39 @@ class FlaskToFastAPIRecipe:
             f"{ctx_blocks}\n"
             f"--- file to migrate: {file.path} ---\n{source}\n\n"
             f"Return ONLY the full migrated contents of {file.path} in one ```python block."
+        )
+
+    def build_cluster_prompt(
+        self, *, files: list[PlannedFile], sources: dict[str, str],
+        context: dict[str, str],
+    ) -> str:
+        """One coordinated prompt for a small Plan-selected framework seam."""
+        ctx_blocks = "".join(
+            f"\n--- context file: {name} ---\n{body}\n" for name, body in context.items()
+        )
+        targets: list[str] = []
+        for file in files:
+            checklist = "\n".join(
+                f"  - {s.title}: {s.instruction}" for s in file.subtasks
+            )
+            targets.append(
+                f"\n--- file to migrate: {file.path} (role: {file.role}) ---\n"
+                f"Transformations:\n{checklist}\n\n{sources[file.path]}\n"
+            )
+        paths = [file.path for file in files]
+        output = "\n".join(
+            f"<<<PORTAGE_FILE:{path}>>>\n```python\n<complete {path}>\n```\n"
+            "<<<PORTAGE_END_FILE>>>"
+            for path in paths
+        )
+        return (
+            "Migrate this tightly-coupled Flask framework seam to FastAPI as ONE coherent "
+            "unit. Resolve configuration, resource lifecycle, app construction, and test "
+            "setup once across all files; do not invent compatibility APIs.\n"
+            f"Files: {', '.join(paths)}\n"
+            f"{ctx_blocks}{''.join(targets)}\n"
+            "Return exactly one complete Python block for every requested path using this "
+            f"exact marker format (replace placeholders):\n{output}"
         )
 
 
