@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from portage_agent.config import settings
@@ -139,15 +140,66 @@ def _module_names(rel: str) -> set[str]:
     return names
 
 
-def export_contract(root: str, target: str) -> list[str]:
-    """Names other files in the repo import FROM `target` — the interface a migration of
-    `target` must keep exporting. Cross-file naming breaks (importer expects `router`/
-    `create_app`, migrated module dropped it) are a measured top failure mode; stating the
-    contract explicitly in the prompt removes the guesswork. AST-based, best-effort:
-    unparseable files are skipped."""
+@dataclass(frozen=True, slots=True)
+class ModuleBinding:
+    """How one importer file binds `target`: a symbol (`from m import x [as y]`) or the
+    whole module (`from . import m`, `import a.m [as z]`). `local` is the name that
+    appears in the importer's source — call-site scanning must use it, not the symbol."""
+
+    importer: str
+    symbol: str | None  # None => module binding
+    local: str
+
+
+def _resolve_module(node_module: str | None, level: int, importer: str) -> str:
+    """Absolute dotted module for an ImportFrom, resolving relative levels."""
+    base = Path(importer).parts[: -level] if level else ()
+    parts = [*base, *(node_module.split(".") if node_module else [])]
+    return ".".join(parts)
+
+
+def _package_reexports_symbol(
+    sources: dict[str, str], module: str, name: str,
+) -> bool:
+    """Whether `module.__init__` binds `name` as a symbol/object export.
+
+    This disambiguates `from pkg import app`: when pkg/__init__.py says
+    `from .app import app`, consumers receive the exported object, not the pkg.app module.
+    A `from . import db` package export remains a module binding and returns False.
+    """
+    package_source = next((
+        src for rel, src in sources.items()
+        if Path(rel).name == "__init__.py" and module in _module_names(rel)
+    ), None)
+    if package_source is None:
+        return False
+    try:
+        tree = ast.parse(package_source)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return True
+        elif isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return True
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            if any((alias.asname or alias.name) == name for alias in node.names):
+                return True
+    return False
+
+
+def imported_bindings(root: str, target: str) -> list[ModuleBinding]:
+    """Every binding of `target` across the repo's other .py files. AST-based,
+    best-effort (unparseable importers skipped; `import *` ignored)."""
     wanted = _module_names(target)
-    names: set[str] = set()
-    for rel, src in iter_py_files(root).items():
+    out: list[ModuleBinding] = []
+    sources = iter_py_files(root)
+    for rel, src in sources.items():
         if rel == target:
             continue
         try:
@@ -155,13 +207,457 @@ def export_contract(root: str, target: str) -> list[str]:
         except SyntaxError:
             continue
         for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or not node.module:
-                continue
-            # Relative imports: resolve against the importer's package.
-            mod = node.module
-            if node.level:
-                base = Path(rel).parts[: -node.level]
-                mod = ".".join((*base, *mod.split("."))) if base else mod
-            if mod in wanted or mod.split(".")[-1] in {w.split(".")[-1] for w in wanted}:
-                names.update(a.name for a in node.names if a.name != "*")
+            if isinstance(node, ast.ImportFrom):
+                mod = _resolve_module(node.module, node.level, rel)
+                if node.module is None:
+                    # `from . import db` / `from .pkg import db` — names ARE modules.
+                    for a in node.names:
+                        if f"{mod}.{a.name}".lstrip(".") in wanted or a.name in {
+                            w.split(".")[-1] for w in wanted
+                        }:
+                            out.append(ModuleBinding(rel, None, a.asname or a.name))
+                elif mod in wanted or mod.split(".")[-1] in {w.split(".")[-1] for w in wanted}:
+                    for a in node.names:
+                        if a.name != "*":
+                            out.append(ModuleBinding(rel, a.name, a.asname or a.name))
+                else:
+                    # `from pkg import db` / `from .pkg import db` imports the target
+                    # MODULE as a name from its parent package. The direct-symbol branch
+                    # above cannot see this because `mod` is only the parent (`pkg`).
+                    for a in node.names:
+                        candidate = f"{mod}.{a.name}".lstrip(".")
+                        if candidate in wanted and not _package_reexports_symbol(
+                            sources, mod, a.name,
+                        ):
+                            out.append(ModuleBinding(rel, None, a.asname or a.name))
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name in wanted or a.name.split(".")[-1] in {
+                        w.split(".")[-1] for w in wanted
+                    }:
+                        # Unaliased `import a.b` binds the name `a` in Python, but the
+                        # source text accesses attributes on the full dotted path `a.b`
+                        # (`a.b.symbol()`) — keep the whole path so _module_attrs_used
+                        # resolves the real symbol instead of the submodule tail.
+                        out.append(ModuleBinding(rel, None, a.asname or a.name))
+    return out
+
+
+def binding_call_sites(src: str, b: ModuleBinding, *, limit: int = 3) -> list[str]:
+    """Up to `limit` one-line usage snippets for a binding, scanned via its LOCAL name."""
+    needles = ([f"{b.local}(", f"with {b.local}", f"@{b.local}"] if b.symbol
+               else [f"{b.local}."])
+    hits: list[str] = []
+    for line in src.splitlines():
+        s = line.strip()
+        if s.startswith(("def ", "class ", "from ", "import ", "#")):
+            continue
+        if any(n in s for n in needles):
+            hits.append(s[:160])
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def _module_attrs_used(src: str, local: str) -> set[str]:
+    """Attribute names accessed on a module binding (`db.get_db` -> {'get_db'}). `local`
+    may itself be a dotted path (unaliased `import a.b` keeps the full `a.b` in
+    ModuleBinding.local), so match on the unparsed accessed expression rather than a
+    bare `ast.Name` — that's the only way `a.b.symbol()` resolves to `symbol`."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    return {
+        n.attr for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and ast.unparse(n.value) == local
+    }
+
+
+def export_contract(root: str, target: str) -> list[str]:
+    """Names other files import (or use as module attributes) FROM `target` — the
+    interface a migration must keep exporting. Superset of the pre-R1 behavior."""
+    sources = iter_py_files(root)
+    names: set[str] = set()
+    for b in imported_bindings(root, target):
+        if b.symbol:
+            names.add(b.symbol)
+        else:
+            names |= _module_attrs_used(sources.get(b.importer, ""), b.local)
     return sorted(names)
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolContract:
+    """One cross-file symbol: original kind/shape + how importers actually use it.
+    `shape` holds MACHINE-READABLE facts for validation — never recovered by parsing
+    the human-facing `signature`/`notes` strings (v2 review finding #3)."""
+
+    name: str
+    kind: str  # "function" | "class" | "variable"
+    signature: str  # human-facing, for prompts
+    notes: str      # human-facing, for prompts
+    call_sites: tuple[str, ...]
+    shape: dict     # JSON-safe callable facts used by definition + direct-caller checks;
+                    # functions only, otherwise {}.
+
+
+def _has_own_yield(node: ast.AST) -> bool:
+    """True if `node`'s OWN scope contains a `yield`/`yield from` — unlike `ast.walk`,
+    does not descend into nested `def`/`async def`/`lambda` scopes, each of which is its
+    own (potential) generator and must not mark the enclosing function as one."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if _has_own_yield(child):
+            return True
+    return False
+
+
+def _shape_facts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
+    a = node.args
+    positional = [*a.posonlyargs, *a.args]
+    required_count = len(positional) - len(a.defaults)
+    return {
+        "required_positional": required_count,
+        "required_positional_names": [arg.arg for arg in positional[:required_count]],
+        "required_keyword_only": [
+            kw.arg for kw, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is None
+        ],
+        "positional_capacity": len(positional),
+        # Positional-only parameters deliberately excluded: passing them by keyword is
+        # invalid even though their names appear in the source signature.
+        "keyword_names": [arg.arg for arg in a.args] + [arg.arg for arg in a.kwonlyargs],
+        "accepts_varargs": a.vararg is not None,
+        "accepts_varkw": a.kwarg is not None,
+        "is_async": isinstance(node, ast.AsyncFunctionDef),
+        "is_generator": _has_own_yield(node),
+    }
+
+
+def _def_contract(node: ast.stmt) -> tuple[str, str, str, dict] | None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        shape = _shape_facts(node)
+        prefix = "async def" if shape["is_async"] else "def"
+        sig = f"{prefix} {node.name}({ast.unparse(node.args)})"
+        notes = [f"@{ast.unparse(d)}" for d in node.decorator_list]
+        if shape["is_generator"]:
+            notes.append("generator (context-manager / yield-dependency shape)")
+        return "function", sig, "; ".join(notes), shape
+    if isinstance(node, ast.ClassDef):
+        init = next((i for i in node.body
+                     if isinstance(i, ast.FunctionDef) and i.name == "__init__"), None)
+        args = ast.unparse(init.args) if init else ""
+        args = args.split(",", 1)[1].strip() if "," in args else ""
+        return "class", f"class {node.name}({args})", "", {}
+    return None
+
+
+def interface_contract(root: str, target: str) -> list[SymbolContract]:
+    """Structured contract for `target`: every name siblings bind (directly or as module
+    attributes), with ORIGINAL signature/lifecycle and real call-site examples."""
+    sources = iter_py_files(root)
+    bindings = imported_bindings(root, target)
+    used: dict[str, list[str]] = {}  # symbol -> call sites
+    for b in bindings:
+        src = sources.get(b.importer, "")
+        if b.symbol:
+            used.setdefault(b.symbol, []).extend(binding_call_sites(src, b, limit=2))
+        else:
+            for attr in _module_attrs_used(src, b.local):
+                used.setdefault(attr, []).extend(
+                    s for s in binding_call_sites(src, b, limit=3) if f".{attr}" in s)
+    if not used:
+        return []
+
+    kinds: dict[str, tuple[str, str, str, dict]] = {}
+    try:
+        for node in ast.parse(sources.get(target, "")).body:
+            info = _def_contract(node)
+            if info and getattr(node, "name", "") in used:
+                kinds[node.name] = info
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id in used:
+                        kinds[t.id] = ("variable",
+                                       f"{t.id} = {ast.unparse(node.value)[:80]}", "", {})
+    except SyntaxError:
+        pass
+
+    return [
+        SymbolContract(name=n, kind=k[0], signature=k[1], notes=k[2],
+                       call_sites=tuple(dict.fromkeys(used[n]))[:3], shape=k[3])
+        for n in sorted(used)
+        for k in [kinds.get(n, ("variable", n, "", {}))]
+    ]
+
+
+def _planned_imports(files: dict[str, str], planned_paths: list[str]) -> dict[str, set[str]]:
+    """path -> other planned paths it imports (edges for ordering). Handles ImportFrom
+    (incl. `from . import mod`), plain Import, and aliases — resolution via _module_names.
+    Takes an ordered LIST and builds insertion-ordered structures (determinism)."""
+    by_module: dict[str, str] = {}
+    for p in planned_paths:
+        for mod in _module_names(p):
+            by_module[mod] = p
+    deps: dict[str, set[str]] = {p: set() for p in planned_paths}
+    for path in planned_paths:
+        try:
+            tree = ast.parse(files.get(path, ""))
+        except SyntaxError:
+            continue
+        mods: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = _resolve_module(node.module, node.level, path)
+                if node.module is None:
+                    mods.extend(f"{base}.{a.name}".lstrip(".") for a in node.names)
+                else:
+                    mods.append(base)
+                    mods.extend(f"{base}.{a.name}" for a in node.names)  # from pkg import mod
+            elif isinstance(node, ast.Import):
+                mods.extend(a.name for a in node.names)
+        for mod in mods:
+            dep = by_module.get(mod) or by_module.get(mod.split(".")[-1])
+            if dep and dep != path:
+                deps[path].add(dep)
+    return deps
+
+
+def _tarjan_sccs(deps: dict[str, set[str]]) -> list[list[str]]:
+    """Tarjan's SCCs, iterative. Returned in REVERSE topological order of the
+    condensation (dependencies' SCCs appear before dependents' — Tarjan's property)."""
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    sccs: list[list[str]] = []
+    counter = 0
+
+    for root in deps:
+        if root in index:
+            continue
+        work = [(root, iter(sorted(deps[root])))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for nxt in it:
+                if nxt not in deps:
+                    continue
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(sorted(deps[nxt]))))
+                    advanced = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                scc = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    scc.append(w)
+                    if w == node:
+                        break
+                sccs.append(scc)
+    return sccs
+
+
+def dependency_order(files: dict[str, str], planned: list) -> list:
+    """Re-sort PlannedFiles so imports migrate FIRST (FINDINGS §7). Tarjan identifies SCC
+    MEMBERSHIP only; the condensation DAG is then Kahn-sorted with a heap keyed by each
+    ready SCC's best `(role order, path)` member — fully deterministic, no dependence on
+    set/dict/traversal order (v2 review finding #2). Role order breaks ties inside an
+    SCC and between simultaneously-ready SCCs."""
+    import heapq
+
+    by_path = {pf.path: pf for pf in planned}
+    ordered_paths = [pf.path for pf in planned]  # NEVER a set — determinism
+    deps = _planned_imports(files, ordered_paths)
+    sccs = _tarjan_sccs(deps)
+
+    scc_of = {p: i for i, scc in enumerate(sccs) for p in scc}
+    indegree = [0] * len(sccs)
+    dependents: list[set[int]] = [set() for _ in sccs]
+    for path, targets in deps.items():
+        for dep in targets:
+            a, b = scc_of[dep], scc_of[path]  # edge: dep's SCC -> dependent's SCC
+            if a != b and b not in dependents[a]:
+                dependents[a].add(b)
+                indegree[b] += 1
+
+    def scc_key(i: int) -> tuple:
+        return min((by_path[p].order, p) for p in sccs[i])
+
+    ready = [(scc_key(i), i) for i in range(len(sccs)) if indegree[i] == 0]
+    heapq.heapify(ready)
+    ordered: list = []
+    while ready:
+        _, i = heapq.heappop(ready)
+        ordered.extend(sorted((by_path[p] for p in sccs[i]),
+                              key=lambda pf: (pf.order, pf.path)))
+        for j in dependents[i]:
+            indegree[j] -= 1
+            if indegree[j] == 0:
+                heapq.heappush(ready, (scc_key(j), j))
+    return ordered
+
+
+def build_migration_units(
+    files: dict[str, str], planned: list, manifest: dict[str, dict], *, max_files: int = 4
+) -> list[dict]:
+    """Select small, tightly-coupled initial generation units for framework seams.
+
+    This is deliberately semantic and recipe-agnostic: a seed is a preserved callable
+    with a required companion export (a resource-helper pin); it may pull in one importing
+    application factory and one importing test harness. Routers and unrelated tests are
+    excluded, even when they import the resource. The result is deterministic, bounded,
+    JSON-safe, and contains no repository-name/path exceptions.
+    """
+    by_path = {pf.path: pf for pf in planned}
+    order = {pf.path: i for i, pf in enumerate(planned)}
+    deps = _planned_imports(files, list(by_path))
+    resource_owners = {
+        p["module"] for p in manifest.values()
+        if p.get("preserve_shape") and p.get("additional_exports")
+        and p.get("module") in by_path
+    }
+
+    def depends_on(path: str, target: str) -> bool:
+        pending = list(deps.get(path, set()))
+        seen: set[str] = set()
+        while pending:
+            dep = pending.pop()
+            if dep == target:
+                return True
+            if dep not in seen:
+                seen.add(dep)
+                pending.extend(deps.get(dep, set()))
+        return False
+
+    claimed: set[str] = set()
+    units: list[dict] = []
+    for owner in sorted(resource_owners, key=lambda p: (order[p], p)):
+        if owner in claimed:
+            continue
+        members = [owner]
+        factories = [
+            p for p, pf in by_path.items()
+            if pf.role == "app_factory" and depends_on(p, owner)
+        ]
+        factories.sort(key=lambda p: (order[p], p))
+        if factories and len(members) < max_files:
+            members.append(factories[0])
+
+        harnesses = [
+            p for p, pf in by_path.items()
+            if pf.role == "test_harness"
+            and any(depends_on(p, member) for member in members)
+        ]
+        # conftest is the standard pytest wiring seam; prefer it over behavioural test
+        # modules without naming any repository or individual test.
+        harnesses.sort(key=lambda p: (
+            Path(p).name != "conftest.py", order[p], p,
+        ))
+        if harnesses and len(members) < max_files:
+            members.append(harnesses[0])
+        # Pytest fixture injection creates no import edge from a test module to
+        # conftest. A CLI invocation nevertheless shares the runner adapter's call shape;
+        # include at most one such harness while the unit remains bounded.
+        invocation_harnesses = [
+            p for p, pf in by_path.items()
+            if pf.role == "test_harness" and p not in members
+            and ".invoke(" in files.get(p, "")
+        ]
+        invocation_harnesses.sort(key=lambda p: (order[p], p))
+        if invocation_harnesses and len(members) < max_files:
+            members.append(invocation_harnesses[0])
+
+        roles = {by_path[p].role for p in members}
+        if len(members) < 2 or not ({"support", "app_factory"} & roles):
+            continue
+        members.sort(key=lambda p: (order[p], p))
+        if {"support", "app_factory", "test_harness"} <= roles:
+            reason = "shared resource/factory/test-harness seam"
+        elif "app_factory" in roles:
+            reason = "shared resource/application-factory seam"
+        else:
+            reason = "shared resource/test-harness seam"
+        units.append({
+            "id": f"framework-seam-{len(units) + 1}",
+            "paths": members,
+            "reason": reason,
+        })
+        claimed.update(members)
+    return units
+
+
+def build_manifest(root: str, planned: list, rules: list) -> dict[str, dict]:
+    """Target-interface manifest: one frozen decision per cross-file symbol. Default
+    target = original shape; exactly ONE matching PinRule may override it — two rules
+    claiming the same symbol is a recipe bug and fails Plan loudly (never silently
+    first-match). Plain JSON-safe dicts: this artifact lives in checkpointed state."""
+    manifest: dict[str, dict] = {}
+    sources = iter_py_files(root)
+    for pf in planned:
+        subtask_types = {s.type for s in pf.subtasks}
+        for c in interface_contract(root, pf.path):
+            matches = [r for r in rules
+                       if r.subtask in subtask_types and r.applies(c)]
+            if len(matches) > 1:
+                raise ValueError(
+                    f"interface pin conflict for {pf.path}::{c.name}: rules "
+                    f"{[r.subtask for r in matches]} all claim it — make applies() "
+                    f"predicates disjoint")
+            rule = matches[0] if matches else None
+            note = rule.note.format(name=c.name) if rule else "keep the original shape"
+            consumers: list[dict] = []
+            for binding in imported_bindings(root, pf.path):
+                uses_symbol = binding.symbol == c.name
+                uses_module_attr = (
+                    binding.symbol is None
+                    and c.name in _module_attrs_used(
+                        sources.get(binding.importer, ""), binding.local,
+                    )
+                )
+                if uses_symbol or uses_module_attr:
+                    consumers.append({
+                        "module": binding.importer,
+                        "local": binding.local,
+                        "binding": "symbol" if uses_symbol else "module",
+                    })
+            manifest[f"{pf.path}::{c.name}"] = {
+                "module": pf.path,
+                "symbol": c.name,
+                "kind": c.kind,
+                "original": c.signature,
+                "target_note": note,
+                "notes": c.notes,
+                "call_sites": list(c.call_sites),
+                "consumers": sorted(
+                    consumers,
+                    key=lambda item: (item["module"], item["local"], item["binding"]),
+                ),
+                "shape": c.shape,
+                "preserve_shape": rule.preserve_shape if rule else True,
+                "target_kind": (rule.target_kind if rule and rule.target_kind else c.kind),
+                "additional_exports": [
+                    name.format(name=c.name) for name in (rule.additional_exports if rule else ())
+                ],
+            }
+    return manifest

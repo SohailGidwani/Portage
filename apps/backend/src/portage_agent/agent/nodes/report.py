@@ -11,11 +11,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from hashlib import sha256
 
 from portage_agent.db import task_store
 from portage_agent.storage import LocalStorage
 
 from ..state import GraphState
+from .common import read_file
+from .oracle import oracle_violations
 from .redaction import scrub
 
 log = logging.getLogger("portage.agent")
@@ -50,13 +53,67 @@ async def report_node(state: GraphState) -> GraphState:
         "tasks_skipped": sum(1 for t in plan if t.get("status") == "skipped"),
         "escalation_attempted": len(escalation_tasks),
         "escalation_rescued": sum(1 for t in escalation_tasks if t.get("status") == "done"),
+        "integration_visits": state.get("integration_recovery_visits", 0),
+        "no_progress_retries": sum(
+            1 for action in state.get("recovery_actions", [])
+            if "no_progress" in action.get("classification", "")
+        ),
+        "last_classification": (
+            (state.get("recovery_actions") or [{}])[-1].get("classification")
+        ),
     }
+
+    oracle_manifest = state.get("oracle_manifest") or {}
+    oracle_files: list[dict] = []
+    oracle_breaks: list[dict] = []
+    oracle_root = state.get("worktree") or state.get("workspace") or ""
+    for oracle_path, entry in oracle_manifest.items():
+        current = read_file(oracle_root, oracle_path) or ""
+        violations = oracle_violations(entry, current)
+        result = {
+            "path": oracle_path,
+            "strategy": (state.get("test_strategy") or {}).get(oracle_path, "unchanged"),
+            "byte_preserved": sha256(current.encode()).hexdigest() == entry.get("sha256"),
+            "violations": violations,
+        }
+        oracle_files.append(result)
+        if violations:
+            oracle_breaks.append({"path": oracle_path, "violations": violations})
+    protected = len(oracle_manifest)
+    clean = sum(1 for result in oracle_files if not result["violations"])
+    oracle_integrity = {
+        "protected_files": protected,
+        "checked_files": len(oracle_files),
+        "clean_files": clean,
+        "integrity_rate": clean / protected if protected else 1.0,
+        "violations": oracle_breaks,
+        "files": oracle_files,
+        "attempt_results": state.get("oracle_results", []),
+    }
+
+    suite_ok = (
+        final.get("passed", 0) > 0
+        and final.get("failed", 0) == 0
+        and final.get("errors", 0) == 0
+    )
+    unsupported = list(state.get("unsupported_test_seams") or [])
+    if unsupported:
+        migration_outcome = "unsupported"
+    elif migrate and suite_ok and tasks_done == len(plan) and not oracle_breaks:
+        migration_outcome = "success"
+    elif migrate:
+        migration_outcome = "failed"
+    else:
+        migration_outcome = "not_applicable"
 
     # Job-level LLM usage, summed over every attempt of every task (retries included) —
     # cost-per-migration is a first-class eval metric (plan §11).
     attempts = [a for t in plan for a in t.get("attempts_log", [])]
     llm_usage = {
-        "calls": sum(1 for a in attempts if a.get("action") == "migrate"),
+        "calls": sum(
+            1 for a in attempts
+            if a.get("action") in ("migrate", "contract_repair", "diagnose")
+        ),
         "prompt_tokens": sum(a.get("prompt_tokens", 0) for a in attempts),
         "completion_tokens": sum(a.get("completion_tokens", 0) for a in attempts),
         "cost_usd": round(sum(a.get("cost_usd", 0.0) for a in attempts), 6),
@@ -74,6 +131,10 @@ async def report_node(state: GraphState) -> GraphState:
         "tasks_done": tasks_done,
         "affected_tests": state.get("affected_tests", []),
         "recovery": recovery,
+        "migration_outcome": migration_outcome,
+        "unsupported_test_seams": unsupported,
+        "oracle_integrity": oracle_integrity,
+        "verified_batches": state.get("verified_batches", []),
         "llm_usage": llm_usage,
         "verify_summary": verify_summary,
         "integrate_summary": integrate_summary,

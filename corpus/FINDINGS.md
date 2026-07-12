@@ -74,12 +74,55 @@ not a single average.
    Middleware + session-auth guidance, template apps now complete their DAGs, their
    suites *execute*, and most tests pass (flaskr and watchlist both average 0.67
    test-pass at K=3) — but the all-or-nothing green bar isn't met. The v1 frontier.
-7. **Cross-file call-shape drift** — OPEN, the dominant residual failure: multi-file
-   regeneration keeps *signatures* coherent nowhere — flaskr's `get_db()` drifts between
-   "plain function", "needs request", "context manager" across files/attempts (19/24
-   failures in the final probe). The export contract pins names, not call shapes. Fix
-   direction: extend the contract pass to include signatures/usage snippets of imported
-   symbols, or plan a shared "interfaces" step before per-file migration.
+7. **Cross-file call-shape drift** — MITIGATED by R1, but the gate is **not closed**.
+   The plan-time manifest now freezes binding-aware exports, original shape facts, call-site
+   examples, and recipe pin decisions; dependency/SCC ordering and every generation/repair
+   consume that same checkpointed artifact. The pre-sandbox checker caught three flaskr
+   drafts that grew `get_db()` from zero required args to one. Two of five retained
+   `tests/conftest.py` recovery diffs still changed the caller to `get_db(app)`, so caller
+   compliance remains a Verify-time gap rather than a solved invariant. It was no longer
+   the dominant terminal failure: all three flaskr gate runs instead converged on invented
+   Flask-like context/CLI surfaces on `FastAPI` (`app.container`,
+   `app.state.open_resource`, and related attributes).
+
+   Task-7 measurements (2026-07-11): the Qwen inner loop (`r1-iter-final`, K=3) produced
+   0/3 green for both flaskr and watchlist (avg test-pass 0.33 for each). The published
+   GPT-4o grid (`r1-gate-final`, K=3) was:
+
+   | repo | green | avg test-pass | avg completion | avg recover | avg cost | avg wall |
+   |---|---:|---:|---:|---:|---:|---:|
+   | flask-items-fixture | **3/3** | 1.00 | 1.00 | 0.0 | $0.025 | 11s |
+   | minimal-flask-api | **2/3** | 0.67 | 0.89 | 2.0 | $0.033 | 16s |
+   | flaskr | **0/3** | 1.00 | 0.00 | 3.0 | $0.387 | 75s |
+   | watchlist | **0/3** | 1.00 | 0.00 | 3.0 | $0.255 | 52s |
+
+   Verdict: fixture, minimal-flask-api, and watchlist's partial-credit threshold pass;
+   flaskr's required ≥1/3 green fails. The 1.00 structural test-pass scores are rollback
+   results, not successful migrations (completion is 0.00), so R1 stays unticked. The
+   remaining dominant boundary is framework-inspecting test/setup migration plus caller-
+   side enforcement, not loss of the manifest itself.
+
+   **R1.1 follow-on (2026-07-11, GPT-4o):** implemented without corpus-path/test-name
+   rules: frozen consumer bindings + direct-call arity/keyword checks; deterministic
+   framework-seam decisions; bounded resource/factory/test-harness cluster generation
+   (including coordinated retries); mechanical rejection of invented FastAPI capabilities;
+   exact Click runner-result semantics; package re-export disambiguation; and restoration
+   of full recipe subtask instructions in Execute. Added a bundled generic structural
+   fixture (factory + `g/current_app` SQLite + Click + blueprint + pytest wiring).
+
+   | suite/repo | green | avg test-pass | avg completion | avg recover | avg cost |
+   |---|---:|---:|---:|---:|---:|
+   | `r1-1-structural-confirm` / structural fixture | **3/3** | 1.00 | 1.00 | 1.0 | $0.044 |
+   | `r1-1-final-gate` / items fixture | **3/3** | 1.00 | 1.00 | 0.0 | $0.021 |
+   | `r1-1-final-gate` / minimal-flask-api | **3/3** | 1.00 | 1.00 | 1.7 | $0.025 |
+   | `r1-1-flaskr-confirm` / flaskr | **0/3** | 1.00 | 0.00 | 3.0 | $0.250 |
+   | `r1-1-final-gate` / watchlist | **0/3** | 1.00 | 0.00 | 4.0 | $0.291 |
+
+   R1.1 establishes a reproducible structural seam and removes the minimal API's false
+   `run` contract (`from api import app` was a package object re-export, not a submodule).
+   It still does not close R1: flaskr/watchlist remain rollback-red with no residual
+   mechanical contract violations, which isolates the next capability to deeper
+   framework-inspecting setup, templates/sessions/auth, and Flask-coupled extensions.
 8. **Flask-coupled extensions** (`flask_sqlalchemy`, `flask_restx`) — OPEN / v1 boundary,
    now partially cracked: with the plain-SQLAlchemy and RESTX guidance plus self-review
    retries, **flask-restx-api reached green 1/3 at K=3** (was: never collected). The
@@ -113,6 +156,26 @@ not a single average.
 - **Escalation, measured**: with driver == escalation model (same GPT-4o deployment),
   escalation-rescue rates measure the *retry ladder machinery*, not stronger-model lift —
   swap `LLM_ESCALATION_MODEL` to a stronger deployment to measure real lift (env-only).
+- **Two-model escalation lift, MEASURED (2026-07-09, suites `qwen-ladder` vs
+  `qwen-control`)**: driver = Qwen3 Coder Next (Ollama cloud) in both arms; escalation =
+  GPT-4o (ladder) vs Qwen itself (control). Same grid: fixture + minimal-flask-api
+  baselines and fixture `bad_patch_until_escalation`, K=3 each.
+
+  | arm | green | fault-scenario green | total cost | avg wall |
+  |---|---|---|---|---|
+  | ladder (qwen → GPT-4o) | **8/9** | **3/3** | $0.093 | 39s |
+  | control (qwen → qwen) | 5/9 | 1/3 | $0.00* | 78s |
+
+  The stronger escalation tier is worth **+3 greens of 9** under identical conditions —
+  concentrated exactly where it should be: the injected-fault scenario (3/3 vs 1/3) and
+  a fixture baseline the weak driver couldn't converge alone. The ladder also halves
+  wall time (GPT-4o resolves in fewer attempts than qwen burning full budgets). Bonus
+  integrity demo: one control run went red with the suite at 6/6 — all three tasks
+  exhausted and rolled back, the ORIGINAL suite passed, and the honest-green bar refused
+  it. (*Ollama-hosted models are absent from LiteLLM's price map, so their calls cost
+  $0.00 in the ledger — the ladder arm's $0.093 is the GPT-4o share only. That
+  cost-blindness is also why the hosted demo keeps GPT-4o: the demo-protection spend
+  caps cannot see unpriceable models.)
 
 ## Corpus admission findings
 
@@ -120,3 +183,45 @@ Four candidates were dropped for one shared reason worth naming: **a single shar
 image cannot serve mutually incompatible dependency pins** (2017-era Flask 0.12 stacks,
 abandoned `flask_restplus`, `itsdangerous<2.1`, SQLAlchemy 1.x APIs). Per-repo sandbox
 images are the documented unlock if corpus breadth becomes the goal.
+
+## R2/R3 compatibility-first baseline — final GPT-4o grid (2026-07-12)
+
+Suite `r2-r3-baseline-gpt4o-20260712-v2` ran the final rebuilt worker across all seven
+development-corpus entries at K=3 (21 real jobs). The earlier suite without `-v2` was
+aborted after detecting that its container predated the final crash-batch patch; its rows
+remain diagnostic only and are not used below.
+
+| repo | green | test-pass | completion | oracle | avg recovery | total cost |
+|---|---:|---:|---:|---:|---:|---:|
+| flask-items-fixture | **3/3** | 1.00 | 1.00 | 1.00 | 0.00 | $0.0375 |
+| flask-structural-fixture | **3/3** | 1.00 | 1.00 | 1.00 | 0.67 | $0.1180 |
+| minimal-flask-api | **0/3** | 1.00 | 0.25 | 1.00 | 3.00 | $0.0379 |
+| flaskr | **0/3** | 1.00 | 0.1429 | 1.00 | 3.00 | $0.5277 |
+| watchlist | **0/3** | 1.00 | 0.1667 | 1.00 | 3.00 | $0.1170 |
+| microblog | **0/3** | 1.00 | 0.0526 | 1.00 | 3.00 | $6.0604 |
+| flask-restx-api | **0/3** | 1.00 | 0.25 | 1.00 | 3.00 | $0.0914 |
+
+Aggregate: **6/21 green (28.6%)**, $6.9898, 1,108.4 worker-seconds. Every run retained
+100% final test pass and 100% oracle integrity. The external-app reds are therefore honest
+completion failures followed by rollback, not weakened tests or false greens.
+
+The grid identifies the next general boundary more sharply than another prompt iteration:
+
+1. **A batch must be an executable migration cut, not merely the first file with an
+   affected test.** Minimal API and watchlist migrated an `APIRouter` while their still-Flask
+   app factory called `register_blueprint`; the first batch could not possibly pass. The
+   planner must include required consumers/factory wiring (or a deterministic bridge) before
+   Verify, using import/dependency structure rather than repository names.
+2. **Whole-component crash recovery is too expensive for large graphs.** Microblog reset
+   18 files three times for one circular-import collection failure: ~66.7 LLM calls/run and
+   ~$2.02/run, then hit the $2 ceiling. Coherence must be preserved with SCC-aware blame or
+   bounded batch bisection, not full-component blind regeneration.
+3. **Extension profiles need early, explicit handling.** RESTX repeatedly tried to pass a
+   Flask-RESTX `Namespace` to `APIRouter.include_router`; this should become a dedicated
+   namespace conversion profile or an immediate `unsupported` result. Flask-SQLAlchemy/login
+   and template/session apps need the same profile contract.
+
+The immediate engineering order is therefore: executable-cut batching → bounded
+SCC/component recovery → explicit idiom profiles/unsupported diagnosis → rerun baseline
+K=3. Do not spend on the 105-job fault matrix until the external baseline completion rate
+meaningfully improves.

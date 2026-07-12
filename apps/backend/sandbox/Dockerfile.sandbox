@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir \
         "uvicorn==0.34.0" \
         "httpx==0.28.1" \
         "python-multipart==0.0.20" \
+        "click==8.1.8" \
+        "itsdangerous==2.2.0" \
         "flask==3.1.0" \
         "setuptools==75.6.0" \
         "wheel==0.45.1" \

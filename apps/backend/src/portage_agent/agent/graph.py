@@ -33,6 +33,8 @@ log = logging.getLogger("portage.agent")
 
 def _after_verify(state: GraphState) -> str:
     if state.get("verify_passed"):
+        if state.get("migrate") and state.get("has_pending_tasks"):
+            return "execute"
         return "integrate"
     if not state.get("migrate"):
         return "integrate"  # nothing was changed; report the repo's own red suite as-is
@@ -41,6 +43,13 @@ def _after_verify(state: GraphState) -> str:
 
 def _after_recover(state: GraphState) -> str:
     return state.get("recover_route") or "integrate"
+
+
+def _after_integrate(state: GraphState) -> str:
+    if (state.get("migrate") and not state.get("integration_passed")
+            and int(state.get("integration_recovery_visits", 0)) < 1):
+        return "recover"
+    return "report"
 
 
 def build_graph(checkpointer):
@@ -59,12 +68,15 @@ def build_graph(checkpointer):
     builder.add_edge("plan", "execute")
     builder.add_edge("execute", "verify")
     builder.add_conditional_edges(
-        "verify", _after_verify, {"recover": "recover", "integrate": "integrate"}
+        "verify", _after_verify,
+        {"execute": "execute", "recover": "recover", "integrate": "integrate"},
     )
     builder.add_conditional_edges(
         "recover", _after_recover,
         {"execute": "execute", "plan": "plan", "integrate": "integrate"},
     )
-    builder.add_edge("integrate", "report")
+    builder.add_conditional_edges(
+        "integrate", _after_integrate, {"recover": "recover", "report": "report"},
+    )
     builder.add_edge("report", END)
     return builder.compile(checkpointer=checkpointer)

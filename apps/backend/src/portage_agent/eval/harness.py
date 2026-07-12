@@ -44,6 +44,7 @@ SCENARIOS: dict[str, dict] = {
     "bad_patch": {"inject_fault": "bad_patch"},
     "bad_patch_until_escalation": {"inject_fault": "bad_patch_until_escalation"},
     "drop_task": {"inject_fault": "drop_task"},
+    "integration_only": {"inject_fault": "integration_only"},
 }
 
 # Metrics aggregated over the K runs of one (repo, scenario) cell.
@@ -51,6 +52,8 @@ _METRICS = (
     "suite_green",
     "test_pass_rate",
     "completion_rate",
+    "oracle_integrity_rate",
+    "no_progress_retries",
     "recover_visits",
     "escalation_rescued",
     "llm_calls",
@@ -81,6 +84,9 @@ class RunResult:
     completion_tokens: int = 0
     cost_usd: float = 0.0
     wall_seconds: float = 0.0
+    oracle_integrity_rate: float = 0.0
+    no_progress_retries: int = 0
+    migration_outcome: str = "failed"
 
     def metric(self, name: str) -> float:
         if name == "suite_green":
@@ -149,6 +155,10 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     r.prompt_tokens = int(usage.get("prompt_tokens") or 0)
     r.completion_tokens = int(usage.get("completion_tokens") or 0)
     r.cost_usd = float(usage.get("cost_usd") or 0.0)
+    oracle = report.get("oracle_integrity") or {}
+    r.oracle_integrity_rate = float(oracle.get("integrity_rate") or 0.0)
+    r.no_progress_retries = int(rec.get("no_progress_retries") or 0)
+    r.migration_outcome = str(report.get("migration_outcome") or "failed")
 
     # Green = the MIGRATION succeeded, not merely "tests passed": every planned task done
     # (none skipped/rolled back) AND the full suite green. Skip-and-continue can roll the
@@ -157,7 +167,9 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     if job.status == "done":
         suite_ok = r.tests_total > 0 and r.tests_passed == r.tests_total
         fully_migrated = r.tasks_total > 0 and r.tasks_done == r.tasks_total
-        r.status = "green" if (suite_ok and fully_migrated) else "red"
+        r.status = "green" if (
+            suite_ok and fully_migrated and r.migration_outcome == "success"
+        ) else "red"
     return r
 
 
