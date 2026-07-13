@@ -8,6 +8,14 @@ from pathlib import Path
 
 from .common import iter_py_files
 
+# These oracle strategies never produce a framework rewrite. ``adapter`` and
+# ``unchanged`` files are preserved deterministically; ``unsupported_test_seam`` files
+# are reported and skipped. They therefore cannot be members of an executable migration
+# cut or coordinated generation unit.
+NON_REWRITE_TEST_STRATEGIES = frozenset({
+    "adapter", "unchanged", "sanctioned_normalization", "unsupported_test_seam",
+})
+
 
 def _is_test_file(path: str) -> bool:
     name = Path(path).name
@@ -212,6 +220,33 @@ def build_oracle_manifest(root: str) -> dict[str, dict]:
             "strategy": classify_test_strategy(path, content),
         }
     return manifest
+
+
+def apply_sanctioned_normalizations(content: str, replacements: list[dict]) -> str:
+    """Apply recipe-frozen, exact-line plumbing replacements and nothing else.
+
+    Recipes decide which transformations are sanctioned. The engine only enforces that
+    each frozen original line still matches and that no replacement range overlaps.
+    """
+    lines = content.splitlines(keepends=True)
+    occupied: set[int] = set()
+    for replacement in sorted(replacements, key=lambda item: item["line"]):
+        line = int(replacement["line"])
+        index = line - 1
+        if index < 0 or index >= len(lines) or index in occupied:
+            raise ValueError(f"invalid or overlapping sanctioned normalization line {line}")
+        original = lines[index].removesuffix("\n").removesuffix("\r")
+        if original != replacement["before"]:
+            raise ValueError(
+                f"sanctioned normalization source drift at line {line}: "
+                f"expected {replacement['before']!r}, got {original!r}"
+            )
+        ending = "\r\n" if lines[index].endswith("\r\n") else (
+            "\n" if lines[index].endswith("\n") else ""
+        )
+        lines[index] = replacement["after"] + ending
+        occupied.add(index)
+    return "".join(lines)
 
 
 def oracle_violations(original: dict, generated: str) -> list[str]:

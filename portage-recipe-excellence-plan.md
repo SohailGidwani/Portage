@@ -63,8 +63,8 @@ new bundled structural fixture. Confirmation: structural fixture 3/3, original f
 3/3, minimal-flask-api 3/3; flaskr and watchlist remain 0/3 completion-green. R1 stays
 open for the deeper framework-inspection/template/session/extension layer.
 
-Attacks the dominant failure. Detailed task plan:
-`docs/superpowers/plans/2026-07-09-r1-interface-consistency.md`
+Attacks the dominant failure. The detailed task plan is local-only:
+`notes/2026-07-09-r1-interface-consistency-design.md`
 1. Import-graph **topological execution order** (dependencies first; role order as
    tiebreak; cycle-safe). Fixes db-after-routers.
 2. **Interface contracts v2**: export contract grows signatures + call-site examples +

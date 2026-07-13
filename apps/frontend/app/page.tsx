@@ -22,6 +22,7 @@ import {
 } from "./lib/api";
 
 type Filter = "all" | "active" | "success" | "attention";
+const JOB_PAGE_SIZE = 20;
 
 function outcomeFor(job: Job, report?: Report | null): string {
   if (job.status === "queued" || job.status === "running") return job.status;
@@ -38,6 +39,8 @@ export default function Home() {
   const router = useRouter();
   const [health, setHealth] = useState<{ api: boolean; db: boolean } | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [totalJobs, setTotalJobs] = useState(0);
+  const [jobOffset, setJobOffset] = useState(0);
   const [reports, setReports] = useState<Record<string, Report | null>>({});
   const reportCache = useRef<Record<string, Report | null>>({});
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
@@ -58,12 +61,15 @@ export default function Home() {
       setEvalRuns(runs);
       let nextJobs: Job[];
       try {
-        nextJobs = await listJobs();
+        const page = await listJobs(JOB_PAGE_SIZE, jobOffset);
+        nextJobs = page.items;
+        setTotalJobs(page.total);
         setAuthRequired(false);
       } catch (jobError) {
         if (String(jobError).includes("401")) {
           setAuthRequired(true);
           setJobs([]);
+          setTotalJobs(0);
           setReports({});
           reportCache.current = {};
           setError(null);
@@ -84,7 +90,7 @@ export default function Home() {
     } catch (err) {
       setError(String(err));
     }
-  }, []);
+  }, [jobOffset]);
 
   useEffect(() => {
     refresh();
@@ -126,6 +132,11 @@ export default function Home() {
     if (filter === "attention") return ["failed", "unsupported"].includes(outcome);
     return true;
   });
+  const pageStart = totalJobs ? jobOffset + 1 : 0;
+  const pageEnd = Math.min(jobOffset + jobs.length, totalJobs);
+  const pageDescription = filter === "all"
+    ? `Showing ${pageStart}–${pageEnd} of ${totalJobs}`
+    : `${visibleJobs.length} match this filter on runs ${pageStart}–${pageEnd} of ${totalJobs}`;
 
   const account = me?.auth_mode === "github" ? (
     <button className="button ghost" onClick={async () => { await logout(); setMe(null); setAuthRequired(true); }}>
@@ -175,10 +186,10 @@ export default function Home() {
       </section>
 
       <section className="metrics-grid">
-        <Metric label="All runs" value={jobs.length} detail="Visible to this account" />
-        <Metric label="Active now" value={active} detail={active ? "Live updates every 4 seconds" : "No work in progress"} tone={active ? "warn" : undefined} />
-        <Metric label="Successful migrations" value={successful} detail="Complete + full suite green" tone="good" />
-        <Metric label="Needs attention" value={attention} detail="Failed or unsupported" tone={attention ? "bad" : undefined} />
+        <Metric label="All runs" value={totalJobs} detail="Visible to this account across every page" />
+        <Metric label="Active now" value={active} detail={active ? "On this page · updates every 4 seconds" : "None on this page"} tone={active ? "warn" : undefined} />
+        <Metric label="Successful migrations" value={successful} detail="On this page · complete + full suite green" tone="good" />
+        <Metric label="Needs attention" value={attention} detail="On this page · failed or unsupported" tone={attention ? "bad" : undefined} />
         <Metric label="Mean eval cost" value={avgCost === null ? "—" : `$${avgCost.toFixed(3)}`} detail="Green harness runs only" />
       </section>
 
@@ -196,7 +207,7 @@ export default function Home() {
             <table className="data-table">
               <thead><tr><th>Run</th><th>Repository</th><th>Outcome</th><th>Tests</th><th>Progress</th><th>Updated</th></tr></thead>
               <tbody>
-                {visibleJobs.slice(0, 20).map((job) => {
+                {visibleJobs.map((job) => {
                   const outcome = outcomeFor(job, reports[job.id]);
                   const rate = testRate(job);
                   const report = reports[job.id];
@@ -215,6 +226,21 @@ export default function Home() {
                 {!visibleJobs.length && <tr><td colSpan={6}><div className="empty-state">No runs match this filter.</div></td></tr>}
               </tbody>
             </table>
+          </div>
+          <div className="pagination-bar" aria-label="Run history pagination">
+            <span>{pageDescription}</span>
+            <div>
+              <button
+                className="button ghost"
+                disabled={jobOffset === 0}
+                onClick={() => setJobOffset(Math.max(0, jobOffset - JOB_PAGE_SIZE))}
+              >Previous</button>
+              <button
+                className="button ghost"
+                disabled={jobOffset + jobs.length >= totalJobs}
+                onClick={() => setJobOffset(jobOffset + JOB_PAGE_SIZE)}
+              >Next</button>
+            </div>
           </div>
         </section>
 

@@ -2,12 +2,14 @@
 
 import importlib.util
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
 import pytest
 from fastapi import FastAPI, Request
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import RedirectResponse
 
 from portage_agent.recipes.flask_test_compat import render_flask_test_compat
 
@@ -53,6 +55,39 @@ def test_client_response_config_and_context_facades(compat):
         assert response.get_json() == {"ok": True}
         assert response.get_data(as_text=True)
         assert response.data
+
+
+def test_client_uses_flask_redirect_default_and_preserves_explicit_follow(compat):
+    app = _app()
+
+    @app.get("/redirect")
+    def redirect():
+        return RedirectResponse("/json", status_code=302)
+
+    client = compat.adapt_app(app).test_client()
+    response = client.get("/redirect")
+    assert response.status_code == 302
+    assert response.headers["location"] == "/json"
+    assert client.get("/redirect", follow_redirects=True).status_code == 200
+
+
+def test_app_context_delegates_to_application_owned_context(compat):
+    app = _app()
+    active = []
+
+    @contextmanager
+    def app_context():
+        active.append(True)
+        try:
+            yield app
+        finally:
+            active.pop()
+
+    app.app_context = app_context
+    wrapped = compat.adapt_app(app)
+    with wrapped.app_context():
+        assert active == [True]
+    assert active == []
 
 
 def test_cli_runner_preserves_flask_invoke_shape(compat):

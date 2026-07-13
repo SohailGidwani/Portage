@@ -131,6 +131,10 @@ class Settings(BaseSettings):
     # A task that fails this many attempts is rolled back to its original source and marked
     # `skipped` (skip-and-continue keeps the run alive; the report stays honest).
     max_task_attempts: int = 3
+    # A uniquely attributed runtime contract failure gets this many target-only repair
+    # attempts even when coordinated generation already spent the ordinary task budget.
+    # These calls have their own attempts_log scope and never reset Task.attempts.
+    max_targeted_contract_repairs: int = 1
     # Global step budget on the Verify→Recover loop; exceeded => give up and Integrate.
     max_recover_visits: int = 4
 

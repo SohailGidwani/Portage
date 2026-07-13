@@ -4,7 +4,11 @@ Also covers the Task 6 review fixes (task-6-review.md):
   F1 — draft selection (_pick_draft) must not let an unparseable repair beat a valid draft.
   F2 — presence check must see definitions inside module-level try/if blocks (compat
        shims), but NOT inside `if TYPE_CHECKING:` (never runs at import time)."""
-from portage_agent.agent.nodes.execute import _pick_draft, contract_violations
+from portage_agent.agent.nodes.execute import (
+    _pick_draft,
+    all_generation_violations,
+    contract_violations,
+)
 
 
 def _pin(symbol, original, target_note="keep the original shape", kind="function"):
@@ -19,6 +23,20 @@ def test_missing_export_flagged():
     m = {"db.py::get_db": _pin("get_db", "def get_db()")}
     v = contract_violations("def other():\n    pass\n", m, "db.py")
     assert v and "get_db" in v[0] and "missing" in v[0]
+
+
+def test_undefined_global_is_rejected_before_runtime():
+    bad = "def init_app(app):\n    return Path(__file__).parent\n"
+    assert all_generation_violations(bad, {}, "db.py") == [
+        "db.py: undefined global name `Path`; import or define it",
+    ]
+    good = "from pathlib import Path\ndef init_app(app):\n    return Path(__file__).parent\n"
+    assert all_generation_violations(good, {}, "db.py") == []
+
+
+def test_undefined_global_check_defers_to_wildcard_import():
+    source = "from framework import *\ndef route():\n    return injected_name\n"
+    assert all_generation_violations(source, {}, "views.py") == []
 
 
 def test_reexport_and_assignment_count_as_defined():
@@ -59,6 +77,35 @@ def test_generator_flip_flagged():
                                    "is_async": False, "is_generator": True}
     v = contract_violations("def get_db():\n    return 1\n", m, "db.py")
     assert v and "generator" in v[0]
+
+
+def test_decorator_factory_must_still_return_a_local_wrapper():
+    pin = _pin("login_required", "def login_required(view)") | {
+        "module": "auth.py",
+        "preserve_shape": True,
+        "shape": {
+            "required_positional": 1,
+            "required_keyword_only": [],
+            "is_async": False,
+            "is_generator": False,
+            "returns_nested_function": True,
+        },
+    }
+    manifest = {"auth.py::login_required": pin}
+
+    bad = "def login_required(request):\n    return request.session\n"
+    assert any(
+        "wrapper/decorator" in violation
+        for violation in contract_violations(bad, manifest, "auth.py")
+    )
+
+    good = (
+        "def login_required(view):\n"
+        "    def wrapped(**kwargs):\n"
+        "        return view(**kwargs)\n"
+        "    return wrapped\n"
+    )
+    assert contract_violations(good, manifest, "auth.py") == []
 
 
 def test_new_required_kwonly_flagged():

@@ -30,11 +30,16 @@ class GraphState(TypedDict, total=False):
     worktree: str  # migration worktree path (only when migrate)
     affected_tests: list[str]  # blast-radius-selected test files ([] => run all)
     interface_manifest: dict  # R1: frozen target-interface decisions, keyed "path::symbol"
-    seam_plan: dict  # R1.1: framework-capability decisions + coupled initial units
+    # R1.1+: framework-capability decisions, bounded coordinated generation units,
+    # executable verification cuts/edges, and large-cut diagnostics.
+    seam_plan: dict
     oracle_manifest: dict  # original test names/assertions/decorators, frozen at Plan
     # path -> unchanged|adapter|adapter_wiring|guarded_rewrite|unsupported_test_seam
     test_strategy: dict
+    # Recipe-owned, frozen exact-line test plumbing rewrites, keyed by test path.
+    test_normalizations: dict
     test_compat_path: str  # deterministic repo-root compatibility module, or empty
+    artifact_plan: list[dict]  # frozen validated create-artifact proposals
     unsupported_test_seams: list[dict]
     oracle_results: Annotated[list[dict], operator.add]
 
@@ -43,15 +48,23 @@ class GraphState(TypedDict, total=False):
     current_batch_tests: list[str]
     has_pending_tasks: bool
     verified_batches: Annotated[list[dict], operator.add]
+    # Filesystem-backed pre-cut snapshot metadata. Source bytes stay in the worktree,
+    # not in checkpoint JSON, and are discarded after a successful Verify.
+    current_batch_checkpoint: dict
+    cut_restore_pending_verification: bool
     verify_attempts: int  # bumped by Verify each run (diagnostic)
     verify_passed: bool
     last_verify_errors: str  # failing-test output; Recover classifies it, Execute retries with it
     last_failure_fingerprint: str
     diagnostic_repair_requested: bool
+    # Uniquely attributed provider/consumer target for a bounded target-only repair.
+    # Historical field name retained for checkpoint compatibility.
+    contract_repair_owner: str
     recover_source: str  # "verify" | "integrate"
 
     # --- Recover (Phase 3) ---
-    recover_visits: int  # step budget on the Verify→Recover loop
+    recover_visits: int  # total audit count for every Recover entry
+    recover_budget_used: int  # only non-progress/whole-cut failures debit this budget
     recover_route: str  # "execute" | "plan" | "integrate" — Recover's routing decision
     replan_requested: bool  # set by Recover, consumed by Plan (append missed tasks)
     recovery_actions: Annotated[list[dict], operator.add]  # audit log for report/frontend

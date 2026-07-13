@@ -42,6 +42,7 @@ def test_generator_decorator_notes_and_with_usage(tmp_path):
         "accepts_varkw": False,
         "is_async": False,
         "is_generator": True,
+        "returns_nested_function": False,
     }
 
 
@@ -62,6 +63,7 @@ def test_shape_facts_async_and_kwonly(tmp_path):
         "accepts_varkw": False,
         "is_async": True,
         "is_generator": False,
+        "returns_nested_function": False,
     }
 
 
@@ -96,4 +98,5 @@ def test_nested_generator_does_not_mark_outer_as_generator(tmp_path):
     })
     c = interface_contract(root, "db.py")[0]
     assert c.shape["is_generator"] is False
+    assert c.shape["returns_nested_function"] is True
     assert "generator" not in c.notes

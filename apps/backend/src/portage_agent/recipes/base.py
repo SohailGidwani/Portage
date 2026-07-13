@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+MAX_CREATED_ARTIFACTS = 4
+
 
 @dataclass(frozen=True, slots=True)
 class Subtask:
@@ -51,12 +53,26 @@ class PlannedFile:
     # Lower runs first. Lets depended-upon files migrate before their importers so the
     # already-migrated version can be shown as context.
     order: int = 100
+    # Provenance is explicit so fault injection and accounting can distinguish recipe
+    # decisions from deterministic Portage execution infrastructure without knowing every
+    # protected role by name.
+    origin: str = "recipe"  # "recipe" | "infrastructure"
+    # Artifact-producing plans keep rewrites backward-compatible while allowing a recipe
+    # to request a path that does not exist in the source repository. The contract is a
+    # JSON-safe, frozen Plan artifact (exports/members/consumers/dependencies/instructions).
+    action: str = "rewrite"  # "rewrite" | "create"
+    purpose: str = ""
+    artifact_contract: dict = field(default_factory=dict)
 
     def verify_spec(self) -> dict:
         """Static part of the per-task verify spec (Plan adds the affected tests at runtime)."""
         return {
             "kind": "pytest",
             "role": self.role,
+            "origin": self.origin,
+            "action": self.action,
+            "purpose": self.purpose,
+            "artifact_contract": self.artifact_contract,
             "subtasks": [s.type for s in self.subtasks],
         }
 

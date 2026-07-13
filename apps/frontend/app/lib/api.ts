@@ -139,6 +139,20 @@ export type Subtask = {
   status: string;
 };
 
+export type ArtifactExport = {
+  name: string;
+  kind: "function" | "class" | "variable";
+  signature?: string;
+  members?: string[];
+};
+
+export type ArtifactContract = {
+  exports?: ArtifactExport[];
+  capabilities?: string[];
+  consumers?: string[];
+  depends_on?: string[];
+};
+
 export type Task = {
   id: string;
   type: string;
@@ -147,7 +161,14 @@ export type Task = {
   status: "pending" | "running" | "done" | "skipped" | "failed";
   attempts: number;
   order_index: number;
-  verify_spec: { affected_tests?: string[]; subtasks?: string[] };
+  verify_spec: {
+    affected_tests?: string[];
+    subtasks?: string[];
+    action?: string;
+    origin?: string;
+    purpose?: string;
+    artifact_contract?: ArtifactContract;
+  };
   content_hash: string | null;
   error: string | null;
   diff: string | null;
@@ -157,6 +178,7 @@ export type Task = {
 
 export type RecoverySummary = {
   visits: number;
+  budget_used?: number;
   actions: {
     visit?: number;
     classification?: string;
@@ -196,12 +218,45 @@ export type VerifiedBatch = {
   summary?: TestSummary;
 };
 
+export type ArtifactPlanItem = ArtifactContract & {
+  path: string;
+  purpose: string;
+  exports: ArtifactExport[];
+  capabilities: string[];
+  consumers: string[];
+  depends_on: string[];
+  status?: string | null;
+};
+
+export type ArtifactPlanSummary = {
+  architect?: {
+    status: string;
+    attempts: number;
+    calls: number;
+    repairs: number;
+    model?: string | null;
+  } | null;
+  contract_completion?: Record<string, unknown>[];
+  created: ArtifactPlanItem[];
+  contract_attributed_recoveries?: number;
+};
+
+export type ExecutionCut = {
+  id: string;
+  paths: string[];
+  reason: string;
+  edge_kinds?: string[];
+  mode?: string;
+};
+
 export type Report = {
   job_id?: string;
   repo_url?: string;
   migration_recipe?: string;
+  evaluation_mode?: "full" | "plan_only" | "replay";
+  replay_source_job?: string | null;
   migrated: boolean;
-  migration_outcome?: "success" | "failed" | "unsupported" | "not_applicable";
+  migration_outcome?: "success" | "failed" | "unsupported" | "not_applicable" | "plan_accepted" | "plan_rejected";
   tasks_total: number;
   tasks_done: number;
   affected_tests: string[];
@@ -210,6 +265,12 @@ export type Report = {
   verified_batches?: VerifiedBatch[];
   llm_usage?: LlmUsage;
   recovery?: RecoverySummary;
+  artifact_plan?: ArtifactPlanSummary;
+  executable_cut_analysis?: {
+    edge_count: number;
+    cuts: ExecutionCut[];
+    diagnostics?: Record<string, unknown>[];
+  };
   verify_summary?: TestSummary;
   integrate_summary?: TestSummary;
   test_summary?: TestSummary;
@@ -293,10 +354,24 @@ export async function getJobReport(id: string): Promise<Report | null> {
   return r.json();
 }
 
-export async function listJobs(): Promise<Job[]> {
-  const r = await authedFetch(`${API_BASE}/jobs`);
+export type JobPage = {
+  items: Job[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listJobs(limit = 20, offset = 0): Promise<JobPage> {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  const r = await authedFetch(`${API_BASE}/jobs?${query}`);
   if (!r.ok) throw new Error(`listJobs ${r.status}`);
-  return r.json();
+  const items: Job[] = await r.json();
+  return {
+    items,
+    total: Number(r.headers.get("X-Total-Count") ?? items.length),
+    limit: Number(r.headers.get("X-Page-Limit") ?? limit),
+    offset: Number(r.headers.get("X-Page-Offset") ?? offset),
+  };
 }
 
 export async function createJob(input: {

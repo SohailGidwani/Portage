@@ -13,7 +13,7 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -49,6 +49,7 @@ app.add_middleware(
     allow_credentials=True,  # the /auth refresh cookie
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count", "X-Page-Limit", "X-Page-Offset"],
 )
 
 app.include_router(auth_router)
@@ -156,12 +157,26 @@ async def get_job(job_id: uuid.UUID, user: User = Depends(current_user)) -> Job:
 
 
 @app.get("/jobs", response_model=list[JobOut])
-async def list_jobs(limit: int = 50, user: User = Depends(current_user)) -> list[Job]:
+async def list_jobs(
+    response: Response,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(current_user),
+) -> list[Job]:
+    """Return one account-visible page while preserving the list response for CLI clients."""
     async with AsyncSessionLocal() as session:
-        q = select(Job).order_by(Job.created_at.desc()).limit(limit)
-        if not _is_admin(user):
-            q = q.where(Job.user_id == user.id)
+        visibility = None if _is_admin(user) else Job.user_id == user.id
+        count_q = select(func.count()).select_from(Job)
+        q = select(Job).order_by(Job.created_at.desc(), Job.id.desc())
+        if visibility is not None:
+            count_q = count_q.where(visibility)
+            q = q.where(visibility)
+        total = int((await session.execute(count_q)).scalar_one())
+        q = q.offset(offset).limit(limit)
         rows = (await session.execute(q)).scalars().all()
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page-Limit"] = str(limit)
+    response.headers["X-Page-Offset"] = str(offset)
     return list(rows)
 
 
@@ -173,7 +188,7 @@ async def eval_leaderboard(suites: str = "") -> dict:
     ``suites``: optional comma-separated filter; response lists distinct suites so the
     client can offer a selector."""
     wanted = [s.strip() for s in suites.split(",") if s.strip()]
-    where = "WHERE suite IN :suites" if wanted else ""
+    where = "WHERE suite IN :suites" if wanted else "WHERE suite NOT LIKE '%-replay-%'"
     sql = text(f"""
         SELECT corpus_name, scenario,
                count(*)                                    AS runs,
@@ -198,6 +213,7 @@ async def eval_leaderboard(suites: str = "") -> dict:
         suite_rows = (
             await session.execute(
                 text("SELECT suite, max(created_at) AS latest FROM runs "
+                     "WHERE suite NOT LIKE '%-replay-%' "
                      "GROUP BY suite ORDER BY latest DESC")
             )
         ).mappings().all()

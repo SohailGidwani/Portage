@@ -6,9 +6,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppShell } from "../../components/AppShell";
 import { ReviewGuide } from "../../components/ReviewGuide";
 import { CopyButton, DiffView, Metric, Progress, StatusPill, shortRepo } from "../../components/ui";
-import { AttemptEntry, Job, Report, Task, getJob, getJobReport, getJobTasks } from "../../lib/api";
+import { ArtifactPlanItem, AttemptEntry, Job, Report, Task, getJob, getJobReport, getJobTasks } from "../../lib/api";
 
-type Tab = "overview" | "files" | "diff" | "recovery";
+type Tab = "overview" | "plan" | "files" | "diff" | "recovery";
 
 const stages = ["ingest", "plan", "execute", "verify", "recover", "integrate", "report"];
 
@@ -98,6 +98,21 @@ export default function JobDetail() {
   const testRate = tests?.total ? tests.passed / tests.total : 0;
   const totalAdds = files.reduce((sum, file) => sum + file.additions, 0);
   const totalDels = files.reduce((sum, file) => sum + file.deletions, 0);
+  const taskArtifacts: ArtifactPlanItem[] = tasks.flatMap((task) => {
+    const contract = task.verify_spec.artifact_contract;
+    if (!task.target_path || task.verify_spec.action !== "create" || task.verify_spec.origin !== "recipe" || !contract) return [];
+    return [{
+      path: task.target_path,
+      purpose: task.verify_spec.purpose ?? task.title,
+      exports: contract.exports ?? [],
+      capabilities: contract.capabilities ?? [],
+      consumers: contract.consumers ?? [],
+      depends_on: contract.depends_on ?? [],
+      status: task.status,
+    }];
+  });
+  const artifacts = report?.artifact_plan?.created ?? taskArtifacts;
+  const cuts = report?.executable_cut_analysis?.cuts ?? [];
 
   function downloadDiff() {
     if (!report?.diff) return;
@@ -131,7 +146,7 @@ export default function JobDetail() {
       </ol>
 
       <nav className="tabs" aria-label="Run details">
-        {(["overview", "files", "diff", "recovery"] as Tab[]).map((value) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value}{value === "files" && fileTasks.length ? ` ${fileTasks.length}` : ""}</button>)}
+        {(["overview", "plan", "files", "diff", "recovery"] as Tab[]).map((value) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value}{value === "plan" && fileTasks.length ? ` ${fileTasks.length}` : value === "files" && fileTasks.length ? ` ${fileTasks.length}` : ""}</button>)}
       </nav>
 
       {tab === "overview" && <>
@@ -161,7 +176,51 @@ export default function JobDetail() {
         {report && <ReviewGuide jobId={id} compact />}
       </>}
 
-      {tab === "files" && <section className="surface">
+      {tab === "plan" && <>
+        <section className="metrics-grid run-metrics">
+          <Metric label="Architect" value={report?.artifact_plan?.architect ? report.artifact_plan.architect.status : artifacts.length ? "accepted" : "not needed"} detail={report?.artifact_plan?.architect ? `${report.artifact_plan.architect.calls} calls · ${report.artifact_plan.architect.repairs} repairs` : "Frozen recipe plan"} tone={report?.artifact_plan?.architect?.status === "skipped" ? "warn" : "good"} />
+          <Metric label="Created artifacts" value={artifacts.length} detail="Application-owned modules" />
+          <Metric label="Execution cuts" value={cuts.length || "—"} detail="Atomic verification boundaries" />
+          <Metric label="Contract completions" value={report?.artifact_plan?.contract_completion?.length ?? "—"} detail="Facts added mechanically" />
+          <Metric label="Contract recoveries" value={report?.artifact_plan?.contract_attributed_recoveries ?? "—"} detail="Uniquely attributed repairs" />
+        </section>
+        <section className="surface plan-surface">
+          <div className="section-heading"><div><span className="kicker">Execution plan</span><h2>Planned files and order</h2></div></div>
+          <div className="task-list">
+            {fileTasks.map((task) => <div className="task-row" key={task.id}><span className="file-icon">{task.order_index}</span><div><strong>{task.target_path}</strong><small>{task.type.replaceAll("_", " ")}{task.subtasks.length ? ` · ${task.subtasks.map((subtask) => subtask.title).join(", ")}` : ""}</small></div><StatusPill status={task.status} /></div>)}
+            {!fileTasks.length && <div className="empty-state">The migration plan has not produced file tasks yet.</div>}
+          </div>
+        </section>
+        <div className="run-grid">
+          <section className="surface plan-surface">
+            <div className="section-heading"><div><span className="kicker">Frozen target architecture</span><h2>Owned artifacts and contracts</h2></div></div>
+            <div className="file-cards">
+              {artifacts.map((artifact) => <article className="file-card plan-card" key={artifact.path}>
+                <header><div><strong>{artifact.path}</strong><small>{artifact.purpose}</small></div><StatusPill status={artifact.status ?? "pending"} /></header>
+                {artifact.capabilities.length > 0 && <div className="tag-list">{artifact.capabilities.map((capability) => <span key={capability}>{capability.replaceAll("_", " ")}</span>)}</div>}
+                <div className="plan-contract">
+                  <div><strong>Exports</strong><span>{artifact.exports.map((item) => `${item.name}${item.members?.length ? ` { ${item.members.join(", ")} }` : ""}`).join(", ") || "None"}</span></div>
+                  <div><strong>Consumers</strong><span>{artifact.consumers.join(", ") || "None"}</span></div>
+                  <div><strong>Depends on</strong><span>{artifact.depends_on.join(", ") || "None"}</span></div>
+                </div>
+              </article>)}
+              {!artifacts.length && <div className="empty-state">No new application artifacts were needed; this run uses in-place rewrites.</div>}
+            </div>
+          </section>
+          <section className="surface plan-surface">
+            <div className="section-heading"><div><span className="kicker">Execution topology</span><h2>Verification cuts</h2></div></div>
+            <div className="file-cards">
+              {cuts.map((cut) => <article className="file-card plan-card" key={cut.id}>
+                <header><div><strong>{cut.id}</strong><small>{cut.reason}</small></div>{cut.mode && <StatusPill status={cut.mode} />}</header>
+                <div className="tag-list">{cut.paths.map((path) => <span key={path}>{path}</span>)}</div>
+              </article>)}
+              {!cuts.length && <div className="empty-state">Execution cuts appear when the final report is available.</div>}
+            </div>
+          </section>
+        </div>
+      </>}
+
+      {tab === "files" && <section className="surface plan-surface">
         <div className="section-heading"><div><span className="kicker">Execution plan</span><h2>Files and attempts</h2></div></div>
         <div className="file-cards">{fileTasks.map((task) => <article className="file-card" key={task.id}><header><div><strong>{task.target_path}</strong><small>{task.type.replaceAll("_", " ")}</small></div><StatusPill status={task.status} /></header>{task.subtasks.length > 0 && <div className="tag-list">{task.subtasks.map((subtask) => <span key={subtask.id}>{subtask.type.replaceAll("_", " ")}</span>)}</div>}{task.error && <div className="notice error">{task.error}</div>}{task.attempts_log.length > 0 && <ol className="timeline">{task.attempts_log.map((entry, index) => <Attempt entry={entry} key={index} />)}</ol>}</article>)}</div>
       </section>}

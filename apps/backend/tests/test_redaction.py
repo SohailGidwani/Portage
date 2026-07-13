@@ -1,5 +1,6 @@
 """Secret-redaction unit tests (Phase 7). Pure functions — no DB, no Docker."""
 
+from portage_agent.agent.nodes.common import non_python_context, non_python_sources
 from portage_agent.agent.nodes.redaction import is_denied_path, scrub
 
 
@@ -55,3 +56,19 @@ def test_scrub_leaves_normal_code_alone():
         "    return {'id': 1, 'name': name}\n"
     )
     assert scrub(code) == code
+
+
+def test_non_python_context_surveys_semantic_text_and_omits_secrets(tmp_path):
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "page.html").write_text("{{ request.form['name'] }}")
+    (tmp_path / "data.sql").write_text("INSERT INTO user VALUES ('hash');")
+    (tmp_path / ".env").write_text("PASSWORD=should-never-enter-prompts")
+    (tmp_path / "logo.png").write_bytes(b"not text context")
+
+    context = non_python_context(str(tmp_path))
+
+    assert "request.form" in context
+    assert "INSERT INTO user" in context
+    assert "should-never-enter-prompts" not in context
+    assert "logo.png" not in context
+    assert non_python_sources(str(tmp_path))["logo.png"] == ""

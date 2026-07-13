@@ -123,6 +123,8 @@ def test_flaskr_auth_seam_pin_rules_are_disjoint(tmp_path):
     db_note = m["auth.py::get_db"]["target_note"]
     assert "session" in login_note
     assert "yield dependency" in db_note
+    assert m["auth.py::login_required"]["preserve_shape"] is True
+    assert m["auth.py::login_required"]["shape"]["returns_nested_function"] is True
 
 
 def test_request_context_only_pins_resource_functions(tmp_path):

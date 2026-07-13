@@ -11,16 +11,23 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
+from fastapi import Response
+from sqlalchemy import delete
 
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 
+from portage_agent.api.app import list_jobs  # noqa: E402
 from portage_agent.auth import service  # noqa: E402
 from portage_agent.auth.tokens import (  # noqa: E402
     mint_access_token,
     verify_access_token,
 )
+from portage_agent.db.models import Job  # noqa: E402
+from portage_agent.db.session import AsyncSessionLocal  # noqa: E402
 
 
 @pytest.fixture
@@ -73,7 +80,7 @@ async def test_families_are_independent(user):
     assert await service.rotate_refresh(a) is not None
     await service.revoke_refresh(b)
     # killing B must not affect A's chain
-    rotated = await service.rotate_refresh((await service.issue_refresh(user.id)))
+    rotated = await service.rotate_refresh(await service.issue_refresh(user.id))
     assert rotated is not None
 
 
@@ -87,3 +94,52 @@ async def test_api_key_lifecycle(user):
     key_id = next(k.id for k in keys if k.name == "ci")
     assert await service.revoke_api_key(user.id, key_id)
     assert await service.verify_api_key(plain) is None
+
+
+async def test_job_history_is_paginated_with_an_ownership_scoped_total(user):
+    other = await service.upsert_github_user(
+        github_id=-int(uuid.uuid4().int % 1_000_000_000) - 2,
+        login=f"other-{uuid.uuid4().hex[:8]}",
+        avatar_url=None,
+    )
+    # Future timestamps make these deterministic page leaders without depending on the
+    # pre-existing development database history.
+    base = datetime.now(UTC) + timedelta(days=3650)
+    owned_old = Job(
+        repo_url="pagination-owned-old", migration_recipe="flask_to_fastapi",
+        status="done", config={}, user_id=user.id, created_at=base,
+    )
+    owned_new = Job(
+        repo_url="pagination-owned-new", migration_recipe="flask_to_fastapi",
+        status="done", config={}, user_id=user.id, created_at=base + timedelta(seconds=1),
+    )
+    other_job = Job(
+        repo_url="pagination-other", migration_recipe="flask_to_fastapi",
+        status="done", config={}, user_id=other.id, created_at=base + timedelta(seconds=2),
+    )
+    async with AsyncSessionLocal() as session, session.begin():
+        session.add_all([owned_old, owned_new, other_job])
+    ids = [owned_old.id, owned_new.id, other_job.id]
+
+    try:
+        response = Response()
+        first = await list_jobs(response, limit=1, offset=0, user=user)
+        assert response.headers["X-Total-Count"] == "2"
+        assert response.headers["X-Page-Limit"] == "1"
+        assert response.headers["X-Page-Offset"] == "0"
+        assert [job.id for job in first] == [owned_new.id]
+
+        response = Response()
+        second = await list_jobs(response, limit=1, offset=1, user=user)
+        assert [job.id for job in second] == [owned_old.id]
+
+        response = Response()
+        admin_page = await list_jobs(
+            response, limit=3, offset=0,
+            user=SimpleNamespace(id=uuid.uuid4(), role="admin"),
+        )
+        assert int(response.headers["X-Total-Count"]) >= 3
+        assert {job.id for job in admin_page} == set(ids)
+    finally:
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(delete(Job).where(Job.id.in_(ids)))

@@ -61,7 +61,12 @@ report = get(f"/jobs/{job_id}/report")
 ts = job.get("test_summary") or {}
 rec = report.get("recovery") or {}
 file_tasks = [t for t in tasks if t.get("target_path")]
-first = min(file_tasks, key=lambda t: t["order_index"]) if file_tasks else None
+recipe_tasks = [
+    t for t in file_tasks
+    if t.get("type") != "test_compat"
+    and (t.get("verify_spec") or {}).get("origin", "recipe") == "recipe"
+]
+first = min(recipe_tasks, key=lambda t: t["order_index"]) if recipe_tasks else None
 
 print(f"  tests={ts.get('passed')}/{ts.get('total')}  tasks={report.get('tasks_done')}/{report.get('tasks_total')}"
       f"  recover_visits={rec.get('visits')}  escalation={rec.get('escalation_rescued')}/{rec.get('escalation_attempted')}")
@@ -73,29 +78,53 @@ assert report.get("tasks_done") == report.get("tasks_total") and report.get("tas
 assert rec.get("visits", 0) >= 1, "Recover never ran — the fault did not exercise recovery"
 
 classifications = {a.get("classification") for a in rec.get("actions", [])}
-others = [t for t in file_tasks if first and t["id"] != first["id"]]
+rollback_targets = {
+    path
+    for action in rec.get("actions", [])
+    if action.get("action") == "rollback_regenerate"
+    for path in action.get("targets", [])
+}
+
+def assert_only_attributed_batch_retried(expected_attempts):
+    assert first and first["target_path"] in rollback_targets, \
+        f"faulted recipe task absent from rollback attribution: {rollback_targets}"
+    for task in file_tasks:
+        expected = expected_attempts if task["target_path"] in rollback_targets else 1
+        assert task["attempts"] == expected, \
+            f"unexpected attempts for {task['target_path']}: {task['attempts']} != {expected}; " \
+            f"attributed batch={sorted(rollback_targets)}"
 
 if fault == "bad_patch":
-    assert "crash" in classifications, f"crash not classified: {classifications}"
+    assert any((item or "").startswith("crash") for item in classifications), \
+        f"crash not classified: {classifications}"
     assert first and first["attempts"] == 2, f"expected 2 attempts on first task, got {first and first['attempts']}"
-    assert all(t["attempts"] == 1 for t in others), \
-        f"targeted rollback should not retry healthy files: {[(t['target_path'], t['attempts']) for t in others]}"
+    assert_only_attributed_batch_retried(2)
     actions = [a.get("action") for a in first["attempts_log"]]
     assert "rollback_regenerate" in actions, f"no rollback_regenerate in attempts_log: {actions}"
     tiers = {a.get("tier") for a in first["attempts_log"] if a.get("action") == "migrate"}
     assert tiers == {"driver"}, f"bad_patch should be rescued at driver tier, saw {tiers}"
 elif fault == "bad_patch_until_escalation":
-    assert "crash" in classifications, f"crash not classified: {classifications}"
-    assert rec.get("escalation_attempted") == 1 and rec.get("escalation_rescued") == 1, \
-        f"expected exactly the faulted task escalated+rescued, got {rec.get('escalation_rescued')}/{rec.get('escalation_attempted')}"
+    assert any((item or "").startswith("crash") for item in classifications), \
+        f"crash not classified: {classifications}"
+    expected_escalations = len(rollback_targets)
+    assert rec.get("escalation_attempted") == expected_escalations \
+        and rec.get("escalation_rescued") == expected_escalations, \
+        f"expected the attributed batch escalated+rescued, got " \
+        f"{rec.get('escalation_rescued')}/{rec.get('escalation_attempted')} " \
+        f"for {sorted(rollback_targets)}"
     assert first and first["attempts"] == 3, f"expected 3 attempts, got {first and first['attempts']}"
-    assert all(t["attempts"] == 1 for t in others), \
-        f"targeted rollback should not retry healthy files: {[(t['target_path'], t['attempts']) for t in others]}"
+    assert_only_attributed_batch_retried(3)
     last_migrate = [a for a in first["attempts_log"] if a.get("action") == "migrate"][-1]
     assert last_migrate.get("tier") == "escalation", f"final attempt not escalation-tier: {last_migrate}"
 elif fault == "drop_task":
     assert "unplanned_residue" in classifications, f"no replan classification: {classifications}"
-    assert report.get("tasks_total") == 3, f"replan should restore 3 tasks, got {report.get('tasks_total')}"
+    adapters = [t for t in file_tasks if t.get("type") == "test_compat"]
+    assert adapters, "deterministic compatibility infrastructure was not preserved"
+    replans = [a for a in rec.get("actions", []) if a.get("action") == "replan"]
+    assert replans and all(
+        target != adapters[0]["target_path"]
+        for action in replans for target in action.get("targets", [])
+    ), f"replan targeted infrastructure instead of a recipe file: {replans}"
 
 print(f"  scenario '{fault}' assertions passed")
 PY
