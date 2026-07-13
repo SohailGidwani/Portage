@@ -38,3 +38,28 @@ def test_defines_side_lists_required_companion_exports():
     }
     frag = contract_sections(manifest, "db.py")
     assert "REQUIRED ADDITIONAL EXPORTS: get_db_dep" in frag
+
+
+def test_planned_class_contract_renders_members_and_consumer_wiring():
+    manifest = {
+        "pkg/testing.py::AppFacade": {
+            "module": "pkg/testing.py", "symbol": "AppFacade", "kind": "class",
+            "target_kind": "class", "original": "planned target artifact",
+            "target_note": "own the target app surface", "notes": "",
+            "call_sites": [], "members": ["testing", "test_client"],
+            "provenance": "planned_create", "depends_on": [],
+            "capabilities": ["direct_test_surface"],
+            "factory_consumers": ["pkg/app.py"],
+            "consumers": [{"module": "pkg/app.py"}],
+        },
+    }
+
+    provider = contract_sections(manifest, "pkg/testing.py")
+    consumer = contract_sections(
+        manifest, "pkg/app.py", consumed={"pkg/testing.py::AppFacade"},
+    )
+
+    assert "REQUIRED CLASS MEMBERS: testing, test_client" in provider
+    assert "including inside a function body" in provider
+    assert "PLANNED CLASS WIRING" in consumer
+    assert "construct it in this consumer" in consumer

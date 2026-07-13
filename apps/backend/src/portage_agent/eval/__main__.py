@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import uuid
 
 from portage_agent.logging_conf import setup_logging
 
@@ -21,6 +22,7 @@ from .harness import (
     HarnessConfig,
     default_suite_name,
     format_metrics_table,
+    load_replay_plan,
     run_suite,
 )
 
@@ -37,6 +39,14 @@ def _parse_args() -> argparse.Namespace:
                    help="comma-separated corpus names to include (default: all)")
     p.add_argument("--suite", default="", help="suite label (default: timestamped)")
     p.add_argument("--timeout", type=int, default=900, help="per-job timeout, seconds")
+    p.add_argument(
+        "--plan-only", action="store_true",
+        help="stop real jobs after Plan and measure architect acceptance",
+    )
+    p.add_argument(
+        "--replay-plan-job", default="",
+        help="diagnostic: reuse the accepted artifact plan from this job UUID",
+    )
     return p.parse_args()
 
 
@@ -52,11 +62,32 @@ async def main() -> None:
             raise SystemExit(f"unknown corpus repos: {sorted(missing)}")
         repos = [r for r in repos if r.name in wanted]
 
+    replay_source = None
+    replay_plan = None
+    if args.replay_plan_job:
+        if args.plan_only:
+            raise SystemExit("--replay-plan-job cannot be combined with --plan-only")
+        if len(repos) != 1:
+            raise SystemExit("--replay-plan-job requires exactly one selected corpus repo")
+        try:
+            replay_source = uuid.UUID(args.replay_plan_job)
+            replay_plan = await load_replay_plan(replay_source)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    suite = args.suite or (
+        default_suite_name().replace("eval-", "eval-replay-", 1)
+        if replay_plan is not None else default_suite_name()
+    )
+
     cfg = HarnessConfig(
-        suite=args.suite or default_suite_name(),
+        suite=suite,
         k=args.k,
         scenarios=[s.strip() for s in args.scenarios.split(",") if s.strip()],
         job_timeout_seconds=args.timeout,
+        plan_only=args.plan_only,
+        replay_plan=replay_plan,
+        replay_source_job=replay_source,
     )
     metrics = await run_suite(repos, cfg)
     print(f"\nsuite: {cfg.suite}\n")

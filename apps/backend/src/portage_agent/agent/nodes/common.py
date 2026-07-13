@@ -7,8 +7,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +19,10 @@ from portage_agent.config import settings
 log = logging.getLogger("portage.agent")
 
 # Dirs we never treat as project source (graph artifacts, vcs, caches, the worktree itself).
-_SKIP_DIRS = {".git", ".code-review-graph", "__pycache__", ".pytest_cache", ".portage-worktree"}
+_SKIP_DIRS = {
+    ".git", ".code-review-graph", "__pycache__", ".pytest_cache",
+    ".portage-worktree", ".portage-cut-checkpoint",
+}
 
 _FENCE = re.compile(r"```(?:[\w+-]*)\n(.*?)```", re.DOTALL)
 
@@ -70,6 +75,58 @@ def non_python_listing(root: str, *, limit: int = 80) -> str:
     return "\n".join(out)
 
 
+def non_python_context(
+    root: str, *, limit: int = 24000,
+    suffixes: frozenset[str] = frozenset({
+        ".html", ".jinja", ".jinja2", ".sql", ".toml", ".yaml", ".yml",
+    }),
+) -> str:
+    """Bounded, redacted repository data that changes migration semantics.
+
+    Paths alone cannot reveal Jinja globals, fixture data formats, or warning policy.
+    Keep the survey deliberately small and deterministic; binary/static assets remain a
+    listing only.
+    """
+    return "\n\n".join(
+        f"--- {path} ---\n{body}"
+        for path, body in non_python_sources(
+            root, content_limit=limit, suffixes=suffixes,
+        ).items()
+        if body
+    )
+
+
+def non_python_sources(
+    root: str, *, content_limit: int = 24000, path_limit: int = 500,
+    suffixes: frozenset[str] = frozenset({
+        ".html", ".jinja", ".jinja2", ".sql", ".toml", ".yaml", ".yml",
+    }),
+) -> dict[str, str]:
+    """Bounded non-Python path inventory with text only for semantic file types."""
+    from .redaction import is_denied_path, scrub
+
+    base = Path(root)
+    out: dict[str, str] = {}
+    remaining = content_limit
+    for path in sorted(base.rglob("*")):
+        if len(out) >= path_limit:
+            break
+        if not path.is_file() or path.suffix == ".py":
+            continue
+        rel = path.relative_to(base)
+        if any(part in _SKIP_DIRS for part in rel.parts) or is_denied_path(str(rel)):
+            continue
+        body = ""
+        if remaining > 0 and path.suffix.lower() in suffixes:
+            try:
+                body = scrub(path.read_text())[:remaining]
+            except (OSError, UnicodeDecodeError):
+                pass
+            remaining -= len(body)
+        out[str(rel)] = body
+    return out
+
+
 def read_file(root: str, rel: str, *, limit: int = 8000) -> str | None:
     p = Path(root) / rel
     if not p.exists():
@@ -87,6 +144,61 @@ def write_file(root: str, rel: str, content: str) -> str:
 
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def load_cut_checkpoint(worktree: str) -> dict:
+    manifest = Path(worktree, ".portage-cut-checkpoint", "manifest.json")
+    try:
+        value = json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def create_cut_checkpoint(
+    worktree: str, paths: list[str], baseline: dict[str, dict],
+) -> dict:
+    """Snapshot a cut before generation; the on-disk copy survives worker resumes."""
+    existing = load_cut_checkpoint(worktree)
+    if existing and set(paths) <= set(existing.get("paths", [])):
+        return existing
+
+    root = Path(worktree, ".portage-cut-checkpoint")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir()
+    files: dict[str, dict] = {}
+    for path in paths:
+        source = Path(worktree, path)
+        record = {**baseline[path], "existed": source.exists()}
+        if source.exists():
+            snapshot = hashlib.sha256(path.encode()).hexdigest() + ".snapshot"
+            Path(root, snapshot).write_bytes(source.read_bytes())
+            record["snapshot"] = snapshot
+        files[path] = record
+    checkpoint = {"root": str(root), "paths": list(paths), "files": files}
+    Path(root, "manifest.json").write_text(json.dumps(checkpoint))
+    return checkpoint
+
+
+def restore_cut_checkpoint(worktree: str, checkpoint: dict) -> list[str]:
+    """Restore the pre-cut files and remove the snapshot. Git index cleanup stays async."""
+    root = Path(checkpoint.get("root") or Path(worktree, ".portage-cut-checkpoint"))
+    restored: list[str] = []
+    for path, record in checkpoint.get("files", {}).items():
+        target = Path(worktree, path)
+        if record.get("existed"):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(Path(root, record["snapshot"]).read_bytes())
+        elif target.exists():
+            target.unlink()
+        restored.append(path)
+    shutil.rmtree(root, ignore_errors=True)
+    return restored
+
+
+def discard_cut_checkpoint(checkpoint: dict) -> None:
+    if root := checkpoint.get("root"):
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def extract_code(text: str) -> str:
@@ -193,12 +305,17 @@ def _package_reexports_symbol(
     return False
 
 
-def imported_bindings(root: str, target: str) -> list[ModuleBinding]:
-    """Every binding of `target` across the repo's other .py files. AST-based,
-    best-effort (unparseable importers skipped; `import *` ignored)."""
+def imported_bindings_from_sources(
+    sources: dict[str, str], target: str,
+) -> list[ModuleBinding]:
+    """Every binding of ``target`` in an in-memory source map.
+
+    Keeping this pure lets Plan-time graph analyzers query the exact frozen source set
+    without creating fixture directories or re-reading a workspace. Unparseable importers
+    are skipped and star imports are deliberately ignored.
+    """
     wanted = _module_names(target)
     out: list[ModuleBinding] = []
-    sources = iter_py_files(root)
     for rel, src in sources.items():
         if rel == target:
             continue
@@ -241,6 +358,11 @@ def imported_bindings(root: str, target: str) -> list[ModuleBinding]:
                         # resolves the real symbol instead of the submodule tail.
                         out.append(ModuleBinding(rel, None, a.asname or a.name))
     return out
+
+
+def imported_bindings(root: str, target: str) -> list[ModuleBinding]:
+    """Filesystem wrapper around :func:`imported_bindings_from_sources`."""
+    return imported_bindings_from_sources(iter_py_files(root), target)
 
 
 def binding_call_sites(src: str, b: ModuleBinding, *, limit: int = 3) -> list[str]:
@@ -316,6 +438,39 @@ def _has_own_yield(node: ast.AST) -> bool:
     return False
 
 
+def _returns_nested_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether this callable returns a function defined in its own local scope.
+
+    This is the smallest structural fact that distinguishes decorator factories from
+    ordinary request handlers.  Like ``_has_own_yield``, it deliberately refuses to
+    descend through a nested callable's scope.
+    """
+    nested_names = {
+        child.name
+        for child in node.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if not nested_names:
+        return False
+
+    def _has_return(stmts: list[ast.stmt]) -> bool:
+        for stmt in stmts:
+            if (
+                isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Name)
+                and stmt.value.id in nested_names
+            ):
+                return True
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, ast.stmt) and _has_return([child]):
+                    return True
+        return False
+
+    return _has_return(node.body)
+
+
 def _shape_facts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
     a = node.args
     positional = [*a.posonlyargs, *a.args]
@@ -334,6 +489,7 @@ def _shape_facts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
         "accepts_varkw": a.kwarg is not None,
         "is_async": isinstance(node, ast.AsyncFunctionDef),
         "is_generator": _has_own_yield(node),
+        "returns_nested_function": _returns_nested_function(node),
     }
 
 
@@ -426,6 +582,62 @@ def _planned_imports(files: dict[str, str], planned_paths: list[str]) -> dict[st
     return deps
 
 
+def planned_artifact_topology_violations(
+    content: str, manifest: dict[str, dict], path: str,
+) -> list[str]:
+    """Reject edges from a planned provider back to its consumers."""
+    pins = [
+        pin for pin in manifest.values()
+        if pin.get("module") == path and pin.get("provenance") == "planned_create"
+    ]
+    consumers = {
+        consumer["module"]
+        for pin in pins for consumer in pin.get("consumers", [])
+    }
+    if not consumers:
+        return []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    imports: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, ast.If) and (
+            isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+            or isinstance(node.test, ast.Attribute) and node.test.attr == "TYPE_CHECKING"
+        ):
+            for child in node.orelse:
+                visit(child)
+            return
+        if isinstance(node, ast.Import):
+            imports.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_module(node.module, node.level, path)
+            if node.module is not None and base:
+                imports.append((node.lineno, base))
+            imports.extend(
+                (node.lineno, f"{base}.{alias.name}".lstrip("."))
+                for alias in node.names
+            )
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    out = []
+    for consumer in sorted(consumers):
+        names = _module_names(consumer)
+        line = next((line for line, module in imports if module in names), None)
+        if line is not None:
+            out.append(
+                f"{path}:{line}: provider-first topology forbids importing declared "
+                f"consumer {consumer}; keep shared state in the provider or a declared "
+                "lower-level dependency"
+            )
+    return out
+
+
 def _tarjan_sccs(deps: dict[str, set[str]]) -> list[list[str]]:
     """Tarjan's SCCs, iterative. Returned in REVERSE topological order of the
     condensation (dependencies' SCCs appear before dependents' — Tarjan's property)."""
@@ -489,6 +701,19 @@ def dependency_order(files: dict[str, str], planned: list) -> list:
     by_path = {pf.path: pf for pf in planned}
     ordered_paths = [pf.path for pf in planned]  # NEVER a set — determinism
     deps = _planned_imports(files, ordered_paths)
+    # Original source cannot import a file that does not exist yet. Created artifacts
+    # therefore contribute explicit frozen dependency edges: their dependencies run first,
+    # and the artifact itself runs before every declared consumer.
+    for pf in planned:
+        if getattr(pf, "action", "rewrite") != "create":
+            continue
+        contract = getattr(pf, "artifact_contract", {}) or {}
+        deps[pf.path].update(
+            path for path in contract.get("depends_on", []) if path in deps
+        )
+        for consumer in contract.get("consumers", []):
+            if consumer in deps:
+                deps[consumer].add(pf.path)
     sccs = _tarjan_sccs(deps)
 
     scc_of = {p: i for i, scc in enumerate(sccs) for p in scc}
@@ -613,8 +838,47 @@ def build_manifest(root: str, planned: list, rules: list) -> dict[str, dict]:
     claiming the same symbol is a recipe bug and fails Plan loudly (never silently
     first-match). Plain JSON-safe dicts: this artifact lives in checkpointed state."""
     manifest: dict[str, dict] = {}
+    roles = {item.path: item.role for item in planned}
     sources = iter_py_files(root)
     for pf in planned:
+        if getattr(pf, "action", "rewrite") == "create":
+            contract = getattr(pf, "artifact_contract", {}) or {}
+            for export in contract.get("exports", []):
+                key = f"{pf.path}::{export['name']}"
+                if key in manifest:
+                    raise ValueError(f"duplicate planned artifact export: {key}")
+                manifest[key] = {
+                    "module": pf.path,
+                    "symbol": export["name"],
+                    "kind": export["kind"],
+                    "original": "planned target artifact",
+                    "target_note": (
+                        export.get("signature") or getattr(pf, "purpose", "")
+                        or "implement the frozen planned export"
+                    ),
+                    "notes": getattr(pf, "purpose", ""),
+                    "call_sites": [],
+                    "consumers": [
+                        {"module": path, "local": export["name"], "binding": "planned"}
+                        for path in contract.get("consumers", [])
+                    ],
+                    "shape": {},
+                    "preserve_shape": False,
+                    "target_kind": export["kind"],
+                    "additional_exports": [],
+                    "members": list(export.get("members", [])),
+                    "member_shapes": _planned_member_shapes(
+                        sources, export.get("members", []),
+                    ),
+                    "capabilities": list(contract.get("capabilities", [])),
+                    "factory_consumers": [
+                        path for path in contract.get("consumers", [])
+                        if roles.get(path) == "app_factory"
+                    ],
+                    "depends_on": list(contract.get("depends_on", [])),
+                    "provenance": "planned_create",
+                }
+            continue
         subtask_types = {s.type for s in pf.subtasks}
         for c in interface_contract(root, pf.path):
             matches = [r for r in rules
@@ -661,3 +925,39 @@ def build_manifest(root: str, planned: list, rules: list) -> dict[str, dict]:
                 ],
             }
     return manifest
+
+
+def _planned_member_shapes(
+    sources: dict[str, str], members: list[str],
+) -> dict[str, str]:
+    """Infer planned class-member shape from existing consumer expressions."""
+    wanted = set(members)
+    shapes: dict[str, str] = {}
+    if not wanted:
+        return shapes
+    for source in sources.values():
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or node.attr not in wanted:
+                continue
+            parent = parents.get(node)
+            # ponytail: direct member calls are enough for current evidence; add local
+            # alias-flow tracking only when a measured consumer calls through an alias.
+            called = isinstance(parent, ast.Call) and parent.func is node
+            call_parent = parents.get(parent) if called else None
+            shape = (
+                "context_manager"
+                if called and isinstance(call_parent, ast.withitem)
+                and call_parent.context_expr is parent
+                else "method" if called else "attribute"
+            )
+            rank = {"attribute": 0, "method": 1, "context_manager": 2}
+            if rank[shape] >= rank.get(shapes.get(node.attr, "attribute"), 0):
+                shapes[node.attr] = shape
+    return dict(sorted(shapes.items()))

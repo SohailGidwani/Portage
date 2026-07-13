@@ -50,8 +50,8 @@ async def materialize_repo(
     if _is_git_url(repo_url):
         if ws.exists():
             await asyncio.to_thread(shutil.rmtree, ws)
-        # `subdir`: the app lives in a subdirectory of a larger repo (e.g. pallets/flask's
-        # examples/tutorial). Clone aside, lift the subdir out as the workspace root, and
+        # `subdir`: the app lives in a subdirectory of a larger repository. Clone aside,
+        # lift the subdir out as the workspace root, and
         # snapshot it as a fresh git repo — same shape as the local-path flow, so the
         # worktree/rollback machinery sees a normal repo either way.
         target = f"{workspace}.clone-tmp" if subdir else workspace

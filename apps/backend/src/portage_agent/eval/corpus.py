@@ -18,8 +18,8 @@ class CorpusRepo:
     repo_url: str  # local path (bundled) or git URL (curated, with ref pinned)
     recipe: str
     ref: str = ""  # git SHA/tag for remote repos; empty for bundled fixtures
-    # The app lives in this subdirectory of the repo (e.g. pallets/flask examples/tutorial);
-    # Ingest lifts it out as the workspace root.
+    # The app may live in a repository subdirectory; Ingest lifts it out as the
+    # workspace root.
     subdir: str = ""
     # The sanctioned test paths (pytest targets). Empty = the whole repo suite. Set it for
     # repos whose tree carries tests that can't run offline (Selenium, load tests).

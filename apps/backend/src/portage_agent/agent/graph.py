@@ -31,6 +31,10 @@ from .state import GraphState
 log = logging.getLogger("portage.agent")
 
 
+def _after_plan(state: GraphState) -> str:
+    return "report" if (state.get("config") or {}).get("plan_only") else "execute"
+
+
 def _after_verify(state: GraphState) -> str:
     if state.get("verify_passed"):
         if state.get("migrate") and state.get("has_pending_tasks"):
@@ -65,7 +69,9 @@ def build_graph(checkpointer):
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "plan")
-    builder.add_edge("plan", "execute")
+    builder.add_conditional_edges(
+        "plan", _after_plan, {"execute": "execute", "report": "report"},
+    )
     builder.add_edge("execute", "verify")
     builder.add_conditional_edges(
         "verify", _after_verify,
@@ -73,7 +79,10 @@ def build_graph(checkpointer):
     )
     builder.add_conditional_edges(
         "recover", _after_recover,
-        {"execute": "execute", "plan": "plan", "integrate": "integrate"},
+        {
+            "execute": "execute", "plan": "plan", "verify": "verify",
+            "integrate": "integrate",
+        },
     )
     builder.add_conditional_edges(
         "integrate", _after_integrate, {"recover": "recover", "report": "report"},

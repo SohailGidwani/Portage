@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from portage_agent.agent.nodes.execute import (
     expand_to_verifiable_batch,
+    is_initial_cluster,
+    runtime_contract_repair_attempt,
     select_execution_batch,
 )
 
@@ -14,7 +16,7 @@ def _task(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         target_path=path, order_index=order, status=status, type=role,
-        verify_spec={"affected_tests": tests or []},
+        verify_spec={"affected_tests": tests or []}, attempts=3, attempts_log=[],
     )
 
 
@@ -52,3 +54,72 @@ def test_deterministic_adapter_remains_its_own_foundation_batch():
         _task("app.py", 10, tests=["test_app.py"]),
     ]
     assert expand_to_verifiable_batch(tasks, [], ["compat.py"]) == ["compat.py"]
+
+
+def test_executable_cut_schedules_provider_and_incompatible_consumer_together():
+    tasks = [
+        _task("views.py", 10),
+        _task("app.py", 20, tests=["test_app.py"]),
+        _task("other.py", 30, tests=["test_other.py"]),
+    ]
+    cuts = [{
+        "id": "executable-cut-1",
+        "paths": ["views.py", "app.py"],
+        "mode": "coordinated",
+    }]
+
+    assert select_execution_batch(tasks, cuts) == ["views.py", "app.py"]
+    assert expand_to_verifiable_batch(tasks, cuts, ["views.py", "app.py"]) == [
+        "views.py", "app.py",
+    ]
+
+
+def test_targeted_consumer_repair_retains_its_full_cut_verification_boundary():
+    tasks = [
+        _task("compat.py", 10, "done"),
+        _task("errors.py", 20, "done"),
+        _task("app.py", 30, tests=["tests/test_app.py"]),
+    ]
+    cuts = [{
+        "id": "executable-cut-1",
+        "paths": ["compat.py", "errors.py", "app.py"],
+        "mode": "coordinated",
+    }]
+
+    selected = select_execution_batch(tasks, cuts)
+    assert selected == ["compat.py", "errors.py", "app.py"]
+    assert expand_to_verifiable_batch(tasks, cuts, selected) == selected
+    assert [task.target_path for task in tasks if task.status == "pending"] == ["app.py"]
+
+
+def test_runtime_contract_repair_ordinal_does_not_reuse_task_attempts():
+    task = _task("app.py", 10)
+    task.attempts_log = [
+        {"action": "migrate"},
+        {"action": "contract_repair", "scope": "runtime_targeted"},
+    ]
+
+    assert runtime_contract_repair_attempt(task, "app.py") == 2
+    assert runtime_contract_repair_attempt(task, "other.py") is None
+    assert task.attempts == 3
+
+
+def test_large_executable_cut_is_one_verification_batch():
+    tasks = [_task(f"view{i}.py", i * 10) for i in range(5)]
+    tasks.append(_task("app.py", 50, tests=["test_app.py"]))
+    paths = [task.target_path for task in tasks]
+    cuts = [{"id": "large", "paths": paths, "mode": "batch_only"}]
+
+    assert select_execution_batch(tasks, cuts) == paths
+    assert expand_to_verifiable_batch(tasks, cuts, paths) == paths
+
+
+def test_only_untouched_cut_uses_coordinated_generation():
+    tasks = [_task("db.py", 10), _task("app.py", 20)]
+    by_path = {task.target_path: task for task in tasks}
+    for task in tasks:
+        task.attempts = 0
+
+    assert is_initial_cluster(["db.py", "app.py"], by_path)
+    tasks[0].attempts = 1
+    assert not is_initial_cluster(["db.py", "app.py"], by_path)

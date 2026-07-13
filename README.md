@@ -13,7 +13,7 @@ honest patch and evidence trail.
 [![Postgres 16](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](docker-compose.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-52D69A.svg)](LICENSE)
 
-**Platform phases 0–7 complete · Recipe Excellence active · Deployment intentionally parked**
+**Platform phases 0–7 complete · Artifact-contract recipe phase active · Deployment intentionally parked**
 
 [Quickstart](#quickstart) · [How it works](#how-it-works) · [Results](#measured-results) ·
 [CLI](#cli) · [MCP](#mcp-for-coding-agents) · [Roadmap](#roadmap)
@@ -50,7 +50,7 @@ is recipe-specific by design.
 | Property | What Portage does |
 |---|---|
 | Durable execution | Checkpoints every graph node to Postgres and reclaims expired worker leases after a crash. |
-| Structural planning | Builds a code graph, extracts import/call bindings, orders dependencies and SCCs, and freezes target interfaces before generation. |
+| Structural planning | Builds a code graph, extracts bindings and capabilities, plans owned target artifacts—including new modules—and freezes their contracts before generation. |
 | Incremental proof | Executes coupled migration batches and runs blast-radius tests before proceeding to the next cut. |
 | Honest recovery | Regenerates or rolls back implicated work under fixed budgets; repeated failure fingerprints stop no-progress loops. |
 | Protected oracle | Freezes test names, assertions, fixtures, parametrization, lifecycle, and skip state; mechanically rejects weakened tests. |
@@ -91,11 +91,12 @@ One autonomous run follows this path:
 
 1. **Ingest** clones a local or Git repository, optionally at a pinned SHA, then builds a
    structural graph with `code-review-graph`.
-2. **Plan** detects the recipe, freezes an interface manifest and test-oracle manifest,
-   classifies framework seams, builds dependency-complete units, and orders the task DAG.
-3. **Execute** generates changes in a Git worktree. Deterministic adapters are preferred
-   for known test seams; LLM output must pass interface, capability, and oracle checks
-   before it is written.
+2. **Plan** detects the recipe, surveys repository topology, freezes interface, artifact,
+   and test-oracle manifests, compiles source-derived capability contracts, builds
+   dependency-complete executable cuts, and orders the task DAG.
+3. **Execute** creates planned support modules and rewrites existing files in a Git
+   worktree. Deterministic adapters are preferred for known seams; LLM output must pass
+   interface, capability, ownership, topology, and oracle checks before it is written.
 4. **Verify** runs the affected tests in an ephemeral `--network none` Docker sandbox and
    records the successful batch boundary.
 5. **Recover** classifies failures, retries with the rejected diff and exact evidence,
@@ -238,6 +239,7 @@ The workbench is designed around the decisions a reviewer actually needs:
 
 - strict migration outcome versus raw test status;
 - live pipeline and task progress;
+- the frozen create/rewrite plan, artifact ownership, contracts, and execution cuts;
 - interface/oracle/recovery evidence;
 - LLM calls, tokens, and measured cost;
 - changed-file index and syntax-colored unified diff;
@@ -301,47 +303,63 @@ for the stdio MCP server.
 
 ## Measured results
 
-The current accepted baseline is suite
-**`r2-r3-baseline-gpt4o-20260712-v2`**: seven development-corpus entries × K=3, 21 real
-jobs, run on the final compatibility-first R2/R3 implementation with a GPT-4o driver.
-The numbers below were verified directly from the `runs` table.
+The latest full baseline is suite **`eval-full-corpus-k3-20260714`**: seven pinned
+development-corpus entries × K=3, 21 autonomous jobs with a GPT-4o driver. It is the first
+full grid after planned artifact creation, contract compilation, executable cuts, and
+targeted transactional repair landed.
 
 ### Headline
 
-| Metric | Accepted result |
+| Metric | Latest result |
 |---|---:|
-| Strict green migrations | **6/21 (28.6%)** |
-| Final test pass | **100% across 21/21 runs** |
-| Oracle integrity | **100% across 21/21 runs** |
-| Measured GPT-4o cost | **$6.9898 total** |
-| Worker execution time | **1,108.4 seconds total** |
+| Strict green migrations | **13/21 (61.9%)** |
+| Pinned GitHub repositories | **8/15 strict green (53.3%)** |
+| Report-bearing migration attempts | **13/19 green (68.4%)** |
+| Oracle integrity | **100% across all 19 report-bearing runs** |
+| Reconstructed GPT-4o cost | **$6.9195 total** |
+| Worker execution time | **1,088.0 seconds total** |
 
-| Corpus entry | Tier | Green | Mean test pass | Mean completion | Mean recovery visits | Total cost |
-|---|---|---:|---:|---:|---:|---:|
-| `flask-items-fixture` | baseline | **3/3** | 1.00 | 1.000 | 0.00 | $0.0375 |
-| `flask-structural-fixture` | structural | **3/3** | 1.00 | 1.000 | 0.67 | $0.1180 |
-| `minimal-flask-api` | baseline | 0/3 | 1.00 | 0.250 | 3.00 | $0.0379 |
-| `flaskr` | structural | 0/3 | 1.00 | 0.143 | 3.00 | $0.5277 |
-| `watchlist` | structural | 0/3 | 1.00 | 0.167 | 3.00 | $0.1170 |
-| `microblog` | heavy | 0/3 | 1.00 | 0.053 | 3.00 | $6.0604 |
-| `flask-restx-api` | framework | 0/3 | 1.00 | 0.250 | 3.00 | $0.0914 |
+| Corpus entry | Tier | Strict result | Migrated evidence | Total cost |
+|---|---|---:|---|---:|
+| `flask-items-fixture` | baseline | **2 green / 1 red** | red stopped at 5/6 | $0.1190 |
+| `flask-structural-fixture` | structural | **3/3 green** | 2/2 each | $0.1833 |
+| `minimal-flask-api` | baseline | **3/3 green** | 2/2 each | $0.1307 |
+| `flaskr` | structural | **2 green / 1 engine error** | both completed runs 24/24, zero recovery | $0.3410 reconstructed |
+| `watchlist` | structural | **2 red / 1 engine error** | original 15/15 restored on both reds | $0.5994 reconstructed |
+| `microblog` | heavy | **0/3 green** | collection blocked; original 4/4 restored | $5.3377 |
+| `flask-restx-api` | framework | **3/3 green** | 4/4 each | $0.2084 |
 
-### Why are all tests green while five repositories are red?
+The strict denominator includes two deterministic-renderer errors. Both stopped before a
+report existed, so oracle integrity is unknown—not zero—and both count against the result.
+The run table recorded $6.8629; the reconstructed total adds four paid architect calls
+preserved on task rows but omitted when those jobs failed before Report.
 
-Those five migrations exhausted their bounded repair path and rolled incomplete work back.
-Their original applications then passed their original suites. Portage reported them as
-**failed** because completion remained below 1.0. The oracle stayed intact, so the result is
-not a false green or a weakened test suite—it is an honest completion failure.
+### The artifact-contract breakthrough
 
-This baseline sharpened the next general engineering boundary:
+The July 12 grid was 6/21 overall and 0/15 across pinned GitHub repositories. The new
+engine can now survey a repository, propose purposeful support modules, freeze their
+exports and consumers, compile source-derived framework surfaces, wire sanctioned test
+normalizations, and repair one attributed artifact without rerolling a coherent cut.
 
-1. **Executable migration cuts** — a batch must include the consumers and factory wiring
-   needed to run, not merely the first provider with an affected test.
-2. **Bounded SCC/component recovery** — one circular import in Microblog regenerated an
-   18-file coherent component three times and consumed $6.06 of the $6.99 grid.
-3. **Explicit idiom profiles** — Flask-RESTX, Flask-SQLAlchemy/login, and
-   template/session applications need profile-specific conversion or an early,
-   accurate `unsupported` result.
+That changed the observed capability boundary:
+
+1. **Flaskr is autonomously expressible.** Two independent K=3 samples planned four owned
+   support modules, completed all 12 tasks, and passed 24/24 with no recovery. A separate
+   frozen-plan replay also passed 24/24, proving generation given an accepted architecture.
+2. **The gains transfer.** Minimal and the structural fixture are 3/3; RESTX moved from
+   0/3 to 3/3. Production rules use capabilities, AST shape, contracts, and
+   provider/consumer topology—never corpus identity.
+3. **Recovery is now local and transactional.** Distinct attributed failures can repair one
+   owner without charging the global no-progress budget; a failed repair restores and
+   re-verifies the last coherent cut.
+4. **The next blocker is narrower.** Watchlist needs a realized Flask-SQLAlchemy/config
+   surface. All three Microblog samples introduced the same `db` provider import cycle
+   before test collection. Two additional jobs exposed deterministic materializer/reporting
+   defects rather than migration-semantic failures.
+
+The next gate is therefore not another broad K=3. It is to get Watchlist and Microblog into
+actual test execution under frozen-plan replay with zero reportless failures and no new
+import cycles, while keeping the stable repositories green.
 
 The methodology, historical grids, fault-injection results, escalation experiment, and
 failure taxonomy are documented in:
@@ -352,7 +370,7 @@ failure taxonomy are documented in:
   accepted R2/R3 baseline.
 - [`corpus/corpus.toml`](corpus/corpus.toml) — pinned repositories and test configuration.
 
-### Reproduce the accepted grid
+### Reproduce the latest grid
 
 This command launches 21 paid model runs. With the measured GPT-4o configuration it cost
 approximately $7; inspect `.env` limits before running it.
@@ -362,7 +380,7 @@ docker compose run --rm worker python -m portage_agent.eval \
   --corpus /corpus/corpus.toml \
   --k 3 \
   --scenarios baseline \
-  --suite repro-r2-r3-$(date +%s)
+  --suite repro-artifact-contracts-$(date +%s)
 ```
 
 Results persist to Postgres and appear under the suite selector at
@@ -473,11 +491,11 @@ infra/           deployment infrastructure
 
 | Stage | Goal | Status |
 |---|---|---:|
-| R1 | Frozen binding-aware interface manifest, dependency/SCC order, caller/contract checks | Implemented; external gate open |
-| R2 | Batch-scoped verification, Integrate recovery, no-progress diagnosis | Implemented; broader gate pending |
+| R1 | Frozen binding-aware interface manifest, dependency/SCC order, caller/contract checks | ✅ |
+| R2 | Executable cuts, targeted transactional recovery, Integrate repair, no-progress diagnosis | ✅ |
 | R3 | Mechanical oracle protection and deterministic compatibility facade | ✅ gate closed |
-| R2.1 | Executable migration cuts and bounded large-component recovery | **Next** |
-| R4 | Explicit Flask idiom profiles and accurate early `unsupported` outcomes | Planned |
+| R4 | Planned artifact creation, contract compiler, capability ownership, repo-aware prompt packs | **Active; Flaskr gate proven** |
+| R4.1 | Extension-provider initialization, import-cycle gate, renderer completeness | **Next** |
 | R5 | Frozen held-out evaluation on 3–5 unseen repositories | Planned |
 
 After R5: harden the public repository-execution boundary → unpark Phase 8 → launch →
@@ -489,8 +507,10 @@ one difficult migration, measured honestly, before a catalog of shallow recipes.
 - Only Flask → FastAPI is implemented and evaluated.
 - The seven-entry corpus is a development corpus; several rules were learned from it.
   Held-out generalization has not been measured yet.
-- The accepted external-repository baseline is 0/15 strict greens despite 100% final test
-  pass after rollback. External completion—not test execution—is the active frontier.
+- The latest pinned-GitHub result is 8/15 strict green. Flask-SQLAlchemy/config realization
+  and extension-provider initialization still block Watchlist and Microblog.
+- Two K=3 jobs failed before Report because deterministic artifact rendering omitted frozen
+  exports; their cost had to be reconstructed from task ledgers.
 - A shared sandbox image cannot satisfy every legacy Flask dependency combination;
   per-repository images are the documented corpus-breadth unlock.
 - Thousand-file repositories, untrusted public inputs, and production multi-tenant sandbox

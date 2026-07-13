@@ -28,13 +28,14 @@ from pathlib import Path
 from sqlalchemy import select
 
 from portage_agent.config import settings
-from portage_agent.db.models import EvalMetric, EvalRun, Job
+from portage_agent.db.models import EvalMetric, EvalRun, Job, Task, TaskStatus
 from portage_agent.db.session import AsyncSessionLocal
 from portage_agent.worker.queue import PostgresJobQueue
 
 from .corpus import CorpusRepo
 
 log = logging.getLogger("portage.eval")
+REPLAY_SUITE_MARKER = "-replay-"
 
 # Scenario name -> job config. The faults are deterministic (see agent/nodes/execute.py
 # and plan.py); kill/resume stays in scripts/dod_check.sh — the harness can't SIGKILL the
@@ -48,14 +49,22 @@ SCENARIOS: dict[str, dict] = {
 }
 
 # Metrics aggregated over the K runs of one (repo, scenario) cell.
-_METRICS = (
+_FULL_METRICS = (
     "suite_green",
     "test_pass_rate",
     "completion_rate",
     "oracle_integrity_rate",
     "no_progress_retries",
     "recover_visits",
+    "recover_budget_used",
     "escalation_rescued",
+    "llm_calls",
+    "cost_usd",
+    "wall_seconds",
+)
+_PLAN_METRICS = (
+    "architect_acceptance_rate",
+    "architect_repair_rate",
     "llm_calls",
     "cost_usd",
     "wall_seconds",
@@ -77,6 +86,7 @@ class RunResult:
     tasks_done: int = 0
     tasks_skipped: int = 0
     recover_visits: int = 0
+    recover_budget_used: int = 0
     escalation_attempted: int = 0
     escalation_rescued: int = 0
     llm_calls: int = 0
@@ -87,6 +97,9 @@ class RunResult:
     oracle_integrity_rate: float = 0.0
     no_progress_retries: int = 0
     migration_outcome: str = "failed"
+    architect_accepted: bool = False
+    architect_repairs: int = 0
+    architect_rejection_class: str = ""
 
     def metric(self, name: str) -> float:
         if name == "suite_green":
@@ -95,6 +108,12 @@ class RunResult:
             return self.tests_passed / self.tests_total if self.tests_total else 0.0
         if name == "completion_rate":
             return self.tasks_done / self.tasks_total if self.tasks_total else 0.0
+        if name == "architect_acceptance_rate":
+            return float(self.architect_accepted)
+        if name == "architect_repair_rate":
+            return float(self.architect_repairs > 0)
+        if name.startswith("rejection_"):
+            return float(self.architect_rejection_class == name.removeprefix("rejection_"))
         return float(getattr(self, name))
 
 
@@ -105,6 +124,27 @@ class HarnessConfig:
     scenarios: list[str] = field(default_factory=lambda: ["baseline"])
     job_timeout_seconds: int = 900
     poll_seconds: float = 3.0
+    plan_only: bool = False
+    replay_plan: list[dict] | None = None
+    replay_source_job: uuid.UUID | None = None
+
+
+async def load_replay_plan(job_id: uuid.UUID) -> list[dict]:
+    """Load one already-accepted, compiler-completed architect plan."""
+    async with AsyncSessionLocal() as session:
+        task = (
+            await session.execute(
+                select(Task).where(
+                    Task.job_id == job_id,
+                    Task.type == "artifact_architect",
+                    Task.status == TaskStatus.done.value,
+                )
+            )
+        ).scalar_one_or_none()
+    plan = task.verify_spec.get("artifact_plan") if task else None
+    if not isinstance(plan, list) or not plan:
+        raise ValueError(f"job {job_id} has no accepted non-empty artifact plan")
+    return plan
 
 
 async def _wait_for_job(job_id: uuid.UUID, cfg: HarnessConfig) -> Job | None:
@@ -122,8 +162,25 @@ async def _wait_for_job(job_id: uuid.UUID, cfg: HarnessConfig) -> Job | None:
     return None
 
 
+def classify_architect_rejection(error: str) -> str:
+    value = error.lower()
+    if "must declare at least one export" in value:
+        return "schema_missing_export"
+    if "strict json" in value:
+        return "schema_invalid_json"
+    if "requires exactly one owner artifact, got 0" in value:
+        return "policy_missing_owner"
+    if "requires exactly one class export" in value or "wrong export kinds" in value:
+        return "policy_contract_shape"
+    if "path" in value and ("forbidden" in value or "allowed_new_artifact_paths" in value):
+        return "policy_path"
+    if "artifact architecture rejected" in value:
+        return "schema_or_policy_other"
+    return "engine_or_unknown"
+
+
 def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
-             job: Job | None, job_id: uuid.UUID) -> RunResult:
+             job: Job | None, job_id: uuid.UUID, *, plan_only: bool = False) -> RunResult:
     """Fold the job row + its report.json into one flat run record."""
     r = RunResult(corpus_name=repo.name, scenario=scenario, k_index=k_index, job_id=job_id,
                   status="timeout")
@@ -148,6 +205,7 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     rec = report.get("recovery") or {}
     r.tasks_skipped = int(rec.get("tasks_skipped") or 0)
     r.recover_visits = int(rec.get("visits") or 0)
+    r.recover_budget_used = int(rec.get("budget_used") or 0)
     r.escalation_attempted = int(rec.get("escalation_attempted") or 0)
     r.escalation_rescued = int(rec.get("escalation_rescued") or 0)
     usage = report.get("llm_usage") or {}
@@ -160,10 +218,28 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     r.no_progress_retries = int(rec.get("no_progress_retries") or 0)
     r.migration_outcome = str(report.get("migration_outcome") or "failed")
 
+    if plan_only and job.status == "done":
+        architect = (report.get("artifact_plan") or {}).get("architect")
+        architect_task = next(
+            (
+                task for task in report.get("tasks", [])
+                if task.get("type") == "artifact_architect"
+            ),
+            None,
+        )
+        r.architect_accepted = architect is None or architect.get("status") == "done"
+        r.architect_repairs = int((architect or {}).get("repairs") or 0)
+        if not r.architect_accepted:
+            r.architect_rejection_class = classify_architect_rejection(
+                str((architect_task or {}).get("error") or "")
+            )
+        r.status = "green" if r.architect_accepted else "red"
+        return r
+
     # Green = the MIGRATION succeeded, not merely "tests passed": every planned task done
     # (none skipped/rolled back) AND the full suite green. Skip-and-continue can roll the
     # whole worktree back to original sources, whose suite then passes — that is an honest
-    # failure report, and it must never score as a green migration (observed on flaskr).
+    # failure report, and it must never score as a green migration.
     if job.status == "done":
         suite_ok = r.tests_total > 0 and r.tests_passed == r.tests_total
         fully_migrated = r.tasks_total > 0 and r.tasks_done == r.tasks_total
@@ -201,7 +277,15 @@ async def _persist_metrics(cfg: HarnessConfig, corpus_name: str, scenario: str,
                            results: list[RunResult]) -> list[EvalMetric]:
     driver, _ = _labels()
     rows: list[EvalMetric] = []
-    for name in _METRICS:
+    names = list(_PLAN_METRICS if cfg.plan_only else _FULL_METRICS)
+    if cfg.plan_only:
+        names.extend(
+            "rejection_" + name for name in sorted({
+                result.architect_rejection_class for result in results
+                if result.architect_rejection_class
+            })
+        )
+    for name in names:
         values = [r.metric(name) for r in results]
         mean = statistics.mean(values)
         variance = statistics.variance(values) if len(values) > 1 else 0.0
@@ -222,6 +306,11 @@ async def run_suite(repos: list[CorpusRepo], cfg: HarnessConfig) -> list[EvalMet
     unknown = [s for s in cfg.scenarios if s not in SCENARIOS]
     if unknown:
         raise ValueError(f"unknown scenarios {unknown}; known: {sorted(SCENARIOS)}")
+    if cfg.replay_plan is not None and REPLAY_SUITE_MARKER not in cfg.suite:
+        raise ValueError(
+            f"replay suite names must contain {REPLAY_SUITE_MARKER!r} so diagnostics "
+            "cannot enter headline aggregates"
+        )
 
     queue = PostgresJobQueue()
     all_metrics: list[EvalMetric] = []
@@ -237,17 +326,37 @@ async def run_suite(repos: list[CorpusRepo], cfg: HarnessConfig) -> list[EvalMet
                 n += 1
                 job_id = await queue.enqueue(
                     repo_url=repo.repo_url, migration_recipe=repo.recipe,
-                    config=repo.job_config(SCENARIOS[scenario]),
+                    config=repo.job_config({
+                        **SCENARIOS[scenario],
+                        **({"plan_only": True} if cfg.plan_only else {}),
+                        **({
+                            "frozen_artifact_plan": cfg.replay_plan,
+                            "replay_source_job": str(cfg.replay_source_job),
+                        } if cfg.replay_plan is not None else {}),
+                    }),
                 )
                 log.info("[%s/%s] %s/%s k=%s -> job=%s",
                          n, total, repo.name, scenario, k_index, job_id)
                 job = await _wait_for_job(job_id, cfg)
-                result = _harvest(repo, scenario, k_index, job, job_id)
+                result = _harvest(
+                    repo, scenario, k_index, job, job_id, plan_only=cfg.plan_only,
+                )
                 await _persist_run(cfg, repo, result)
-                log.info("[%s/%s] %s | tests=%s/%s cost=$%.4f wall=%.0fs recover=%s",
-                         n, total, result.status.upper(), result.tests_passed,
-                         result.tests_total, result.cost_usd, result.wall_seconds,
-                         result.recover_visits)
+                if cfg.plan_only:
+                    log.info(
+                        "[%s/%s] PLAN_%s | repairs=%s rejection=%s cost=$%.4f wall=%.0fs",
+                        n, total, "ACCEPTED" if result.architect_accepted else "REJECTED",
+                        result.architect_repairs,
+                        result.architect_rejection_class or "-",
+                        result.cost_usd, result.wall_seconds,
+                    )
+                else:
+                    log.info(
+                        "[%s/%s] %s | tests=%s/%s cost=$%.4f wall=%.0fs recover=%s",
+                        n, total, result.status.upper(), result.tests_passed,
+                        result.tests_total, result.cost_usd, result.wall_seconds,
+                        result.recover_visits,
+                    )
                 cell.append(result)
             all_metrics.extend(await _persist_metrics(cfg, repo.name, scenario, cell))
 

@@ -25,10 +25,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import logging
 import re
+import symtable
+import sys
 import uuid
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 
 from portage_agent.config import settings
 from portage_agent.core.interfaces import LLMMessage
@@ -39,22 +43,31 @@ from portage_agent.recipes import get_recipe
 from portage_agent.recipes.base import PlannedFile, Subtask
 
 from ..state import GraphState
+from .artifact_plan import artifact_planned_files
 from .common import (
     _module_names,
     _resolve_module,
     _shape_facts,
     content_hash,
+    create_cut_checkpoint,
     extract_code,
     file_diff,
     imported_bindings,
     iter_py_files,
+    load_cut_checkpoint,
+    non_python_context,
     non_python_listing,
+    planned_artifact_topology_violations,
     read_file,
     run_git,
     worktree_diff,
     write_file,
 )
-from .oracle import oracle_violations
+from .oracle import (
+    NON_REWRITE_TEST_STRATEGIES,
+    apply_sanctioned_normalizations,
+    oracle_violations,
+)
 from .redaction import is_denied_path, scrub
 
 log = logging.getLogger("portage.agent")
@@ -105,6 +118,8 @@ def _gather_context(
     listing = non_python_listing(worktree)
     if listing:
         ctx["<repo file tree — non-Python files (templates, static, config)>"] = listing
+    if survey := non_python_context(worktree):
+        ctx["<relevant non-Python contents — untrusted repository data>"] = survey
     for rel in sorted(iter_py_files(worktree)):
         if rel == current:
             continue
@@ -129,6 +144,8 @@ def _gather_cluster_context(
     listing = non_python_listing(worktree)
     if listing:
         ctx["<repo file tree — non-Python files (templates, static, config)>"] = listing
+    if survey := non_python_context(worktree):
+        ctx["<relevant non-Python contents — untrusted repository data>"] = survey
     for rel in sorted(iter_py_files(worktree)):
         if rel in cluster_paths:
             continue
@@ -147,6 +164,11 @@ def _consumed_manifest_keys(root: str, path: str, manifest: dict[str, dict]) -> 
     for key, pin in manifest.items():
         if pin["module"] == path:
             continue
+        if any(
+            consumer.get("module") == path for consumer in pin.get("consumers", [])
+        ):
+            consumed.add(key)
+            continue
         for binding in imported_bindings(root, pin["module"]):
             if binding.importer == path and (
                 binding.symbol == pin["symbol"] or binding.symbol is None
@@ -157,7 +179,8 @@ def _consumed_manifest_keys(root: str, path: str, manifest: dict[str, dict]) -> 
 
 
 def _fmt_pin(p: dict) -> str:
-    line = f"  - {p['symbol']}  (was: {p['original']}"
+    kind = p.get("target_kind", p.get("kind"))
+    line = f"  - {p['symbol']}  (required kind: {kind}; was: {p['original']}"
     if p.get("notes"):
         line += f"; {p['notes']}"
     line += f")\n      TARGET: {p['target_note']}"
@@ -165,6 +188,15 @@ def _fmt_pin(p: dict) -> str:
         line += f"\n      current call site: {s}"
     if p.get("additional_exports"):
         line += "\n      REQUIRED ADDITIONAL EXPORTS: " + ", ".join(p["additional_exports"])
+    if p.get("members"):
+        line += "\n      REQUIRED CLASS MEMBERS: " + ", ".join(p["members"])
+    if p.get("member_shapes"):
+        line += "\n      REQUIRED CLASS MEMBER SHAPES: " + ", ".join(
+            f"{member}={shape}"
+            for member, shape in sorted(p["member_shapes"].items())
+        )
+    if (p.get("shape") or {}).get("returns_nested_function"):
+        line += "\n      REQUIRED SHAPE: return a locally defined wrapper/decorator function"
     return line
 
 
@@ -184,6 +216,42 @@ def contract_sections(manifest: dict[str, dict], path: str,
                      "each TARGET exactly as decided; already-migrated definitions in "
                      "the context files are the authority):\n"
                      + "\n".join(_fmt_pin(p) for p in calls))
+    class_calls = [
+        pin for pin in calls
+        if pin.get("provenance") == "planned_create"
+        and pin.get("target_kind") == "class" and pin.get("members")
+        and "direct_test_surface" in pin.get("capabilities", [])
+        and path in pin.get("factory_consumers", [])
+    ]
+    if class_calls:
+        parts.append(
+            "PLANNED CLASS WIRING — import each exact owner class below, construct it "
+            "in this consumer, and return it from the public factory or assign it to the "
+            "public export. Pass consumer-owned runtime objects into the provider through "
+            "constructor/factory arguments; the provider must never import this consumer:\n"
+            + "\n".join(
+                f"  - {pin['module']}::{pin['symbol']} owns "
+                + ", ".join(pin["members"])
+                for pin in class_calls
+            )
+        )
+    planned = [p for p in defines if p.get("provenance") == "planned_create"]
+    if planned:
+        consumers = sorted({
+            consumer["module"]
+            for pin in planned for consumer in pin.get("consumers", [])
+        })
+        dependencies = sorted({
+            dependency for pin in planned for dependency in pin.get("depends_on", [])
+        })
+        parts.append(
+            "PROVIDER-FIRST ARTIFACT TOPOLOGY — this file must not import any declared "
+            f"consumer ({', '.join(consumers) or 'none'}). Its declared lower-level "
+            f"dependencies are: {', '.join(dependencies) or 'none'}. Keep shared state "
+            "in this provider or a declared dependency so imports remain acyclic. Receive "
+            "consumer-owned runtime objects through constructor/function arguments; never "
+            "construct or import a consumer, including inside a function body."
+        )
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 
@@ -195,6 +263,11 @@ def seam_sections(seam_plan: dict, path: str) -> str:
     ]
     unit = next(
         (u for u in seam_plan.get("units", []) if path in u.get("paths", [])), None
+    )
+    execution_cut = next(
+        (cut for cut in seam_plan.get("execution_cuts", [])
+         if path in cut.get("paths", [])),
+        None,
     )
     parts: list[str] = []
     if decisions:
@@ -212,6 +285,14 @@ def seam_sections(seam_plan: dict, path: str) -> str:
             + ", ".join(unit["paths"])
             + ". Keep configuration, lifecycle, factory construction, and test setup "
               "coherent across every member."
+        )
+    if execution_cut:
+        parts.append(
+            f"EXECUTABLE VERIFICATION CUT {execution_cut['id']} "
+            f"({execution_cut['reason']}, mode={execution_cut['mode']}): "
+            + ", ".join(execution_cut["paths"])
+            + ". Every member is generated before this cut is sandbox-verified; do not "
+              "assume a mixed Flask/FastAPI intermediate state is runnable."
         )
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
@@ -231,6 +312,14 @@ def extract_cluster_files(text: str, paths: list[str]) -> dict[str, str]:
     if missing:
         raise ValueError(f"cluster response missing paths: {sorted(missing)}")
     return found
+
+
+class ClusterOutputError(ValueError):
+    """Malformed model output whose already-spent usage must remain accountable."""
+
+    def __init__(self, message: str, usage: dict):
+        super().__init__(message)
+        self.usage = usage
 
 
 def _manifest_module_matches(module: str, pin: dict) -> bool:
@@ -374,23 +463,853 @@ def caller_contract_violations(
     return out
 
 
-def framework_seam_violations(content: str, seam_plan: dict, path: str) -> list[str]:
-    """Reject framework capabilities the deterministic seam plan says do not exist."""
-    relevant = [
-        d for d in seam_plan.get("decisions", {}).values()
-        if path in d.get("files", [])
+def planned_capability_consumer_violations(
+    content: str, manifest: dict[str, dict], path: str,
+) -> list[str]:
+    """Require declared consumers to actually construct owned class capabilities."""
+    pins = [
+        pin for pin in manifest.values()
+        if pin.get("provenance") == "planned_create" and pin.get("members")
+        and "direct_test_surface" in pin.get("capabilities", [])
+        and path in pin.get("factory_consumers", [])
     ]
-    if not relevant:
+    if not pins:
         return []
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return []
-
     out: list[str] = []
+    public_symbols = {
+        pin["symbol"] for pin in manifest.values() if pin.get("module") == path
+    }
+    for pin in pins:
+        direct_names: set[str] = set()
+        module_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = _resolve_module(node.module, node.level, path)
+                if _manifest_module_matches(module, pin):
+                    direct_names.update(
+                        alias.asname or alias.name for alias in node.names
+                        if alias.name == pin["symbol"]
+                    )
+            elif isinstance(node, ast.Import):
+                module_names.update(
+                    alias.asname or alias.name for alias in node.names
+                    if _manifest_module_matches(alias.name, pin)
+                )
+        def is_constructor(
+            node: ast.AST | None,
+            direct: set[str] = direct_names,
+            modules: set[str] = module_names,
+            symbol: str = pin["symbol"],
+        ) -> bool:
+            return bool(
+                isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name) and node.func.id in direct
+                or isinstance(node.func, ast.Attribute)
+                and ast.unparse(node.func.value) in modules
+                and node.func.attr == symbol
+            )
+            )
+
+        exported = any(
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and is_constructor(statement.value)
+            and any(
+                isinstance(target, ast.Name)
+                and (not public_symbols or target.id in public_symbols)
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+            for statement in tree.body
+        )
+        returned = False
+        for function in (
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (not public_symbols or node.name in public_symbols)
+        ):
+            constructed_names = {
+                target.id
+                for statement in function.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and is_constructor(statement.value)
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            returned = any(
+                isinstance(node, ast.Return) and (
+                    is_constructor(node.value)
+                    or isinstance(node.value, ast.Name)
+                    and node.value.id in constructed_names
+                )
+                for node in ast.walk(function)
+            )
+            if returned:
+                break
+        if not direct_names and not module_names:
+            out.append(
+                f"{path}: declared consumer must import owned capability "
+                f"{pin['module']}::{pin['symbol']}"
+            )
+        elif not (exported or returned):
+            out.append(
+                f"{path}: declared consumer imports owned capability {pin['symbol']} "
+                "but never returns it from a public factory or assigns it to a public export"
+            )
+    return out
+
+
+def _direct_body_nodes(
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    """Walk one method body without confusing nested ``self`` scopes with its own."""
+    found: list[ast.AST] = []
+
+    class Collector(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):  # noqa: N802
+            return None
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):  # noqa: N802
+            return None
+
+        def generic_visit(self, node):
+            found.append(node)
+            super().generic_visit(node)
+
+    visitor = Collector()
+    for statement in method.body:
+        visitor.visit(statement)
+    return found
+
+
+def framework_seam_violations(
+    content: str, seam_plan: dict, path: str, manifest: dict[str, dict] | None = None,
+) -> list[str]:
+    """Reject capabilities that no frozen plan-owned artifact implements."""
+    relevant = [
+        d for d in seam_plan.get("decisions", {}).values()
+        if path in d.get("files", [])
+    ]
+    owned_pins = [
+        pin for pin in (manifest or {}).values()
+        if pin.get("provenance") == "planned_create"
+        and pin.get("target_kind") == "class"
+        and (
+            path == pin.get("module")
+            or any(consumer.get("module") == path for consumer in pin.get("consumers", []))
+        )
+    ]
+    owned_members = {
+        member
+        for pin in owned_pins
+        for member in pin.get("members", [])
+    }
+    if (
+        not relevant and not owned_members and not seam_plan.get("project_modules")
+        and "allowed_import_roots" not in seam_plan
+    ):
+        return []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    module_defs = {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    out: list[str] = []
+
+    if "allowed_import_roots" in seam_plan:
+        allowed_imports = {
+            *sys.stdlib_module_names,
+            *seam_plan["allowed_import_roots"],
+            *seam_plan.get("original_import_roots", {}).get(path, []),
+            *seam_plan.get("project_roots", []),
+            *(path.split("/", 1)[:1] if "/" in path else []),
+        }
+        for node in tree.body:
+            roots = (
+                [node.module.split(".")[0]]
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module
+                else [alias.name.split(".")[0] for alias in node.names]
+                if isinstance(node, ast.Import) else []
+            )
+            for root in roots:
+                if root not in allowed_imports:
+                    out.append(
+                        f"{path}:{node.lineno}: import `{root}` is unavailable in the "
+                        "network-off migration sandbox"
+                    )
+
+    direct_classes = {
+        pin["symbol"] for pin in owned_pins if pin.get("module") == path
+    }
+    module_aliases: dict[str, set[str]] = {}
+    for pin in owned_pins:
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom):
+                module = _resolve_module(node.module, node.level, path)
+                if _manifest_module_matches(module, pin):
+                    direct_classes.update(
+                        alias.asname or alias.name
+                        for alias in node.names if alias.name == pin["symbol"]
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if _manifest_module_matches(alias.name, pin):
+                        module_aliases.setdefault(alias.asname or alias.name, set()).add(
+                            pin["symbol"]
+                        )
+
+    def is_owned_constructor(node: ast.AST | None) -> bool:
+        return bool(
+            isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name) and node.func.id in direct_classes
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr in module_aliases.get(ast.unparse(node.func.value), set())
+            )
+        )
+
+    owned_instances = {
+        target.id
+        for statement in ast.walk(tree)
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and is_owned_constructor(statement.value)
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+
+    def valid_owned_receiver(node: ast.Attribute) -> bool:
+        if node.attr not in owned_members:
+            return False
+        if isinstance(node.value, ast.Name):
+            return node.value.id in owned_instances or (
+                node.value.id == "self"
+                and any(pin.get("module") == path for pin in owned_pins)
+            )
+        return is_owned_constructor(node.value)
+
+    router_names = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "fastapi"
+        for alias in node.names if alias.name == "APIRouter"
+    }
+    fastapi_modules = {
+        alias.asname or alias.name
+        for node in tree.body if isinstance(node, ast.Import)
+        for alias in node.names if alias.name == "fastapi"
+    }
+
+    def is_router_constructor(node: ast.AST | None) -> bool:
+        return bool(
+            isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name) and node.func.id in router_names
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == "APIRouter"
+                and ast.unparse(node.func.value) in fastapi_modules
+            )
+        )
+
+    router_instances = {
+        target.id
+        for statement in ast.walk(tree)
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and is_router_constructor(statement.value)
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in {
+                "middleware", "add_middleware", "exception_handler", "errorhandler",
+            }
+            and isinstance(node.value, ast.Name)
+            and node.value.id in router_instances
+        ):
+            out.append(
+                f"{path}:{node.lineno}: APIRouter `{node.value.id}` has no "
+                f"`{node.attr}` API; middleware and exception handlers belong to the "
+                "FastAPI application"
+            )
+
+    def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+        parts: list[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return tuple(reversed(parts))
+
+    def _is_state_config(node: ast.AST) -> bool:
+        parts = _attribute_path(node)
+        return len(parts) >= 3 and parts[-2:] == ("state", "config")
+
+    def _state_config_written_keys() -> tuple[set[str], list[int], dict[str, list[int]]]:
+        keys: set[str] = set()
+        writes: list[int] = []
+        updates: dict[str, list[int]] = {}
+        local_configs = {
+            node.value.id
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and isinstance(node.value, ast.Name)
+            and any(
+                _is_state_config(target)
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                for target in targets:
+                    if _is_state_config(target):
+                        writes.append(node.lineno)
+                        if isinstance(value, ast.Dict):
+                            keys.update(
+                                key.value for key in value.keys
+                                if isinstance(key, ast.Constant)
+                                and isinstance(key.value, str)
+                            )
+                    elif isinstance(target, ast.Name) and target.id in local_configs:
+                        if isinstance(value, ast.Dict):
+                            keys.update(
+                                key.value for key in value.keys
+                                if isinstance(key, ast.Constant)
+                                and isinstance(key.value, str)
+                            )
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and (
+                            _is_state_config(target.value)
+                            or isinstance(target.value, ast.Name)
+                            and target.value.id in local_configs
+                        )
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        writes.append(node.lineno)
+                        keys.add(target.slice.value)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and (
+                    _is_state_config(node.func.value)
+                    or isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in local_configs
+                )
+            ):
+                writes.append(node.lineno)
+                if node.args and isinstance(node.args[0], ast.Dict):
+                    keys.update(
+                        key.value for key in node.args[0].keys
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    )
+                if node.args and isinstance(node.args[0], ast.Name):
+                    updates.setdefault(node.args[0].id, []).append(node.lineno)
+        return keys, writes, updates
+
+    def _imported_callable_refs(module_path: str, symbol: str) -> set[str]:
+        refs: set[str] = set()
+        wanted = _module_names(module_path)
+        tails = {name.split(".")[-1] for name in wanted}
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom):
+                module = _resolve_module(node.module, node.level, path)
+                if module in wanted or module.split(".")[-1] in tails:
+                    refs.update(
+                        alias.asname or alias.name
+                        for alias in node.names if alias.name == symbol
+                    )
+                for alias in node.names:
+                    candidate = f"{module}.{alias.name}".lstrip(".")
+                    if candidate in wanted:
+                        refs.add(f"{alias.asname or alias.name}.{symbol}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in wanted or alias.name.split(".")[-1] in tails:
+                        refs.add(f"{alias.asname or alias.name}.{symbol}")
+        return refs
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "application_factory" and item.get("factory") == path
+    ):
+        config_keys, config_writes, config_updates = _state_config_written_keys()
+        required_keys = set(decision.get("config_keys", []))
+        if required_keys and not config_writes:
+            out.append(
+                f"{path}: application factory must create a plain app.state.config dict "
+                "before initializing providers"
+            )
+        missing_keys = required_keys - config_keys
+        if missing_keys:
+            out.append(
+                f"{path}: app.state.config omits original default keys "
+                f"{sorted(missing_keys)}"
+            )
+        for parameter in decision.get("override_parameters", []):
+            if parameter not in config_updates:
+                out.append(
+                    f"{path}: application factory must apply `{parameter}` with "
+                    "app.state.config.update(...) before provider initialization"
+                )
+        ready_line = max(
+            [*config_writes, *(
+                line for parameter in decision.get("override_parameters", [])
+                for line in config_updates.get(parameter, [])
+            )],
+            default=0,
+        )
+        for initializer in decision.get("initializers", []):
+            refs = _imported_callable_refs(
+                initializer["provider"], initializer["symbol"],
+            )
+            calls = [
+                node.lineno for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) in refs
+            ]
+            if not calls:
+                out.append(
+                    f"{path}: application factory must call "
+                    f"{initializer['provider']}::{initializer['symbol']}"
+                )
+            elif min(calls) <= ready_line:
+                out.append(
+                    f"{path}: provider initializer {initializer['symbol']} must run "
+                    "after defaults and test configuration overrides"
+                )
+
+        owner_calls = [
+            node for node in ast.walk(tree) if is_owned_constructor(node)
+        ]
+        for callback in decision.get("cleanup_callbacks", []):
+            for function_name in callback.get("functions", []):
+                refs = _imported_callable_refs(callback["provider"], function_name)
+                wired = any(
+                    any(
+                        ast.unparse(node) in refs for node in ast.walk(keyword.value)
+                    )
+                    for call in owner_calls for keyword in call.keywords
+                    if keyword.arg == "cleanup_callbacks"
+                )
+                if not wired:
+                    out.append(
+                        f"{path}: planned application facade must receive cleanup "
+                        f"callback {callback['provider']}::{function_name} for "
+                        "app-context exit"
+                    )
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "copy"
+                and ".routes" in ast.unparse(node.func.value)
+            ):
+                out.append(
+                    f"{path}:{node.lineno}: preserve endpoint aliases with a supported "
+                    "named route registration; APIRoute objects must not be copied"
+                )
+        named_routes = {
+            (
+                node.args[0].value,
+                next(
+                    (keyword.value.value for keyword in node.keywords
+                     if keyword.arg == "name"
+                     and isinstance(keyword.value, ast.Constant)
+                     and isinstance(keyword.value.value, str)),
+                    "",
+                ),
+            )
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {
+                "add_api_route", "add_route", "api_route", "get", "post", "put",
+                "patch", "delete", "options", "head",
+            }
+            and node.args and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        }
+        for alias in decision.get("endpoint_aliases", []):
+            if (alias["path"], alias["name"]) not in named_routes:
+                out.append(
+                    f"{path}: application factory must preserve reverse-URL alias "
+                    f"{alias['name']!r} for path {alias['path']!r} with a supported "
+                    "named target route"
+                )
+
+        for call in (
+            node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        ):
+            lifespan = next(
+                (keyword.value for keyword in call.keywords
+                 if keyword.arg == "lifespan"),
+                None,
+            )
+            if not isinstance(lifespan, ast.Name):
+                continue
+            function = module_defs.get(lifespan.id)
+            if not isinstance(function, ast.AsyncFunctionDef):
+                continue
+            shape = _shape_facts(function)
+            decorated = any(
+                ast.unparse(decorator).removesuffix("()")
+                .endswith("asynccontextmanager")
+                for decorator in function.decorator_list
+            )
+            if shape["is_generator"] and not decorated:
+                out.append(
+                    f"{path}:{function.lineno}: lifespan `{function.name}` is a bare "
+                    "async generator; decorate it with @contextlib.asynccontextmanager "
+                    "before passing it to FastAPI"
+                )
+
+        static_mount = decision.get("static_mount") or {}
+        if static_mount:
+            mounted = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "mount"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == static_mount["path"]
+                and any(
+                    keyword.arg == "name"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value == static_mount["name"]
+                    for keyword in node.keywords
+                )
+                and any(
+                    isinstance(part, ast.Call)
+                    and (
+                        isinstance(part.func, ast.Name)
+                        and part.func.id == "StaticFiles"
+                        or isinstance(part.func, ast.Attribute)
+                        and part.func.attr == "StaticFiles"
+                    )
+                    for part in ast.walk(node)
+                )
+                for node in ast.walk(tree)
+            )
+            has_package_path = any(
+                isinstance(node, ast.Name) and node.id == "__file__"
+                for node in ast.walk(tree)
+            ) and any(
+                isinstance(node, ast.Constant)
+                and node.value == PurePosixPath(static_mount["directory"]).name
+                for node in ast.walk(tree)
+            )
+            if not mounted or not has_package_path:
+                out.append(
+                    f"{path}: preserve template static endpoint by mounting StaticFiles "
+                    f"at {static_mount['path']!r} with name={static_mount['name']!r} "
+                    "and a package directory resolved from __file__"
+                )
+
+        fastapi_names = {
+            alias.asname or alias.name
+            for node in tree.body if isinstance(node, ast.ImportFrom)
+            and node.module == "fastapi"
+            for alias in node.names if alias.name == "FastAPI"
+        }
+        raw_apps = {
+            target.id
+            for statement in ast.walk(tree)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id in fastapi_names
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if (
+                is_owned_constructor(node)
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in raw_apps
+            ):
+                out.append(
+                    f"{path}:{node.lineno}: planned FastAPI facade must be constructed "
+                    "as the application itself, not wrapped around a separately-created "
+                    "FastAPI positional argument"
+                )
+            if (
+                "testing" in owned_members and is_owned_constructor(node)
+                and not any(keyword.arg == "testing" for keyword in node.keywords)
+            ):
+                out.append(
+                    f"{path}:{node.lineno}: planned application facade must receive "
+                    "`testing=` from the original factory test configuration"
+                )
+            if "testing" in owned_members and is_owned_constructor(node):
+                testing_value = next(
+                    (keyword.value for keyword in node.keywords
+                     if keyword.arg == "testing"),
+                    None,
+                )
+                for parameter in decision.get("optional_parameters", []):
+                    if testing_value is None:
+                        continue
+                    direct_get = any(
+                        isinstance(candidate, ast.Call)
+                        and isinstance(candidate.func, ast.Attribute)
+                        and candidate.func.attr == "get"
+                        and isinstance(candidate.func.value, ast.Name)
+                        and candidate.func.value.id == parameter
+                        for candidate in ast.walk(testing_value)
+                    )
+                    guarded = any(
+                        isinstance(candidate, ast.BoolOp)
+                        and isinstance(candidate.op, ast.And)
+                        and any(
+                            isinstance(part, ast.Name) and part.id == parameter
+                            for part in ast.walk(candidate)
+                        )
+                        or isinstance(candidate, ast.IfExp)
+                        and any(
+                            isinstance(part, ast.Name) and part.id == parameter
+                            for part in ast.walk(candidate.test)
+                        )
+                        for candidate in ast.walk(testing_value)
+                    )
+                    if direct_get and not guarded:
+                        out.append(
+                            f"{path}:{node.lineno}: optional config `{parameter}` may be "
+                            "None; guard it before deriving the facade `testing` value"
+                        )
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "route_names"
+    ):
+        functions = {
+            node.name: node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for route in decision.get("routes", []):
+            function = functions.get(route["function"])
+            names = {
+                keyword.value.value
+                for decorator in (function.decorator_list if function else [])
+                if isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr in {
+                    "api_route", "get", "post", "put", "patch", "delete",
+                    "options", "head",
+                }
+                for keyword in decorator.keywords
+                if keyword.arg == "name"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            }
+            if route["name"] not in names:
+                out.append(
+                    f"{path}: route `{route['function']}` must preserve reverse-URL "
+                    f"name {route['name']!r}"
+                )
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "view_decorators"
+    ):
+        for contract in decision.get("decorators", []):
+            function = module_defs.get(contract["function"])
+            wrapper = next((
+                node for node in (function.body if function else [])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == contract["wrapper"]
+            ), None)
+            wrapped = wrapper is not None and any(
+                isinstance(decorator, ast.Call)
+                and ast.unparse(decorator.func).split(".")[-1] == "wraps"
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Name)
+                and decorator.args[0].id == contract["parameter"]
+                for decorator in wrapper.decorator_list
+            )
+            if not wrapped:
+                out.append(
+                    f"{path}: view decorator `{contract['function']}` must preserve "
+                    f"the wrapped endpoint signature with functools.wraps"
+                )
+            if wrapper is None:
+                continue
+            wrapper_parameters = {
+                argument.arg for argument in [
+                    *wrapper.args.posonlyargs, *wrapper.args.args,
+                    *wrapper.args.kwonlyargs,
+                ]
+            }
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == contract["parameter"]
+                and any(
+                    isinstance(argument, ast.Name)
+                    and argument.id in wrapper_parameters
+                    for argument in call.args
+                )
+                for call in ast.walk(wrapper)
+            ):
+                out.append(
+                    f"{path}: view decorator `{contract['function']}` must forward "
+                    "explicit wrapper parameters by keyword so endpoint parameter order "
+                    "is preserved"
+                )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "response_shape" and item.get("path") == path
+    ):
+        for function_name in decision.get("plain_string_functions", []):
+            function = next((
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            ), None)
+            explicit_response = function is not None and any(
+                isinstance(decorator, ast.Call)
+                and any(
+                    keyword.arg == "response_class"
+                    and ast.unparse(keyword.value).split(".")[-1]
+                    in {"HTMLResponse", "PlainTextResponse"}
+                    for keyword in decorator.keywords
+                )
+                for decorator in function.decorator_list
+            )
+            if function is not None and not explicit_response and any(
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                for node in ast.walk(function)
+            ):
+                out.append(
+                    f"{path}:{function.lineno}: FastAPI route `{function_name}` must "
+                    "wrap its original plain string in HTMLResponse/PlainTextResponse; "
+                    "a bare string changes the response bytes to JSON"
+                )
+
+    for _decision in (
+        item for item in relevant
+        if item.get("kind") == "planned_test_surface" and item.get("provider") == path
+    ):
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_middleware"
+            ):
+                out.append(
+                    f"{path}:{node.lineno}: planned application-surface provider must "
+                    "not install middleware; the application factory owns middleware "
+                    "configuration exactly once"
+                )
+        cleanup_required = any(
+            item.get("kind") == "resource_lifecycle"
+            and item.get("cleanup_functions")
+            for item in relevant
+        )
+        if cleanup_required:
+            provider_classes = [
+                node for node in tree.body if isinstance(node, ast.ClassDef)
+            ]
+            stored_attrs: set[str] = set()
+            context_nodes: list[ast.AST] = []
+            for cls in provider_classes:
+                init = next((
+                    child for child in cls.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name == "__init__"
+                ), None)
+                if init is not None and any(
+                    arg.arg == "cleanup_callbacks"
+                    for arg in [*init.args.posonlyargs, *init.args.args, *init.args.kwonlyargs]
+                ):
+                    stored_attrs.update(
+                        target.attr
+                        for node in ast.walk(init)
+                        if isinstance(node, (ast.Assign, ast.AnnAssign))
+                        for target in (
+                            node.targets if isinstance(node, ast.Assign) else [node.target]
+                        )
+                        if isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                        and any(
+                            isinstance(value, ast.Name)
+                            and value.id == "cleanup_callbacks"
+                            for value in ast.walk(node.value)
+                        )
+                    )
+                method = next((
+                    child for child in cls.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name == "app_context"
+                ), None)
+                if method is None:
+                    continue
+
+                context_nodes.extend(_direct_body_nodes(method))
+            used_attrs = {
+                node.attr for node in context_nodes
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name) and node.value.id == "self"
+            }
+            loop_callbacks = {
+                node.target.id
+                for node in context_nodes
+                if isinstance(node, (ast.For, ast.AsyncFor))
+                and isinstance(node.target, ast.Name)
+                and any(
+                    isinstance(part, ast.Attribute) and part.attr in stored_attrs
+                    for part in ast.walk(node.iter)
+                )
+            }
+            invokes_cleanup = any(
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in loop_callbacks
+                for node in context_nodes
+            )
+            stores_callbacks = bool(stored_attrs and stored_attrs & used_attrs)
+            if not stores_callbacks or not invokes_cleanup:
+                out.append(
+                    f"{path}: app_context must store `cleanup_callbacks` supplied by the "
+                    "factory and invoke each callback when the context exits. Required "
+                    "shape: `__init__(..., cleanup_callbacks=())` stores "
+                    "`self._cleanup_callbacks = tuple(cleanup_callbacks)`; a "
+                    "`@contextmanager app_context(self)` finally-loop calls each stored "
+                    "callback. Do not put callbacks on app_context itself or a nested "
+                    "context-manager receiver"
+                )
+
     forbidden_attrs = {
         "app_context", "test_client", "test_cli_runner", "container",
-        "open_resource", "cli_runner", "instance_path",
+        "open_resource", "cli_runner", "instance_path", "testing",
     }
     if any(decision.get("kind") == "test_compatibility" for decision in relevant):
         # These Flask-shaped names are real capabilities of the deterministic facade;
@@ -399,21 +1318,263 @@ def framework_seam_violations(content: str, seam_plan: dict, path: str) -> list[
             "app_context", "test_client", "test_cli_runner", "instance_path",
         }
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in forbidden_attrs:
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in forbidden_attrs
+            and not valid_owned_receiver(node)
+        ):
             expr = ast.unparse(node)
+            if node.attr in owned_members:
+                out.append(
+                    f"{path}:{getattr(node, 'lineno', '?')}: owned capability `{expr}` "
+                    "is used on an unverified receiver; construct the frozen owner class "
+                    "and use the member on that instance"
+                )
+                continue
             out.append(
                 f"{path}:{getattr(node, 'lineno', '?')}: invented/Flask-only framework "
                 f"capability `{expr}` is forbidden by the seam plan"
             )
 
+    # Relative imports and imports under this repository's own package roots must resolve
+    # to either an original module or a frozen planned artifact. This catches the exact
+    # "useful compatibility-module shape, but file defined nowhere" failure before pytest.
+    known_modules = set(seam_plan.get("project_modules", []))
+    project_roots = set(seam_plan.get("project_roots", []))
+    for node in ast.walk(tree):
+        modules: list[str] = []
+        if isinstance(node, ast.ImportFrom):
+            resolved = _resolve_module(node.module, node.level, path)
+            if resolved:
+                modules.append(resolved)
+        elif isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        if isinstance(node, ast.ImportFrom) and node.level and node.module is None:
+            resolved = _resolve_module(None, node.level, path)
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if any(
+                    isinstance(part, ast.Attribute)
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == local
+                    for part in ast.walk(tree)
+                ):
+                    modules.append(f"{resolved}.{alias.name}".lstrip("."))
+        for module in modules:
+            is_project = bool(
+                module.split(".")[0] in project_roots
+                or isinstance(node, ast.ImportFrom) and node.level > 0
+            )
+            if is_project and module not in known_modules:
+                out.append(
+                    f"{path}:{getattr(node, 'lineno', '?')}: project module `{module}` "
+                    "is imported but neither exists in the source tree nor is owned by "
+                    "the frozen artifact plan"
+                )
+
     resource_decisions = [
         d for d in relevant
         if d.get("kind") == "resource_lifecycle" and d.get("module") == path
     ]
-    module_defs = {
-        node.name: node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "mixed_form_routes" and item.get("path") == path
+    ):
+        for route in decision.get("routes", []):
+            function = module_defs.get(route.get("function", ""))
+            if function is None:
+                continue
+            signature = function.args
+            if any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Name) and node.func.id == "Form"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "Form"
+                )
+                for node in ast.walk(signature)
+            ):
+                out.append(
+                    f"{path}:{function.lineno}: mixed GET+POST route "
+                    f"`{function.name}` must not require FastAPI Form parameters; "
+                    "parse request.form only inside its POST branch"
+                )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "request_hooks" and item.get("path") == path
+    ):
+        for hook in decision.get("hooks", []):
+            name = hook.get("function", "")
+            function = module_defs.get(name)
+            if function is None:
+                out.append(
+                    f"{path}: original pre-request hook `{name}` must remain as real "
+                    "FastAPI request wiring"
+                )
+                continue
+            wired = any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Name) and node.func.id == "Depends"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "Depends"
+                )
+                and node.args and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == name
+                for node in ast.walk(tree)
+            )
+            if not wired and set(decision.get("files", [])) <= {path}:
+                out.append(
+                    f"{path}:{function.lineno}: pre-request hook `{name}` is defined but "
+                    "not wired through Depends before route handlers"
+                )
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "ambient_context_runtime"
+    ):
+        runtime_providers = decision.get("runtime_providers", [])
+        test_providers = decision.get("test_providers", [])
+        if path in runtime_providers:
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_middleware"
+                ):
+                    out.append(
+                        f"{path}:{node.lineno}: ambient runtime provider must not install "
+                        "middleware; the application factory owns ordered installation"
+                    )
+            if not any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Name) and node.func.id == "ContextVar"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "ContextVar"
+                )
+                for node in ast.walk(tree)
+            ):
+                out.append(
+                    f"{path}: ambient runtime provider must own the shared ContextVar "
+                    "state used by request and test-context proxies"
+                )
+            runtime_classes = {
+                pin["symbol"] for pin in (manifest or {}).values()
+                if pin.get("module") == path and pin.get("target_kind") == "class"
+            }
+            for class_name in runtime_classes:
+                cls = next((
+                    node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == class_name
+                ), None)
+                if cls is not None and not any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in {"dispatch", "__call__"}
+                    for node in cls.body
+                ):
+                    out.append(
+                        f"{path}:{cls.lineno}: ambient context class `{class_name}` must "
+                        "implement request middleware (`dispatch` or `__call__`)"
+                    )
+        if path in test_providers and path not in runtime_providers:
+            imported_runtime = any(
+                isinstance(node, ast.ImportFrom)
+                and any(
+                    _resolve_module(node.module, node.level, path) in _module_names(provider)
+                    for provider in runtime_providers
+                )
+                for node in tree.body
+            )
+            owns_parallel_context = any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Name) and node.func.id == "ContextVar"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "ContextVar"
+                )
+                for node in ast.walk(tree)
+            )
+            if not imported_runtime or owns_parallel_context:
+                out.append(
+                    f"{path}: test-context provider must import/re-export the runtime "
+                    "provider's proxies and must not create parallel ContextVars"
+                )
+        if path in decision.get("factory_files", []):
+            runtime_classes = {
+                pin["symbol"] for pin in (manifest or {}).values()
+                if pin.get("module") in runtime_providers
+                and pin.get("target_kind") == "class"
+            }
+            middleware_calls = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_middleware" and node.args
+            ]
+            context_positions = [
+                node.lineno for node in middleware_calls
+                if isinstance(node.args[0], ast.Name)
+                and node.args[0].id in runtime_classes
+            ]
+            session_positions = [
+                node.lineno for node in middleware_calls
+                if isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "SessionMiddleware"
+            ]
+            constructor_orders = []
+            for keyword in (
+                keyword
+                for call in ast.walk(tree) if isinstance(call, ast.Call)
+                for keyword in call.keywords
+                if keyword.arg == "middleware"
+                and isinstance(keyword.value, (ast.List, ast.Tuple))
+            ):
+                contexts = [
+                    index for index, item in enumerate(keyword.value.elts)
+                    if isinstance(item, ast.Call) and item.args
+                    and isinstance(item.args[0], ast.Name)
+                    and item.args[0].id in runtime_classes
+                ]
+                sessions = [
+                    index for index, item in enumerate(keyword.value.elts)
+                    if isinstance(item, ast.Call) and item.args
+                    and isinstance(item.args[0], ast.Name)
+                    and item.args[0].id == "SessionMiddleware"
+                ]
+                constructor_orders.append((contexts, sessions))
+            constructor_context = any(contexts for contexts, _ in constructor_orders)
+            wrong_constructor_order = any(
+                contexts and sessions and max(sessions) >= min(contexts)
+                for contexts, sessions in constructor_orders
+            )
+            if runtime_classes and not context_positions and not constructor_context:
+                out.append(
+                    f"{path}: factory must install the frozen ambient-context owner "
+                    f"{sorted(runtime_classes)} as request middleware"
+                )
+            elif (
+                context_positions and session_positions
+                and max(context_positions) >= min(session_positions)
+                or wrong_constructor_order
+            ):
+                out.append(
+                    f"{path}: install ambient-context middleware before SessionMiddleware "
+                    "when using add_middleware so SessionMiddleware is outermost; with "
+                    "a constructor middleware list, put SessionMiddleware first"
+                )
+            for call in (
+                node for node in ast.walk(tree) if isinstance(node, ast.Call)
+            ):
+                for keyword in call.keywords:
+                    if (
+                        keyword.arg == "lifespan"
+                        and isinstance(keyword.value, ast.Attribute)
+                        and isinstance(keyword.value.value, ast.Name)
+                        and keyword.value.value.id in runtime_classes
+                    ):
+                        out.append(
+                            f"{path}:{call.lineno}: ambient request-context owner "
+                            f"`{keyword.value.value.id}` is middleware, not an "
+                            "application lifespan"
+                        )
+
     for decision in resource_decisions:
         function = module_defs.get(decision.get("symbol", ""))
         if function is None:
@@ -427,8 +1588,491 @@ def framework_seam_violations(content: str, seam_plan: dict, path: str) -> list[
                     f"helper reads `{node.id}`; pinned helpers must use module-owned "
                     "configuration and keep their no-context call shape"
                 )
+
+        if decision.get("context_cache_members"):
+            opens_directly = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                for node in ast.walk(function)
+            )
+            if opens_directly and not any(
+                isinstance(node, ast.If) for node in ast.walk(function)
+            ):
+                out.append(
+                    f"{decision['symbol']}:{function.lineno}: original helper cached a "
+                    "resource in the active context; an unconditional connect/open on "
+                    "every call breaks resource identity"
+                )
+            context_vars = {
+                target.id
+                for statement in tree.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and isinstance(statement.value, ast.Call)
+                and (
+                    isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == "ContextVar"
+                    or isinstance(statement.value.func, ast.Attribute)
+                    and statement.value.func.attr == "ContextVar"
+                )
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            connections = {
+                target.id
+                for statement in ast.walk(function)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and isinstance(statement.value.func.value, ast.Name)
+                and statement.value.func.value.id == "sqlite3"
+                and statement.value.func.attr == "connect"
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "set"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in context_vars
+                    and node.args and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in connections
+                ):
+                    out.append(
+                        f"{decision['symbol']}:{node.lineno}: do not store a live "
+                        "sqlite3 connection directly in ContextVar; cache it inside a "
+                        "mutable context-state mapping so cleanup in a copied request "
+                        "context clears the parent-visible entry"
+                    )
+
+        initializer_name = decision.get("initializer")
+        initializer = module_defs.get(initializer_name) if initializer_name else None
+        if initializer_name and initializer is None:
+            out.append(
+                f"{path}: resource provider must preserve initializer `{initializer_name}`"
+            )
+        elif initializer is not None:
+            argument_names = {
+                arg.arg for arg in [*initializer.args.posonlyargs, *initializer.args.args]
+            }
+            configured = {
+                node.slice.value
+                for node in ast.walk(initializer)
+                if isinstance(node, ast.Subscript)
+                and _is_state_config(node.value)
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            }
+            configured.update(
+                node.args[0].value
+                for node in ast.walk(initializer)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and _is_state_config(node.func.value)
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            )
+            if any(
+                (
+                    isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and (
+                        _is_state_config(node.value)
+                        or isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute)
+                        and node.value.func.attr == "copy"
+                        and _is_state_config(node.value.func.value)
+                    )
+                )
+                or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "update"
+                    and node.args and _is_state_config(node.args[0])
+                )
+                for node in ast.walk(initializer)
+            ):
+                configured.update(decision.get("config_keys", []))
+            missing = set(decision.get("config_keys", [])) - configured
+            if missing:
+                out.append(
+                    f"{path}:{initializer.lineno}: `{initializer_name}` must copy "
+                    f"configuration keys {sorted(missing)} from app.state.config"
+                )
+            cleanup_names = set(decision.get("cleanup_functions", []))
+            for node in ast.walk(initializer):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "append"
+                    and any(
+                        ast.unparse(node.func.value).startswith(f"{name}.state.")
+                        for name in argument_names
+                    )
+                    and node.args and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in cleanup_names
+                ):
+                    continue
+                out.append(
+                    f"{path}:{node.lineno}: provider initializer must not invent "
+                    "app.state cleanup storage; the frozen app facade owns this "
+                    f"cleanup callback `{node.args[0].id}`"
+                )
+            for node in ast.walk(initializer):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                parts = _attribute_path(node)
+                if len(parts) >= 2 and parts[-2] in argument_names and node.attr in {
+                    "cli", "config", "open_resource", "teardown_appcontext",
+                }:
+                    out.append(
+                        f"{path}:{node.lineno}: FastAPI provider initializer cannot use "
+                        f"Flask-only `{ast.unparse(node)}`; copy configuration only and "
+                        "keep CLI/context wiring separate"
+                    )
+
+        for cleanup_name in decision.get("cleanup_functions", []):
+            cleanup = module_defs.get(cleanup_name)
+            if cleanup is None:
+                out.append(
+                    f"{path}: context-cached resource must preserve cleanup function "
+                    f"`{cleanup_name}`"
+                )
+            elif not any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "close"
+                for node in ast.walk(cleanup)
+            ):
+                out.append(
+                    f"{path}:{cleanup.lineno}: cleanup function `{cleanup_name}` must "
+                    "close the cached resource"
+                )
+            elif decision.get("context_cache_members") and not any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    node.func.attr == "pop"
+                    or node.func.attr in {"set", "reset"} and node.args and (
+                        node.func.attr == "reset"
+                        or isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value is None
+                    )
+                )
+                or isinstance(node, (ast.Assign, ast.AnnAssign))
+                and isinstance(node.value, ast.Constant) and node.value.value is None
+                or isinstance(node, ast.Delete)
+                for node in ast.walk(cleanup)
+            ):
+                out.append(
+                    f"{path}:{cleanup.lineno}: cleanup function `{cleanup_name}` must "
+                    "clear the module-owned cached resource after closing it"
+                )
+
+        if decision.get("sqlite_cross_thread"):
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sqlite3" and node.func.attr == "connect"
+                ):
+                    continue
+                setting = next(
+                    (keyword.value for keyword in node.keywords
+                     if keyword.arg == "check_same_thread"),
+                    None,
+                )
+                if not (
+                    isinstance(setting, ast.Constant) and setting.value is False
+                ):
+                    out.append(
+                        f"{path}:{node.lineno}: sqlite3 connection used by FastAPI must "
+                        "set check_same_thread=False across dependency/endpoint execution"
+                    )
+
+        resource_files = set(decision.get("resource_files", []))
+        for with_node in (
+            node for node in ast.walk(tree) if isinstance(node, ast.With)
+        ):
+            for item in with_node.items:
+                call = item.context_expr
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "open"
+                    and call.args
+                    and isinstance(item.optional_vars, ast.Name)
+                ):
+                    continue
+                resource_arg = call.args[0]
+                if (
+                    isinstance(resource_arg, ast.Constant)
+                    and isinstance(resource_arg.value, str)
+                    and any(resource_arg.value.endswith(name) for name in resource_files)
+                ):
+                    out.append(
+                        f"{path}:{call.lineno}: package resource path must be resolved "
+                        "from __file__ (or importlib.resources), not the process cwd"
+                    )
+                mode_node = (
+                    call.args[1] if len(call.args) > 1 else
+                    next((kw.value for kw in call.keywords if kw.arg == "mode"), None)
+                )
+                binary = (
+                    isinstance(mode_node, ast.Constant)
+                    and isinstance(mode_node.value, str)
+                    and "b" in mode_node.value
+                )
+                decoded = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "decode"
+                    and isinstance(node.func.value, ast.Call)
+                    and isinstance(node.func.value.func, ast.Attribute)
+                    and node.func.value.func.attr == "read"
+                    and isinstance(node.func.value.func.value, ast.Name)
+                    and node.func.value.func.value.id == item.optional_vars.id
+                    for statement in with_node.body for node in ast.walk(statement)
+                )
+                if decoded and not binary:
+                    out.append(
+                        f"{path}:{call.lineno}: `{item.optional_vars.id}.read().decode(...)` "
+                        "requires opening the resource in binary mode"
+                    )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "resource_lifecycle"
+        and item.get("module") != path and item.get("dependency")
+    ):
+        refs = _imported_callable_refs(
+            decision["module"], decision["dependency"],
+        )
+        for call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in refs
+        ):
+            out.append(
+                f"{path}:{call.lineno}: yield dependency `{decision['dependency']}` "
+                "must be passed to Depends without calling it; ordinary code calls "
+                f"the pinned direct helper `{decision['symbol']}`"
+            )
+
+    session_decisions = [
+        decision for decision in relevant if decision.get("kind") == "session_runtime"
+    ]
+    if session_decisions:
+        imported_names: set[str] = set()
+        imported_modules: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == (
+                "starlette.middleware.sessions"
+            ):
+                imported_names.update(
+                    alias.asname or alias.name
+                    for alias in node.names if alias.name == "SessionMiddleware"
+                )
+            elif isinstance(node, ast.Import):
+                imported_modules.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "starlette.middleware.sessions"
+                )
+
+        def _session_middleware_ref(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Name) and node.id in imported_names
+            ) or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "SessionMiddleware"
+                and ast.unparse(node.value) in imported_modules
+            )
+
+        direct_instances = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _session_middleware_ref(node.func)
+        ]
+        for node in direct_instances:
+            out.append(
+                f"{path}:{node.lineno}: SessionMiddleware is ASGI middleware, not a "
+                "session/proxy object; install the class with app.add_middleware(...) "
+                "and expose request-backed session access separately"
+            )
+
+        factory_files = {
+            factory
+            for decision in session_decisions
+            for factory in decision.get("factory_files", [])
+        }
+        if path in factory_files:
+            installed = any(
+                isinstance(node, ast.Call)
+                and bool(node.args) and (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_middleware"
+                    and _session_middleware_ref(node.args[0])
+                    or ast.unparse(node.func).split(".")[-1] == "Middleware"
+                    and _session_middleware_ref(node.args[0])
+                )
+                for node in ast.walk(tree)
+            )
+            if not installed:
+                out.append(
+                    f"{path}: session runtime requires app.add_middleware("
+                    "SessionMiddleware, secret_key=...) or an equivalent constructor "
+                    "Middleware entry in the application factory"
+                )
+        provider_files = {
+            provider
+            for decision in session_decisions
+            for provider in decision.get("provider_files", [])
+        }
+        if path in provider_files:
+            has_request_session = any(
+                isinstance(node, ast.Attribute) and node.attr == "session"
+                for node in ast.walk(tree)
+            )
+            if not has_request_session:
+                out.append(
+                    f"{path}: session capability provider must read/mutate the active "
+                    "request.session mapping; response cookies are owned by SessionMiddleware"
+                )
+            original_cookie_writers = {
+                writer
+                for decision in session_decisions
+                for writer in decision.get("original_cookie_writer_files", [])
+            }
+            if path not in original_cookie_writers:
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"set_cookie", "delete_cookie"}
+                    ):
+                        out.append(
+                            f"{path}:{node.lineno}: session provider must mutate "
+                            "request.session, not synthesize raw response cookies"
+                        )
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "template_runtime"
+    ):
+        if path not in decision.get("provider_files", []):
+            continue
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and node.module in {"starlette.responses", "fastapi.responses"}
+            and any(alias.name == "TemplateResponse" for alias in node.names)
+            for node in tree.body
+        ):
+            out.append(
+                f"{path}: TemplateResponse is produced by a configured "
+                "Jinja2Templates instance; it is not importable from response modules"
+            )
+        request_args: set[str] = set()
+        for function_name in decision.get("provider_functions", {}).get(path, []):
+            function = module_defs.get(function_name)
+            if function is not None and _shape_facts(function)["required_positional"] > 2:
+                out.append(
+                    f"{path}:{function.lineno}: shared template helper `{function_name}` "
+                    "must keep template context optional; only request and template name "
+                    "may be required positional arguments"
+                )
+            if function is not None:
+                positional = [*function.args.posonlyargs, *function.args.args]
+                if positional:
+                    request_args.add(positional[0].arg)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "TemplateResponse":
+                out.append(
+                    f"{path}:{node.lineno}: call TemplateResponse through the configured "
+                    "Jinja2Templates instance"
+                )
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "TemplateResponse"
+            ):
+                continue
+            has_request_keyword = any(
+                keyword.arg == "request" for keyword in node.keywords
+            )
+            request_first = bool(
+                node.args and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in request_args
+            )
+            if not request_first and not has_request_keyword:
+                out.append(
+                    f"{path}:{node.lineno}: use request-first "
+                    "TemplateResponse(request, name, context); the old two-argument "
+                    "form emits a deprecation warning"
+                )
     for decision in (d for d in relevant if d.get("kind") == "standalone_cli"):
         commands = decision.get("commands", {})
+        command_bindings = decision.get("command_bindings", [])
+        for binding in (
+            item for item in command_bindings if item.get("module") == path
+        ):
+            command_function = module_defs.get(binding["function"])
+            if command_function is None:
+                continue  # interface-presence validation owns the missing-symbol message
+            decorator_names = {
+                decorator.args[0].value
+                for decorator in command_function.decorator_list
+                if isinstance(decorator, ast.Call)
+                and (
+                    isinstance(decorator.func, ast.Name)
+                    and decorator.func.id == "command"
+                    or isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "command"
+                )
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+                and isinstance(decorator.args[0].value, str)
+            }
+            if binding["name"] not in decorator_names:
+                out.append(
+                    f"{path}:{command_function.lineno}: `{binding['function']}` must "
+                    f"remain the real Click command named `{binding['name']}`"
+                )
+            called_names = {
+                node.func.id for node in ast.walk(command_function)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            missing_handlers = set(binding.get("handlers", [])) - called_names
+            if missing_handlers:
+                out.append(
+                    f"{path}:{command_function.lineno}: Click command must call original "
+                    f"module-level handlers {sorted(missing_handlers)} by name so "
+                    "monkeypatching remains observable"
+                )
+
+        if path in decision.get("factory_files", []):
+            forbidden_functions = {
+                binding["function"] for binding in command_bindings
+            }
+            used = {
+                node.id for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id in forbidden_functions
+            }
+            if used:
+                out.append(
+                    f"{path}: application factory must not own/register Click commands "
+                    f"{sorted(used)}; pass them only from test compatibility wiring"
+                )
         for node in ast.walk(tree):
             if (isinstance(node, ast.Attribute) and node.attr == "main"
                     and isinstance(node.value, ast.Name) and node.value.id in commands):
@@ -436,6 +2080,15 @@ def framework_seam_violations(content: str, seam_plan: dict, path: str) -> list[
                     f"{path}:{node.lineno}: low-level Click `{node.value.id}.main()` "
                     "raises/exits instead of returning the existing runner Result; use "
                     "click.testing.CliRunner.invoke"
+                )
+            if (
+                isinstance(node, ast.Attribute) and node.attr == "cli"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in {"app", "application"}
+            ):
+                out.append(
+                    f"{path}:{node.lineno}: FastAPI has no `{ast.unparse(node)}`; keep "
+                    "Click commands standalone and wire them only through the test facade"
                 )
             if (isinstance(node, ast.Attribute)
                     and isinstance(node.value, ast.Attribute)
@@ -539,15 +2192,51 @@ def framework_seam_violations(content: str, seam_plan: dict, path: str) -> list[
                     "Flask-compatible command dispatch; use adapted_app.test_cli_runner()"
                 )
         if any(decision.get("kind") == "standalone_cli" for decision in relevant):
-            has_commands = any(
-                any(keyword.arg == "commands" for keyword in call.keywords)
-                for call in adapter_calls
-            )
-            if not has_commands:
+            command_values = [
+                keyword.value
+                for call in adapter_calls for keyword in call.keywords
+                if keyword.arg == "commands"
+            ]
+            if not command_values:
                 out.append(
                     f"{path}: adapt_app must receive the real exported Click commands "
                     "so test_cli_runner().invoke(args=[command, ...]) can dispatch them"
                 )
+            assignments = {
+                target.id: node.value
+                for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+
+            def _command_mapping(value: ast.AST) -> dict[str, str]:
+                if isinstance(value, ast.Name) and value.id in assignments:
+                    value = assignments[value.id]
+                if not isinstance(value, ast.Dict):
+                    return {}
+                return {
+                    key.value: ast.unparse(item)
+                    for key, item in zip(value.keys, value.values, strict=True)
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+
+            mappings = [_command_mapping(value) for value in command_values]
+            for cli_decision in (
+                item for item in relevant if item.get("kind") == "standalone_cli"
+            ):
+                for binding in cli_decision.get("command_bindings", []):
+                    refs = _imported_callable_refs(
+                        binding["module"], binding["function"],
+                    )
+                    if not any(
+                        mapping.get(binding["name"]) in refs for mapping in mappings
+                    ):
+                        out.append(
+                            f"{path}: adapt_app commands must map `{binding['name']}` to "
+                            f"the real export {binding['module']}::{binding['function']}"
+                        )
     return list(dict.fromkeys(out))
 
 
@@ -603,14 +2292,25 @@ def contract_violations(
     caller-compatibility analysis; Verify owns that."""
     pins = [p for p in manifest.values() if p["module"] == path]
     caller_violations = caller_contract_violations(content, manifest, path)
-    seam_violations = framework_seam_violations(content, seam_plan or {}, path)
+    capability_violations = planned_capability_consumer_violations(
+        content, manifest, path,
+    )
+    seam_violations = framework_seam_violations(
+        content, seam_plan or {}, path, manifest,
+    )
+    topology_violations = planned_artifact_topology_violations(
+        content, manifest, path,
+    )
     try:
         tree = ast.parse(content)
     except SyntaxError as exc:
         return [f"{path} unparseable ({exc.msg} line {exc.lineno}) — generated file "
                 f"cannot satisfy its interface contract"]
     if not pins:
-        return [*caller_violations, *seam_violations]
+        return [
+            *caller_violations, *capability_violations, *seam_violations,
+            *topology_violations,
+        ]
     defined: dict[str, ast.stmt] = {}
     for node in _module_level_stmts(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -645,6 +2345,125 @@ def contract_violations(
             actual_kind = None  # an import re-export's underlying kind is unknowable here
         if expected_kind and actual_kind and actual_kind != expected_kind:
             out.append(f"{name}: target kind changed ({expected_kind} -> {actual_kind})")
+        if (
+            expected_kind == "variable"
+            and "test_context_surface" in p.get("capabilities", [])
+            and isinstance(node, (ast.Assign, ast.AnnAssign))
+        ):
+            value = node.value
+            local_function_alias = (
+                isinstance(value, ast.Name)
+                and isinstance(
+                    defined.get(value.id), (ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+            )
+            if value is None or local_function_alias or isinstance(
+                value, (ast.Constant, ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Lambda),
+            ):
+                out.append(
+                    f"{name}: test-context export must be a runtime-backed proxy, "
+                    "not a literal, function alias, or process-global container"
+                )
+
+        required_members = p.get("members", [])
+        if required_members:
+            if not isinstance(node, ast.ClassDef):
+                out.append(
+                    f"{name}: planned capability members {required_members} require a class"
+                )
+            else:
+                methods = {
+                    child.name: child for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                class_members = {*methods, *(
+                    child.name for child in node.body if isinstance(child, ast.ClassDef)
+                )}
+                assigned_members = {
+                    target.id
+                    for child in node.body if isinstance(child, ast.Assign)
+                    for target in child.targets if isinstance(target, ast.Name)
+                }
+                assigned_members.update(
+                    child.target.id for child in node.body
+                    if isinstance(child, ast.AnnAssign)
+                    and isinstance(child.target, ast.Name)
+                )
+                class_members.update(assigned_members)
+                init = next((
+                    child for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name == "__init__"
+                ), None)
+                if init is not None:
+                    positional = [*init.args.posonlyargs, *init.args.args]
+                    receiver = positional[0].arg if positional else "self"
+                    for child in ast.walk(init):
+                        targets: list[ast.expr] = []
+                        if isinstance(child, ast.Assign):
+                            targets = child.targets
+                        elif isinstance(child, ast.AnnAssign):
+                            targets = [child.target]
+                        initialized = {
+                            target.attr for target in targets
+                            if isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == receiver
+                        }
+                        assigned_members.update(initialized)
+                        class_members.update(initialized)
+                missing_members = set(required_members) - class_members
+                if missing_members:
+                    out.append(
+                        f"{name}: missing planned capability members "
+                        f"{sorted(missing_members)}"
+                    )
+                properties = {
+                    member for member, definition in methods.items()
+                    if any(
+                        isinstance(decorator, ast.Name) and decorator.id == "property"
+                        or isinstance(decorator, ast.Attribute)
+                        and decorator.attr == "property"
+                        for decorator in definition.decorator_list
+                    )
+                }
+                for member, shape in p.get("member_shapes", {}).items():
+                    if member not in class_members:
+                        continue
+                    if shape in {"method", "context_manager"} and (
+                        member not in methods or member in properties
+                    ):
+                        out.append(
+                            f"{name}.{member}: consumer calls this member; implement it "
+                            "as a method, not an attribute or property"
+                        )
+                    elif shape == "context_manager" and member in methods:
+                        method = methods[member]
+                        yields = any(
+                            isinstance(node, (ast.Yield, ast.YieldFrom))
+                            for node in ast.walk(method)
+                        )
+                        decorated = any(
+                            isinstance(decorator, ast.Name)
+                            and decorator.id in {"contextmanager", "asynccontextmanager"}
+                            or isinstance(decorator, ast.Attribute)
+                            and decorator.attr in {"contextmanager", "asynccontextmanager"}
+                            for decorator in method.decorator_list
+                        )
+                        if yields and not decorated:
+                            out.append(
+                                f"{name}.{member}: consumer enters this result with `with`; "
+                                "a generator implementation must use @contextmanager "
+                                "(or return a real context-manager object)"
+                            )
+                    elif shape == "attribute" and (
+                        member in methods and member not in properties
+                        and member not in assigned_members
+                    ):
+                        out.append(
+                            f"{name}.{member}: consumer reads this member without calling "
+                            "it; implement it as an attribute or property, not a method"
+                        )
 
         for extra in p.get("additional_exports", []):
             if extra not in defined:
@@ -670,7 +2489,18 @@ def contract_violations(
                 out.append(f"{name}: generator-ness changed (was "
                            f"{'generator' if orig['is_generator'] else 'plain'}) but "
                            f"the pin says keep the original shape")
-    return [*out, *caller_violations, *seam_violations]
+            if (
+                orig.get("returns_nested_function")
+                and not new["returns_nested_function"]
+            ):
+                out.append(
+                    f"{name}: no longer returns a locally defined wrapper/decorator "
+                    "function but the pin says keep the original shape"
+                )
+    return [
+        *out, *caller_violations, *capability_violations, *seam_violations,
+        *topology_violations,
+    ]
 
 
 def all_generation_violations(
@@ -678,9 +2508,51 @@ def all_generation_violations(
     oracle_entry: dict | None = None,
 ) -> list[str]:
     out = contract_violations(content, manifest, path, seam_plan)
+    out.extend(_undefined_global_violations(content, path))
     if oracle_entry is not None:
         out.extend(f"oracle: {item}" for item in oracle_violations(oracle_entry, content))
     return out
+
+
+def _undefined_global_violations(content: str, path: str) -> list[str]:
+    """Catch names that would deterministically raise at import or call time."""
+    try:
+        tree = ast.parse(content)
+        table = symtable.symtable(content, path, "exec")
+    except SyntaxError:
+        return []
+    if any(
+        isinstance(node, ast.ImportFrom)
+        and any(alias.name == "*" for alias in node.names)
+        for node in tree.body
+    ):
+        return []
+    bound = {
+        symbol.get_name() for symbol in table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    tables = [table]
+    for current in tables:
+        tables.extend(current.get_children())
+        bound.update(
+            symbol.get_name() for symbol in current.get_symbols()
+            if symbol.is_global() and symbol.is_assigned()
+        )
+    allowed = {
+        *dir(builtins), "__annotations__", "__builtins__", "__file__", "__loader__",
+        "__name__", "__package__", "__spec__",
+    }
+    undefined = sorted({
+        symbol.get_name()
+        for current in tables
+        for symbol in current.get_symbols()
+        if symbol.is_referenced() and symbol.is_global()
+        and symbol.get_name() not in bound | allowed
+    })
+    return [
+        f"{path}: undefined global name `{name}`; import or define it"
+        for name in undefined
+    ]
 
 
 def _pick_draft(content1: str, broken1: list[str], content2: str,
@@ -725,11 +2597,17 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
                         verify_errors: str, prior_attempt: str = "",
                         manifest: dict | None = None,
                         consumed: set[str] | None = None,
-                        seam_plan: dict | None = None) -> tuple[str, dict]:
+                        seam_plan: dict | None = None,
+                        planned_file: PlannedFile | None = None,
+                        source_override: str | None = None) -> tuple[str, dict]:
     """Call the model for one file; return (migrated content, usage) — content not yet
     written. Usage feeds the attempts_log entry (cost-per-migration is an eval metric)."""
-    source = scrub(read_file(worktree, path, limit=20000) or "")
-    planned = PlannedFile(path=path, role=role, subtasks=subtasks)
+    source = scrub(
+        source_override
+        if source_override is not None
+        else read_file(worktree, path, limit=20000) or ""
+    )
+    planned = planned_file or PlannedFile(path=path, role=role, subtasks=subtasks)
     user = recipe.build_user_prompt(file=planned, source=source, context=context)
     # R1: the frozen target-interface manifest, stated explicitly as DEFINES/CALLS.
     # Cross-file naming/shape breaks are a measured top failure mode (corpus finding
@@ -764,7 +2642,10 @@ async def _migrate_file(recipe, worktree: str, *, path: str, role: str, model: s
         "completion_tokens": resp.completion_tokens,
         "cost_usd": round(resp.cost_usd, 6),
     }
-    return extract_code(resp.text), usage
+    content = extract_code(resp.text)
+    if normalizer := getattr(recipe, "normalize_generated", None):
+        content = normalizer(path, content, seam_plan)
+    return content, usage
 
 
 async def _migrate_cluster(
@@ -802,19 +2683,101 @@ async def _migrate_cluster(
         "completion_tokens": resp.completion_tokens,
         "cost_usd": round(resp.cost_usd, 6),
     }
-    return extract_cluster_files(resp.text, [file.path for file in planned_files]), usage
+    try:
+        contents = extract_cluster_files(
+            resp.text, [file.path for file in planned_files],
+        )
+    except ValueError as exc:
+        raise ClusterOutputError(str(exc), usage) from exc
+    if normalizer := getattr(recipe, "normalize_generated", None):
+        contents = {
+            path: normalizer(path, content, seam_plan)
+            for path, content in contents.items()
+        }
+    return contents, usage
 
 
 def _cluster_violations(
     contents: dict[str, str], manifest: dict[str, dict], seam_plan: dict,
     oracle_manifest: dict,
 ) -> dict[str, list[str]]:
-    return {
+    broken = {
         path: broken for path, content in contents.items()
         if (broken := all_generation_violations(
             content, manifest, path, seam_plan, oracle_manifest.get(path),
         ))
     }
+    trees = {}
+    for path, content in contents.items():
+        try:
+            trees[path] = ast.parse(content)
+        except SyntaxError:
+            trees[path] = None
+    for decision in seam_plan.get("decisions", {}).values():
+        if decision.get("kind") != "request_hooks":
+            continue
+        files = set(decision.get("files", []))
+        if not files or not files <= set(contents):
+            continue
+        for hook in decision.get("hooks", []):
+            name = hook.get("function", "")
+            wired = any(
+                tree is not None and any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, (ast.Name, ast.Attribute))
+                    and (
+                        isinstance(node.func, ast.Name) and node.func.id == "Depends"
+                        or isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "Depends"
+                    )
+                    and node.args and ast.unparse(node.args[0]).split(".")[-1] == name
+                    for node in ast.walk(tree)
+                )
+                for tree in trees.values()
+            )
+            if not wired:
+                owner = decision.get("path", sorted(files)[0])
+                broken.setdefault(owner, []).append(
+                    f"{owner}: pre-request hook `{name}` is not wired through Depends "
+                    "in its frozen provider/consumer cut"
+                )
+                continue
+            if hook.get("scope") != "before_app_request":
+                continue
+            globally_wired = any(
+                candidate_path != decision.get("path")
+                and tree is not None
+                and any(
+                    isinstance(statement, (ast.Assign, ast.AnnAssign))
+                    and isinstance(statement.value, ast.Call)
+                    and any(
+                        keyword.arg == "dependencies"
+                        and any(
+                            isinstance(call, ast.Call)
+                            and isinstance(call.func, (ast.Name, ast.Attribute))
+                            and (
+                                isinstance(call.func, ast.Name)
+                                and call.func.id == "Depends"
+                                or isinstance(call.func, ast.Attribute)
+                                and call.func.attr == "Depends"
+                            )
+                            and call.args
+                            and ast.unparse(call.args[0]).split(".")[-1] == name
+                            for call in ast.walk(keyword.value)
+                        )
+                        for keyword in statement.value.keywords
+                    )
+                    for statement in ast.walk(tree)
+                )
+                for candidate_path, tree in trees.items() if candidate_path in files
+            )
+            if not globally_wired:
+                owner = decision.get("path", sorted(files)[0])
+                broken.setdefault(owner, []).append(
+                    f"{owner}: before_app_request hook `{name}` must be a global "
+                    "application dependency, not scoped to one included router"
+                )
+    return broken
 
 
 def _choose_cluster_draft(
@@ -900,13 +2863,29 @@ def expand_to_verifiable_batch(
     ]
 
 
+def runtime_contract_repair_attempt(task, target: str) -> int | None:
+    """Return the next separate repair ordinal when this task is the unique target."""
+    if not target or task.target_path != target:
+        return None
+    return 1 + sum(
+        entry.get("action") == "contract_repair"
+        and entry.get("scope") == "runtime_targeted"
+        for entry in task.attempts_log
+    )
+
+
+def is_initial_cluster(paths: list[str], tasks_by_path: dict) -> bool:
+    """Only untouched tasks are safe to generate as one coordinated draft."""
+    return all(tasks_by_path[path].attempts == 0 for path in paths)
+
+
 async def _execute_initial_cluster(
     *, recipe, unit: dict, tasks_by_path: dict, original_planned: dict[str, PlannedFile],
     worktree: str, binding_root: str, target_paths: set[str], done_paths: set[str],
     manifest: dict, seam_plan: dict, fault: str | None, first_path: str | None,
     delay: int, verify_errors: str, oracle_manifest: dict,
 ) -> float:
-    """Coordinated generation for a seam; retries keep every active member coherent."""
+    """Generate an untouched seam in one coordinated call."""
     paths = unit["paths"]
     members = [tasks_by_path[path] for path in paths]
     planned_files = [original_planned[path] for path in paths]
@@ -938,6 +2917,8 @@ async def _execute_initial_cluster(
             worktree, cluster_paths=set(paths), target_paths=target_paths,
             done_paths=done_paths,
         )
+        if not any(file.role == "test_harness" for file in planned_files):
+            context.pop(getattr(recipe, "test_compat_path", ""), None)
         prior_diffs = [
             entry.get("failing_diff", "")
             for task in members
@@ -950,12 +2931,39 @@ async def _execute_initial_cluster(
                 "\n\nPREVIOUS REJECTED MEMBER DIFFS — coordinate the correction:\n"
                 + "\n\n".join(prior_diffs[:len(members)])
             )
-        contents, usage = await _migrate_cluster(
-            recipe, planned_files=planned_files, sources=sources, context=context,
-            model=model, manifest=manifest, seam_plan=seam_plan,
-            binding_root=binding_root, verify_errors=feedback,
-        )
-        call_cost = usage.get("cost_usd", 0.0)
+        try:
+            contents, usage = await _migrate_cluster(
+                recipe, planned_files=planned_files, sources=sources, context=context,
+                model=model, manifest=manifest, seam_plan=seam_plan,
+                binding_root=binding_root, verify_errors=feedback,
+            )
+            call_cost = usage.get("cost_usd", 0.0)
+        except ClusterOutputError as exc:
+            usage = exc.usage
+            call_cost = usage.get("cost_usd", 0.0)
+            await task_store.update_task(coordinator.id, amend_last_attempt=usage)
+            await task_store.update_task(
+                coordinator.id,
+                append_attempt={
+                    "attempt": attempt,
+                    "tier": tier,
+                    "model": model_label,
+                    "action": "format_repair",
+                    "cluster_id": unit["id"],
+                    "violations": [str(exc)],
+                    "at": _now(),
+                },
+            )
+            contents, usage = await _migrate_cluster(
+                recipe, planned_files=planned_files, sources=sources, context=context,
+                model=model, manifest=manifest, seam_plan=seam_plan,
+                binding_root=binding_root,
+                verify_errors=(
+                    feedback + "\n\nINVALID OUTPUT FORMAT: " + str(exc)
+                    + "\nReturn every requested file exactly once."
+                ),
+            )
+            call_cost += usage.get("cost_usd", 0.0)
         broken = _cluster_violations(contents, manifest, seam_plan, oracle_manifest)
         if broken:
             await task_store.update_task(coordinator.id, amend_last_attempt=usage)
@@ -990,22 +2998,108 @@ async def _execute_initial_cluster(
                     model=model, manifest=manifest, seam_plan=seam_plan,
                     binding_root=binding_root, verify_errors=repair_errors,
                 )
-                contents, _ = _choose_cluster_draft(
+                contents, remaining = _choose_cluster_draft(
                     contents, broken, repaired, manifest, seam_plan, oracle_manifest,
                 )
             except ValueError:
                 log.warning("cluster repair output invalid for %s — keeping first draft",
                             unit["id"])
                 usage2 = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
+                remaining = broken
             await task_store.update_task(coordinator.id, amend_last_attempt=usage2)
             call_cost += usage2.get("cost_usd", 0.0)
+            if remaining:
+                flattened = [
+                    f"{path}: {violation}"
+                    for path, violations in remaining.items()
+                    for violation in violations
+                ]
+                await task_store.update_task(
+                    coordinator.id,
+                    append_attempt={
+                        "attempt": attempt,
+                        "repair_attempt": 2,
+                        "tier": tier,
+                        "model": model_label,
+                        "action": "contract_repair",
+                        "cluster_id": unit["id"],
+                        "violations": flattened[:20],
+                        "at": _now(),
+                    },
+                )
+                rejected = "\n\n".join(
+                    f"<<<PORTAGE_FILE:{path}>>>\n```python\n{content[:12000]}\n```\n"
+                    "<<<PORTAGE_END_FILE>>>"
+                    for path, content in contents.items()
+                )
+                try:
+                    if len(remaining) == 1:
+                        repair_path = next(iter(remaining))
+                        planned_file = next(
+                            file for file in planned_files if file.path == repair_path
+                        )
+                        repaired_content, usage3 = await _migrate_file(
+                            recipe, binding_root, path=repair_path,
+                            role=planned_file.role, model=model,
+                            subtasks=planned_file.subtasks,
+                            context={
+                                **context,
+                                **{
+                                    path: content for path, content in contents.items()
+                                    if path != repair_path
+                                },
+                            },
+                            verify_errors=(
+                                "SECOND AND FINAL CONTRACT REPAIR. VIOLATIONS:\n- "
+                                + "\n- ".join(flattened)
+                            ),
+                            manifest=manifest,
+                            consumed=_consumed_manifest_keys(
+                                binding_root, repair_path, manifest,
+                            ),
+                            seam_plan=seam_plan,
+                            planned_file=planned_file,
+                            source_override=contents[repair_path],
+                        )
+                        repaired = {**contents, repair_path: repaired_content}
+                    else:
+                        repaired, usage3 = await _migrate_cluster(
+                            recipe, planned_files=planned_files, sources=sources,
+                            context=context, model=model, manifest=manifest,
+                            seam_plan=seam_plan, binding_root=binding_root,
+                            verify_errors=(
+                                "SECOND AND FINAL CONTRACT REPAIR. VIOLATIONS:\n- "
+                                + "\n- ".join(flattened)
+                                + "\n\nCURRENT REJECTED DRAFT:\n" + rejected
+                            ),
+                        )
+                    contents, _ = _choose_cluster_draft(
+                        contents, remaining, repaired, manifest, seam_plan,
+                        oracle_manifest,
+                    )
+                except ValueError:
+                    log.warning(
+                        "second cluster repair output invalid for %s — keeping best draft",
+                        unit["id"],
+                    )
+                    usage3 = {
+                        "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0,
+                    }
+                await task_store.update_task(
+                    coordinator.id, amend_last_attempt=usage3,
+                )
+                call_cost += usage3.get("cost_usd", 0.0)
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
 
         if _should_corrupt(fault, path=paths[0], first_path=first_path,
                            attempt=attempt, tier=tier):
             contents[paths[0]] += _FAULT_PAYLOAD
-        for index, (task, path) in enumerate(zip(members, paths, strict=True)):
+        for index, (task, path, planned_file) in enumerate(zip(
+            members, paths, planned_files, strict=True,
+        )):
             h = write_file(worktree, path, contents[path])
+            if planned_file.action == "create":
+                await run_git("add", "-N", "--", path, cwd=worktree)
             diff = await file_diff(worktree, path)
             await task_store.update_task(
                 task.id, status=TaskStatus.done.value, content_hash=h, diff=diff,
@@ -1044,7 +3138,7 @@ async def execute_node(state: GraphState) -> GraphState:
     first_path = next((
         task.target_path for task in file_tasks
         if task.type != "test_compat"
-        and strategies.get(task.target_path) not in {"adapter", "unchanged"}
+        and strategies.get(task.target_path) not in NON_REWRITE_TEST_STRATEGIES
     ), None)
     log.info("EXECUTE node | job=%s tasks=%s pending=%s fault=%s", job_id, len(file_tasks),
              sum(t.status == TaskStatus.pending.value for t in file_tasks), fault or "-")
@@ -1053,21 +3147,30 @@ async def execute_node(state: GraphState) -> GraphState:
     # ceiling stops migrating and skips the remaining tasks — the run finishes with an
     # honest red report instead of draining the demo's LLM quota.
     ceiling = settings.job_cost_ceiling_usd
-    spent = sum(
-        a.get("cost_usd", 0.0) for t in file_tasks for a in t.attempts_log
-    )
+    spent = sum(a.get("cost_usd", 0.0) for t in tasks for a in t.attempts_log)
 
     # R1: the frozen target-interface manifest built at Plan time.
     manifest = state.get("interface_manifest") or {}
     seam_plan = state.get("seam_plan") or {}
     oracle_manifest = state.get("oracle_manifest") or {}
     test_strategy = strategies
+    test_normalizations = state.get("test_normalizations") or {}
     unsupported_test_seams = list(state.get("unsupported_test_seams") or [])
     # Persisted subtasks intentionally store stable ids/titles only. Rehydrate their full
     # recipe instructions from the ORIGINAL workspace plan; reconstructing them with an
     # empty instruction silently discarded the recipe's most valuable guidance.
     original_files = iter_py_files(state.get("workspace") or worktree)
     original_planned = {pf.path: pf for pf in recipe.plan_files(original_files)}
+    original_planned.update({
+        pf.path: pf for pf in artifact_planned_files(state.get("artifact_plan") or [])
+    })
+    artifact_renderer = getattr(recipe, "render_created_artifact", None)
+    deterministic_artifacts = {
+        path: content
+        for path, planned_file in original_planned.items()
+        if planned_file.action == "create" and artifact_renderer is not None
+        and (content := artifact_renderer(planned_file, worktree)) is not None
+    }
     compat_module = (state.get("test_compat_path") or "_portage_fastapi_test_compat.py")
     compat_module = compat_module.removesuffix(".py").replace("/", ".")
     for path, strategy in test_strategy.items():
@@ -1094,6 +3197,7 @@ async def execute_node(state: GraphState) -> GraphState:
         )
     binding_root = state.get("workspace") or worktree
     tasks_by_path = {t.target_path: t for t in file_tasks if t.target_path}
+    contract_repair_owner = state.get("contract_repair_owner") or ""
     active_units = {
         unit["paths"][0]: unit
         for unit in seam_plan.get("units", [])
@@ -1104,15 +3208,24 @@ async def execute_node(state: GraphState) -> GraphState:
                 for path in unit["paths"])
         and all(tasks_by_path[path].status != TaskStatus.skipped.value
                 for path in unit["paths"])
-        and (
-            max(tasks_by_path[path].attempts for path in unit["paths"])
-            < settings.max_task_attempts
-            or state.get("recover_source") == "integrate"
-        )
+        and not any(path in deterministic_artifacts for path in unit["paths"])
+        and contract_repair_owner not in unit["paths"]
+        and is_initial_cluster(unit["paths"], tasks_by_path)
     }
     units = list(active_units.values())
+    # Executable cuts own verification boundaries. Small cuts normally overlap one
+    # coordinated generation unit; large cuts deliberately remain sequential generation
+    # inside one batch until bounded component recovery lands. Retain any legacy recipe
+    # unit not covered by the analyzer for other recipes/backward-compatible checkpoints.
+    schedule_units = list(seam_plan.get("execution_cuts", []))
+    covered = [set(unit.get("paths", [])) for unit in schedule_units]
+    for unit in units:
+        paths = set(unit.get("paths", []))
+        if paths and not any(paths & existing for existing in covered):
+            schedule_units.append(unit)
+            covered.append(paths)
     batch_paths = expand_to_verifiable_batch(
-        file_tasks, units, select_execution_batch(file_tasks, units),
+        file_tasks, schedule_units, select_execution_batch(file_tasks, schedule_units),
     )
     batch_path_set = set(batch_paths)
     batch_tests = sorted({
@@ -1120,6 +3233,21 @@ async def execute_node(state: GraphState) -> GraphState:
         for task in file_tasks if task.target_path in batch_path_set
         for test in task.verify_spec.get("affected_tests", [])
     })
+    checkpoint = state.get("current_batch_checkpoint") or load_cut_checkpoint(worktree)
+    if batch_paths and not (
+        checkpoint and set(batch_paths) <= set(checkpoint.get("paths", []))
+    ):
+        checkpoint = create_cut_checkpoint(
+            worktree,
+            batch_paths,
+            {
+                path: {
+                    "status": tasks_by_path[path].status,
+                    "action": tasks_by_path[path].verify_spec.get("action", "rewrite"),
+                }
+                for path in batch_paths
+            },
+        )
     log.info("EXECUTE batch | job=%s paths=%s tests=%s", job_id, batch_paths, batch_tests)
     if state.get("diagnostic_repair_requested") and batch_paths:
         coordinator = tasks_by_path[batch_paths[0]]
@@ -1264,6 +3392,40 @@ async def execute_node(state: GraphState) -> GraphState:
             log.info("  generated deterministic test adapter %s", path)
             continue
 
+        if path in deterministic_artifacts:
+            generated = deterministic_artifacts[path]
+            broken = all_generation_violations(
+                generated, manifest, path, seam_plan, oracle_manifest.get(path),
+            )
+            if broken:
+                raise ValueError(
+                    f"recipe renderer produced invalid {path}: {'; '.join(broken)}"
+                )
+            attempt = t.attempts + 1
+            await task_store.update_task(
+                t.id, status=TaskStatus.running.value, attempts=attempt,
+                cascade_subtasks=True,
+                append_attempt={
+                    "attempt": attempt, "tier": "deterministic", "model": "none",
+                    "action": "deterministic_artifact", "at": _now(),
+                },
+            )
+            if _should_corrupt(
+                fault, path=path, first_path=first_path, attempt=attempt,
+                tier="deterministic",
+            ):
+                generated += _FAULT_PAYLOAD
+            h = write_file(worktree, path, generated)
+            await run_git("add", "-N", "--", path, cwd=worktree)
+            diff = await file_diff(worktree, path)
+            await task_store.update_task(
+                t.id, status=TaskStatus.done.value, content_hash=h, diff=diff,
+                cascade_subtasks=True,
+            )
+            done_paths.add(path)
+            log.info("  generated deterministic artifact %s", path)
+            continue
+
         strategy = test_strategy.get(path)
         if t.type == "test_harness" and strategy in {"adapter", "unchanged"}:
             # These tests are the behavioral oracle. The generated adapter plus the
@@ -1283,9 +3445,47 @@ async def execute_node(state: GraphState) -> GraphState:
             log.info("  preserved oracle test %s (strategy=%s)", path, strategy)
             continue
 
+        if t.type == "test_harness" and strategy == "sanctioned_normalization":
+            normalization = test_normalizations.get(path)
+            if not normalization:
+                raise ValueError(f"missing frozen sanctioned normalization for {path}")
+            attempt = t.attempts + 1
+            audit = [
+                {
+                    "line": replacement["line"],
+                    "symbols": replacement.get("symbols", []),
+                    "target_module": normalization["target_module"],
+                }
+                for replacement in normalization.get("replacements", [])
+            ]
+            await task_store.update_task(
+                t.id, status=TaskStatus.running.value, attempts=attempt,
+                cascade_subtasks=True,
+                append_attempt={
+                    "attempt": attempt,
+                    "tier": "deterministic",
+                    "model": "none",
+                    "action": "sanctioned_normalization",
+                    "normalizations": audit,
+                    "at": _now(),
+                },
+            )
+            generated = apply_sanctioned_normalizations(
+                current, normalization.get("replacements", []),
+            )
+            h = write_file(worktree, path, generated)
+            diff = await file_diff(worktree, path)
+            await task_store.update_task(
+                t.id, status=TaskStatus.done.value, content_hash=h, diff=diff,
+                cascade_subtasks=True,
+            )
+            done_paths.add(path)
+            log.info("  applied sanctioned test normalization %s: %s", path, audit)
+            continue
+
         if t.type == "test_harness" and strategy == "unsupported_test_seam":
             detail = {"path": path, "reason": "unsupported Flask test seam"}
-            if detail not in unsupported_test_seams:
+            if not any(seam.get("path") == path for seam in unsupported_test_seams):
                 unsupported_test_seams.append(detail)
             await task_store.update_task(
                 t.id, status=TaskStatus.skipped.value, cascade_subtasks=True,
@@ -1294,13 +3494,34 @@ async def execute_node(state: GraphState) -> GraphState:
             )
             continue
 
-        attempt = t.attempts + 1
-        tier, model, model_label = _tier_for(attempt)
-        await task_store.update_task(
-            t.id, status=TaskStatus.running.value, attempts=attempt, cascade_subtasks=True,
-            append_attempt={"attempt": attempt, "tier": tier, "model": model_label,
-                            "action": "migrate", "at": _now()},
-        )
+        repair_attempt = runtime_contract_repair_attempt(t, contract_repair_owner)
+        if repair_attempt is not None:
+            # Model escalation still reflects all preceding generation work, but the
+            # ordinary task-attempt counter is intentionally not incremented. Recover
+            # owns a separate, bounded allowance for this uniquely attributed repair.
+            attempt = t.attempts
+            tier, model, model_label = _tier_for(t.attempts + repair_attempt)
+            await task_store.update_task(
+                t.id, status=TaskStatus.running.value, cascade_subtasks=True,
+                append_attempt={
+                    "attempt": attempt,
+                    "repair_attempt": repair_attempt,
+                    "tier": tier,
+                    "model": model_label,
+                    "action": "contract_repair",
+                    "scope": "runtime_targeted",
+                    "at": _now(),
+                },
+            )
+        else:
+            attempt = t.attempts + 1
+            tier, model, model_label = _tier_for(attempt)
+            await task_store.update_task(
+                t.id, status=TaskStatus.running.value, attempts=attempt,
+                cascade_subtasks=True,
+                append_attempt={"attempt": attempt, "tier": tier, "model": model_label,
+                                "action": "migrate", "at": _now()},
+            )
         if delay:
             log.info("  EXECUTE pre-migrate delay %ss (kill window) | job=%s task=%s",
                      delay, job_id, path)
@@ -1309,6 +3530,8 @@ async def execute_node(state: GraphState) -> GraphState:
         try:
             context = _gather_context(worktree, current=path, target_paths=target_paths,
                                       done_paths=done_paths)
+            if t.type != "test_harness":
+                context.pop(getattr(recipe, "test_compat_path", ""), None)
             planned_file = original_planned.get(path)
             subtasks = (planned_file.subtasks if planned_file else
                         [Subtask(s.type, s.title, "") for s in t.subtasks])
@@ -1322,7 +3545,7 @@ async def execute_node(state: GraphState) -> GraphState:
                 recipe, worktree, path=path, role=t.type, model=model,
                 subtasks=subtasks, context=context, verify_errors=verify_errors,
                 prior_attempt=prior, manifest=manifest, consumed=consumed,
-                seam_plan=seam_plan,
+                seam_plan=seam_plan, planned_file=planned_file,
             )
             call_cost = usage.get("cost_usd", 0.0)
             broken = all_generation_violations(
@@ -1353,6 +3576,7 @@ async def execute_node(state: GraphState) -> GraphState:
                     subtasks=subtasks, context=context,
                     verify_errors=verify_errors + repair_note, prior_attempt=prior,
                     manifest=manifest, consumed=consumed, seam_plan=seam_plan,
+                    planned_file=planned_file,
                 )
                 await task_store.update_task(t.id, amend_last_attempt=usage2)
                 call_cost += usage2.get("cost_usd", 0.0)
@@ -1360,10 +3584,43 @@ async def execute_node(state: GraphState) -> GraphState:
                 # valid; among parseable candidates fewer violations wins, tie -> the
                 # repair (it saw the feedback). v1 kept draft 1 on persistent violation —
                 # wrong; an unparseable repair unconditionally winning on count was F1.
-                content, _ = _pick_draft(
+                content, remaining = _pick_draft(
                     content, broken, content2, manifest, path, seam_plan,
                     oracle_manifest.get(path),
                 )
+                if remaining:
+                    await task_store.update_task(
+                        t.id,
+                        append_attempt={
+                            "attempt": attempt,
+                            "repair_attempt": 2,
+                            "tier": tier,
+                            "model": model_label,
+                            "action": "contract_repair",
+                            "at": _now(),
+                            "violations": remaining[:10],
+                        },
+                    )
+                    repair_note = (
+                        "\n\nSECOND AND FINAL CONTRACT REPAIR. THE CURRENT DRAFT STILL "
+                        "VIOLATES:\n- " + "\n- ".join(remaining)
+                        + "\n\nCurrent rejected draft:\n```python\n"
+                        + content[:12000] + "\n```\nReturn the corrected COMPLETE file; "
+                        "fix these violations and change nothing else."
+                    )
+                    content3, usage3 = await _migrate_file(
+                        recipe, worktree, path=path, role=t.type, model=model,
+                        subtasks=subtasks, context=context,
+                        verify_errors=verify_errors + repair_note,
+                        prior_attempt=prior, manifest=manifest, consumed=consumed,
+                        seam_plan=seam_plan, planned_file=planned_file,
+                    )
+                    await task_store.update_task(t.id, amend_last_attempt=usage3)
+                    call_cost += usage3.get("cost_usd", 0.0)
+                    content, _ = _pick_draft(
+                        content, remaining, content3, manifest, path, seam_plan,
+                        oracle_manifest.get(path),
+                    )
                 usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
                 # both calls' usage is already amended onto their own log entries; the
                 # done-update below must not double-amend (zeroed usage = no-op amend)
@@ -1373,6 +3630,8 @@ async def execute_node(state: GraphState) -> GraphState:
                             fault, path, attempt, tier)
                 content += _FAULT_PAYLOAD
             h = write_file(worktree, path, content)
+            if planned_file and planned_file.action == "create":
+                await run_git("add", "-N", "--", path, cwd=worktree)
             diff = await file_diff(worktree, path)
             await task_store.update_task(
                 t.id, status=TaskStatus.done.value, content_hash=h, diff=diff,
@@ -1410,10 +3669,12 @@ async def execute_node(state: GraphState) -> GraphState:
         "diff": diff,
         "last_verify_errors": "",  # consumed
         "diagnostic_repair_requested": False,
+        "contract_repair_owner": "",
         "unsupported_test_seams": unsupported_test_seams,
         "oracle_results": batch_oracle_results,
         "current_batch_paths": batch_paths,
         "current_batch_tests": batch_tests,
+        "current_batch_checkpoint": checkpoint,
         "has_pending_tasks": has_pending_tasks,
         "step_log": ["execute"],
     }

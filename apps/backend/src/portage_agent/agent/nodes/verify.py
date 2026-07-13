@@ -21,13 +21,15 @@ from portage_agent.config import settings
 from portage_agent.sandbox import DockerSandbox, parse_junit_xml
 
 from ..state import GraphState
-from .common import read_file, worktree_diff, write_file
+from .common import discard_cut_checkpoint, read_file, worktree_diff, write_file
 
 log = logging.getLogger("portage.agent")
 
 _REPORT_FILE = ".portage-report.xml"
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-_VOLATILE = re.compile(r"(?:(?<=line )\d+|\b\d+(?:\.\d+)?s\b|/tmp/[^\s:]+)")
+_VOLATILE = re.compile(
+    r"(?:(?<=line )\d+|\b\d+(?:\.\d+)?s\b|0x[0-9a-fA-F]+|/tmp/[^\s:]+)"
+)
 
 
 def failure_fingerprint(output: str, diff: str, batch_paths: list[str]) -> str:
@@ -151,7 +153,12 @@ async def verify_node(state: GraphState) -> GraphState:
         "recover_source": "verify",
         "step_log": ["verify"],
     }
-    if passed and migrate:
+    restoring = bool(state.get("cut_restore_pending_verification"))
+    if passed:
+        discard_cut_checkpoint(state.get("current_batch_checkpoint") or {})
+        out["current_batch_checkpoint"] = {}
+        out["cut_restore_pending_verification"] = False
+    if passed and migrate and not restoring:
         out["verified_batches"] = [{
             "paths": list(state.get("current_batch_paths") or []),
             "tests": targets,

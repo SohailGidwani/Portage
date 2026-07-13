@@ -148,6 +148,7 @@ async def update_task(
     content_hash: str | None = None,
     diff: str | None = None,
     error: str | None = None,
+    verify_spec: dict | None = None,
     append_attempt: dict | None = None,
     amend_last_attempt: dict | None = None,
     cascade_subtasks: bool = False,
@@ -171,6 +172,8 @@ async def update_task(
             task.diff = diff
         if error is not None:
             task.error = error
+        if verify_spec is not None:
+            task.verify_spec = verify_spec
         if append_attempt is not None:
             task.attempts_log = [*(task.attempts_log or []), append_attempt]
         if amend_last_attempt is not None and task.attempts_log:
@@ -231,3 +234,29 @@ async def append_tasks(job_id: uuid.UUID, specs: list[dict]) -> list[TaskSnapsho
                 )
         snapshots = await _load(session, job_id)
     return snapshots
+
+
+async def ensure_architect_task(job_id: uuid.UUID) -> TaskSnapshot:
+    """Create or return the one durable non-file architecture-planning task."""
+    async with AsyncSessionLocal() as session, session.begin():
+        task = (
+            await session.execute(
+                select(Task).where(
+                    Task.job_id == job_id,
+                    Task.parent_id.is_(None),
+                    Task.type == "artifact_architect",
+                )
+            )
+        ).scalar_one_or_none()
+        if task is None:
+            task = Task(
+                id=uuid.uuid4(), job_id=job_id, parent_id=None,
+                type="artifact_architect", title="Plan target architecture artifacts",
+                target_path=None, status=TaskStatus.pending.value, attempts=0,
+                order_index=-20,
+                verify_spec={"kind": "architecture", "action": "architect"},
+            )
+            session.add(task)
+            await session.flush()
+        snapshots = await _load(session, job_id)
+    return next(item for item in snapshots if item.type == "artifact_architect")

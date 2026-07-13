@@ -49,6 +49,7 @@ async def report_node(state: GraphState) -> GraphState:
     ]
     recovery = {
         "visits": state.get("recover_visits", 0),
+        "budget_used": state.get("recover_budget_used", 0),
         "actions": state.get("recovery_actions", []),
         "tasks_skipped": sum(1 for t in plan if t.get("status") == "skipped"),
         "escalation_attempted": len(escalation_tasks),
@@ -89,6 +90,24 @@ async def report_node(state: GraphState) -> GraphState:
         "violations": oracle_breaks,
         "files": oracle_files,
         "attempt_results": state.get("oracle_results", []),
+        "sanctioned_normalizations": [
+            {
+                "path": path,
+                "kind": normalization.get("kind"),
+                "owner_path": normalization.get("owner_path"),
+                "target_module": normalization.get("target_module"),
+                "lines": [
+                    {
+                        "line": replacement.get("line"),
+                        "symbols": replacement.get("symbols", []),
+                    }
+                    for replacement in normalization.get("replacements", [])
+                ],
+            }
+            for path, normalization in sorted(
+                (state.get("test_normalizations") or {}).items()
+            )
+        ],
     }
 
     suite_ok = (
@@ -97,7 +116,19 @@ async def report_node(state: GraphState) -> GraphState:
         and final.get("errors", 0) == 0
     )
     unsupported = list(state.get("unsupported_test_seams") or [])
-    if unsupported:
+    config = state.get("config") or {}
+    plan_only = bool(config.get("plan_only"))
+    replay = config.get("frozen_artifact_plan") is not None
+    architect_task = next(
+        (task for task in plan if task.get("type") == "artifact_architect"), None,
+    )
+    if plan_only:
+        migration_outcome = (
+            "plan_accepted"
+            if architect_task is None or architect_task.get("status") == "done"
+            else "plan_rejected"
+        )
+    elif unsupported:
         migration_outcome = "unsupported"
     elif migrate and suite_ok and tasks_done == len(plan) and not oracle_breaks:
         migration_outcome = "success"
@@ -112,17 +143,73 @@ async def report_node(state: GraphState) -> GraphState:
     llm_usage = {
         "calls": sum(
             1 for a in attempts
-            if a.get("action") in ("migrate", "contract_repair", "diagnose")
+            if a.get("action") in (
+                "architect", "architect_repair", "migrate", "contract_repair", "diagnose",
+            )
         ),
         "prompt_tokens": sum(a.get("prompt_tokens", 0) for a in attempts),
         "completion_tokens": sum(a.get("completion_tokens", 0) for a in attempts),
         "cost_usd": round(sum(a.get("cost_usd", 0.0) for a in attempts), 6),
+    }
+    seam_plan = state.get("seam_plan") or {}
+    executable_cut_analysis = {
+        # Evidence snippets remain checkpoint-internal; the public report needs the
+        # scheduling decision and diagnostics, not arbitrary source fragments.
+        "edge_count": len(seam_plan.get("executable_edges", [])),
+        "cuts": seam_plan.get("execution_cuts", []),
+        "diagnostics": seam_plan.get("cut_diagnostics", []),
+    }
+    artifact_plan = state.get("artifact_plan") or []
+    architect_attempts = (
+        architect_task.get("attempts_log", []) if architect_task else []
+    )
+    artifact_analysis = {
+        "architect": ({
+            "status": architect_task.get("status"),
+            "attempts": architect_task.get("attempts"),
+            "calls": sum(
+                attempt.get("action") in {"architect", "architect_repair"}
+                for attempt in architect_attempts
+            ),
+            "repairs": sum(
+                attempt.get("action") == "architect_repair"
+                for attempt in architect_attempts
+            ),
+            "model": next((
+                attempt.get("model") for attempt in architect_attempts
+                if attempt.get("action") == "architect"
+            ), None),
+        } if architect_task else None),
+        "contract_completion": (
+            architect_task.get("verify_spec", {}).get("contract_completion", [])
+            if architect_task else []
+        ),
+        "created": [
+            {
+                "path": item["path"], "purpose": item["purpose"],
+                "exports": item["exports"],
+                "capabilities": item.get("capabilities", []),
+                "consumers": item["consumers"],
+                "depends_on": item["depends_on"],
+                "status": next((
+                    task.get("status") for task in plan
+                    if task.get("target_path") == item["path"]
+                ), None),
+            }
+            for item in artifact_plan
+        ],
+        "contract_attributed_recoveries": sum(
+            action.get("classification") == "contract_failure"
+            for action in state.get("recovery_actions", [])
+        ),
     }
 
     report = {
         "job_id": job_id,
         "repo_url": state.get("repo_url"),
         "migration_recipe": state.get("migration_recipe"),
+        "evaluation_mode": "plan_only" if plan_only else "replay" if replay else "full",
+        "replay_source_job": config.get("replay_source_job"),
         "migrated": migrate,
         "graph_summary": state.get("graph_summary"),
         "blast_radius_sample": state.get("blast_radius_sample"),
@@ -135,6 +222,8 @@ async def report_node(state: GraphState) -> GraphState:
         "unsupported_test_seams": unsupported,
         "oracle_integrity": oracle_integrity,
         "verified_batches": state.get("verified_batches", []),
+        "executable_cut_analysis": executable_cut_analysis,
+        "artifact_plan": artifact_analysis,
         "llm_usage": llm_usage,
         "verify_summary": verify_summary,
         "integrate_summary": integrate_summary,

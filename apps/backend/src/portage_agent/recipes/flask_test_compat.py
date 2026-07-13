@@ -56,7 +56,7 @@ class FlaskCliRunnerAdapter:
 class FlaskClientAdapter:
     def __init__(self, app):
         self._app = app
-        self._client = TestClient(app)
+        self._client = TestClient(app, follow_redirects=False)
 
     def __enter__(self):
         self._client.__enter__()
@@ -150,7 +150,12 @@ class FastAPITestAdapter:
 
     @contextmanager
     def app_context(self):
-        yield self
+        owned = getattr(self._app, "app_context", None)
+        if owned is None:
+            yield self
+            return
+        with owned():
+            yield self
 
     def test_client(self):
         return FlaskClientAdapter(self._app)
