@@ -13,6 +13,39 @@ from ._flask_analysis import (
 )
 
 
+def _normalize_project_import_levels(
+    path: str, content: str, seam_plan: dict | None,
+) -> str:
+    """Correct a relative import that points below the current package by one level."""
+    modules = set((seam_plan or {}).get("project_modules", []))
+    tree = _parsed(content)
+    if not modules or tree is None:
+        return content
+    package = path.removesuffix(".py").split("/")[:-1]
+    changed = False
+    for statement in tree.body:
+        if not (
+            isinstance(statement, ast.ImportFrom)
+            and statement.level and statement.module
+            and _resolve_module(statement.module, statement.level, path) not in modules
+        ):
+            continue
+        suffix = statement.module.split(".")
+        candidate = next((
+            ".".join([*package[:depth], *suffix])
+            for depth in range(len(package) - 1, -1, -1)
+            if ".".join([*package[:depth], *suffix]) in modules
+        ), "")
+        if candidate:
+            statement.module = candidate
+            statement.level = 0
+            changed = True
+    if not changed:
+        return content
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
 def _realize_ambient_request_binding(
     path: str, content: str, seam_plan: dict | None,
 ) -> str:
@@ -20,13 +53,89 @@ def _realize_ambient_request_binding(
     decision = next((
         item for item in (seam_plan or {}).get("decisions", {}).values()
         if item.get("kind") == "ambient_context_runtime"
-        and path in item.get("runtime_providers", [])
+        and (
+            path in item.get("runtime_providers", [])
+            or path in item.get("current_app_consumers", [])
+        )
     ), None)
     tree = _parsed(content)
     if decision is None or tree is None:
         return content
 
     changed = False
+    if path in decision.get("current_app_consumers", []):
+        app_bindings = {
+            target.id
+            for statement in tree.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and ast.unparse(statement.value.func).split(".")[-1] == "create_app"
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+
+        class CurrentAppRewriter(ast.NodeTransformer):
+            def visit_Name(self, node: ast.Name) -> ast.AST:  # noqa: N802
+                if isinstance(node.ctx, ast.Load) and node.id in app_bindings:
+                    return ast.Name(id="current_app", ctx=node.ctx)
+                return node
+
+        tree = CurrentAppRewriter().visit(tree)
+        tree.body = [
+            statement for statement in tree.body
+            if not (
+                isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name) and target.id in app_bindings
+                    for target in (
+                        statement.targets if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                )
+            )
+        ]
+        needs_proxy = bool(app_bindings) or any(
+            isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            and node.id == "current_app" for node in ast.walk(tree)
+        )
+        for statement in list(tree.body):
+            if isinstance(statement, ast.ImportFrom):
+                statement.names = [
+                    alias for alias in statement.names
+                    if alias.name != "current_app"
+                    and not (
+                        alias.name == "create_app"
+                        and not any(
+                            isinstance(node, ast.Name)
+                            and isinstance(node.ctx, ast.Load)
+                            and node.id == (alias.asname or alias.name)
+                            for node in ast.walk(tree)
+                        )
+                    )
+                ]
+                if not statement.names:
+                    tree.body.remove(statement)
+        providers = decision.get("runtime_providers", [])
+        if needs_proxy and len(providers) == 1:
+            provider_path = providers[0]
+            imported = next((
+                statement for statement in tree.body
+                if isinstance(statement, ast.ImportFrom)
+                and _resolve_module(statement.module, statement.level, path)
+                in _module_names(provider_path)
+            ), None)
+            if imported is None:
+                imported = ast.ImportFrom(
+                    module=provider_path.removesuffix(".py").replace("/", "."),
+                    names=[], level=0,
+                )
+                tree.body.insert(0, imported)
+            if not any(alias.name == "current_app" for alias in imported.names):
+                imported.names.append(ast.alias(name="current_app"))
+        changed = needs_proxy
     runtime_classes = set(decision.get("runtime_classes", {}).get(path, []))
     for cls in (
         node for node in tree.body
@@ -124,22 +233,42 @@ def _realize_decorated_provider_protocols(
                 node.name for node in provider_class.body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
+            existing.update(
+                target.id
+                for statement in provider_class.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            )
         decorator_members = set(protocol.get("decorator_members", []))
         callable_members = set(protocol.get("callable_members", []))
         attribute_members = set(protocol.get("attribute_members", []))
         attribute_values = protocol.get("attribute_values", {})
-        for statement in tree.body:
+        provider_statements = [
+            (statement, False) for statement in tree.body
+        ] + [
+            (statement, True) for statement in (
+                provider_class.body if provider_class is not None else []
+            )
+        ]
+        for statement, class_level in provider_statements:
             if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 continue
             targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
             for target in targets:
-                if (
+                member = (
+                    target.id if class_level and isinstance(target, ast.Name)
+                    else target.attr if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
                     and target.value.id == symbol
-                    and target.attr in attribute_values
-                ):
-                    statement.value = ast.Constant(value=attribute_values[target.attr])
+                    ) else ""
+                )
+                if member in attribute_values:
+                    statement.value = ast.Constant(value=attribute_values[member])
                     changed = True
         for callback in protocol.get("callbacks", []):
             original = _parsed(callback["source"])
@@ -524,14 +653,17 @@ def _realize_extension_provider_facade(
     tree = _parsed(content)
     if tree is None:
         return content
+    changed = False
 
     def imported_name(module: str, name: str, asname: str | None = None) -> str:
+        nonlocal changed
         for statement in tree.body:
             if isinstance(statement, ast.ImportFrom) and statement.module == module:
                 for alias in statement.names:
                     if alias.name == name:
                         return alias.asname or alias.name
                 statement.names.append(ast.alias(name=name, asname=asname))
+                changed = True
                 return asname or name
         insert_at = 1 if (
             tree.body and isinstance(tree.body[0], ast.Expr)
@@ -547,9 +679,9 @@ def _realize_extension_provider_facade(
         tree.body.insert(insert_at, ast.ImportFrom(
             module=module, names=[ast.alias(name=name, asname=asname)], level=0,
         ))
+        changed = True
         return asname or name
 
-    changed = False
     for decision in (seam_plan or {}).get("decisions", {}).values():
         if decision.get("kind") != "extension_provider" or decision.get(
             "provider"
@@ -591,6 +723,38 @@ def _realize_extension_provider_facade(
             )
         ), "")
         database_config = decision.get("database_config", {})
+        engine_factory = ""
+        engine_helper = None
+        if "init_app" in required or database_config.get("sqlite"):
+            engine_factory = "_portage_create_engine"
+            raw_create_engine = imported_name("sqlalchemy", "create_engine")
+            static_pool = imported_name("sqlalchemy.pool", "StaticPool")
+            engine_helper = next((
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == engine_factory
+            ), None)
+            if engine_helper is None:
+                engine_helper = ast.parse(
+                    f"def {engine_factory}(uri):\n"
+                    "    value = str(uri)\n"
+                    "    kwargs = {}\n"
+                    "    if value.startswith('sqlite'):\n"
+                    "        kwargs['connect_args'] = {'check_same_thread': False}\n"
+                    "        if value in {'sqlite://', 'sqlite:///:memory:'}:\n"
+                    f"            kwargs['poolclass'] = {static_pool}\n"
+                    f"    return {raw_create_engine}(uri, **kwargs)\n"
+                ).body[0]
+                first_definition = next((
+                    index for index, node in enumerate(tree.body)
+                    if isinstance(
+                        node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                ), len(tree.body))
+                tree.body.insert(first_definition, engine_helper)
+                changed = True
+        elif database_config:
+            engine_factory = imported_name("sqlalchemy", "create_engine")
         if database_config:
             config_name = imported_name(
                 database_config["module"], database_config["symbol"],
@@ -603,34 +767,6 @@ def _realize_extension_provider_facade(
                 ),
                 attr="SQLALCHEMY_DATABASE_URI", ctx=ast.Load(),
             )
-            engine_factory = "create_engine"
-            helper = None
-            if database_config.get("sqlite"):
-                engine_factory = "_portage_create_engine"
-                helper = next((
-                    node for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == engine_factory
-                ), None)
-                if helper is None:
-                    raw_create_engine = imported_name("sqlalchemy", "create_engine")
-                    static_pool = imported_name("sqlalchemy.pool", "StaticPool")
-                    helper = ast.parse(
-                        f"def {engine_factory}(uri):\n"
-                        "    value = str(uri)\n"
-                        "    kwargs = {}\n"
-                        "    if value.startswith('sqlite'):\n"
-                        "        kwargs['connect_args'] = {'check_same_thread': False}\n"
-                        "        if value in {'sqlite://', 'sqlite:///:memory:'}:\n"
-                        f"            kwargs['poolclass'] = {static_pool}\n"
-                        f"    return {raw_create_engine}(uri, **kwargs)\n"
-                    ).body[0]
-                    first_definition = next((
-                        index for index, node in enumerate(tree.body)
-                        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-                    ), len(tree.body))
-                    tree.body.insert(first_definition, helper)
-                    changed = True
             for statement in tree.body:
                 if not (
                     isinstance(statement, (ast.Assign, ast.AnnAssign))
@@ -642,8 +778,7 @@ def _realize_extension_provider_facade(
                 statement.value.args[0] = deepcopy(uri)
                 changed = True
             for call in (
-                node
-                for statement in tree.body if statement is not helper
+                node for statement in tree.body if statement is not engine_helper
                 for node in ast.walk(statement)
                 if isinstance(node, ast.Call)
                 and ast.unparse(node.func).split(".")[-1] == "create_engine"
@@ -653,6 +788,134 @@ def _realize_extension_provider_facade(
                 call.args[0] = deepcopy(uri)
                 call.keywords = []
                 changed = True
+        existing_definitions = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        runtime_helpers: list[ast.stmt] = []
+        if "paginate" in required and "_PortagePagination" not in existing_definitions:
+            runtime_helpers.extend(ast.parse(
+                "class _PortagePagination:\n"
+                "    def __init__(self, items, page, per_page, total):\n"
+                "        self.items = items\n"
+                "        self.page = page\n"
+                "        self.per_page = per_page\n"
+                "        self.total = total\n"
+                "    @property\n"
+                "    def pages(self):\n"
+                "        if self.total is None:\n"
+                "            return 0\n"
+                "        return (self.total + self.per_page - 1) // self.per_page\n"
+                "    @property\n"
+                "    def has_prev(self):\n"
+                "        return self.page > 1\n"
+                "    @property\n"
+                "    def prev_num(self):\n"
+                "        return self.page - 1\n"
+                "    @property\n"
+                "    def has_next(self):\n"
+                "        return self.page < self.pages\n"
+                "    @property\n"
+                "    def next_num(self):\n"
+                "        return self.page + 1\n"
+            ).body)
+        missing_404_helpers = required & {"first_or_404", "get_or_404"}
+        if missing_404_helpers:
+            http_exception = imported_name("fastapi", "HTTPException")
+            if (
+                "get_or_404" in required
+                and "_portage_sqlalchemy_get_or_404" not in existing_definitions
+            ):
+                runtime_helpers.extend(ast.parse(
+                    "def _portage_sqlalchemy_get_or_404(\n"
+                    "    provider, entity, ident, *, description=None, **kwargs\n"
+                    "):\n"
+                    "    value = provider.session.get(entity, ident, **kwargs)\n"
+                    "    if value is None:\n"
+                    f"        raise {http_exception}(status_code=404, "
+                    "detail=description or 'Not Found')\n"
+                    "    return value\n"
+                ).body)
+            if (
+                "first_or_404" in required
+                and "_portage_sqlalchemy_first_or_404" not in existing_definitions
+            ):
+                runtime_helpers.extend(ast.parse(
+                    "def _portage_sqlalchemy_first_or_404(\n"
+                    "    provider, statement, *, description=None\n"
+                    "):\n"
+                    "    value = provider.session.scalars(statement).first()\n"
+                    "    if value is None:\n"
+                    f"        raise {http_exception}(status_code=404, "
+                    "detail=description or 'Not Found')\n"
+                    "    return value\n"
+                ).body)
+        if (
+            "paginate" in required
+            and "_portage_sqlalchemy_paginate" not in existing_definitions
+        ):
+            select = imported_name("sqlalchemy", "select")
+            func = imported_name("sqlalchemy", "func")
+            http_exception = imported_name("fastapi", "HTTPException")
+            runtime_helpers.extend(ast.parse(
+                "def _portage_sqlalchemy_paginate(\n"
+                "    provider, statement, *, page=None, per_page=None,\n"
+                "    max_per_page=None, error_out=True, count=True\n"
+                "):\n"
+                "    try:\n"
+                "        page = 1 if page is None else int(page)\n"
+                "        per_page = 20 if per_page is None else int(per_page)\n"
+                "        if max_per_page is not None:\n"
+                "            per_page = min(per_page, int(max_per_page))\n"
+                "    except (TypeError, ValueError):\n"
+                "        page = per_page = 0\n"
+                "    if page < 1 or per_page < 1:\n"
+                "        if error_out:\n"
+                f"            raise {http_exception}(status_code=404, detail='Not Found')\n"
+                "        page = max(page, 1)\n"
+                "        per_page = max(per_page, 1)\n"
+                "    offset = (page - 1) * per_page\n"
+                "    if hasattr(statement, 'all'):\n"
+                "        items = list(statement.limit(per_page).offset(offset).all())\n"
+                "        total = statement.order_by(None).count() if count else None\n"
+                "    else:\n"
+                "        items = list(provider.session.scalars(\n"
+                "            statement.limit(per_page).offset(offset)\n"
+                "        ).all())\n"
+                "        if count:\n"
+                "            unordered = statement.order_by(None)\n"
+                f"            count_statement = {select}({func}.count()).select_from(\n"
+                "                unordered.subquery()\n"
+                "            )\n"
+                "            total = int(provider.session.scalar(count_statement) or 0)\n"
+                "        else:\n"
+                "            total = None\n"
+                "    if not items and page != 1 and error_out:\n"
+                f"        raise {http_exception}(status_code=404, detail='Not Found')\n"
+                "    return _PortagePagination(items, page, per_page, total)\n"
+            ).body)
+        if (
+            "init_app" in required
+            and "_portage_sqlalchemy_init_app" not in existing_definitions
+        ):
+            runtime_helpers.extend(ast.parse(
+                "def _portage_sqlalchemy_init_app(provider, app):\n"
+                "    uri = app.state.config.get('SQLALCHEMY_DATABASE_URI')\n"
+                "    if not uri:\n"
+                "        return None\n"
+                "    current = getattr(provider, 'engine', None)\n"
+                "    if current is not None and str(getattr(current, 'url', '')) == str(uri):\n"
+                "        return None\n"
+                "    provider.session.remove()\n"
+                f"    provider.engine = {engine_factory}(uri)\n"
+                "    provider.session.configure(bind=provider.engine)\n"
+            ).body)
+        if runtime_helpers:
+            insertion = tree.body.index(assignment)
+            for helper_node in runtime_helpers:
+                tree.body.insert(insertion, helper_node)
+                insertion += 1
+            changed = True
         if decision.get("query_models"):
             base = next((
                 node for node in tree.body if isinstance(node, ast.ClassDef)
@@ -844,22 +1107,46 @@ def _realize_extension_provider_facade(
                 node.name for node in facade.body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
-            if database_config and "init_app" in required:
-                method = ast.parse(
+            facade_methods = {
+                "get_or_404": (
+                    "def get_or_404(self, entity, ident, *, description=None, **kwargs):\n"
+                    "    return _portage_sqlalchemy_get_or_404(\n"
+                    "        self, entity, ident, description=description, **kwargs\n"
+                    "    )\n"
+                ),
+                "first_or_404": (
+                    "def first_or_404(self, statement, *, description=None):\n"
+                    "    return _portage_sqlalchemy_first_or_404(\n"
+                    "        self, statement, description=description\n"
+                    "    )\n"
+                ),
+                "paginate": (
+                    "def paginate(\n"
+                    "    self, statement, *, page=None, per_page=None,\n"
+                    "    max_per_page=None, error_out=True, count=True\n"
+                    "):\n"
+                    "    return _portage_sqlalchemy_paginate(\n"
+                    "        self, statement, page=page, per_page=per_page,\n"
+                    "        max_per_page=max_per_page, error_out=error_out, count=count\n"
+                    "    )\n"
+                ),
+                "init_app": (
                     "def init_app(self, app):\n"
-                    "    uri = app.state.config.get('SQLALCHEMY_DATABASE_URI')\n"
-                    "    if uri and str(self.engine.url) != uri:\n"
-                    "        self.session.remove()\n"
-                    f"        self.engine = {engine_factory}(uri)\n"
-                    "        self.session.configure(bind=self.engine)\n"
-                ).body[0]
-                facade.body = [
-                    node for node in facade.body
-                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    or node.name != "init_app"
-                ]
-                facade.body.append(method)
-                defined.add("init_app")
+                    "    return _portage_sqlalchemy_init_app(self, app)\n"
+                ),
+            }
+            for member in sorted(required & facade_methods.keys()):
+                replace = member == "init_app" and bool(database_config)
+                if member in defined and not replace:
+                    continue
+                if replace:
+                    facade.body = [
+                        node for node in facade.body
+                        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        or node.name != member
+                    ]
+                facade.body.append(ast.parse(facade_methods[member]).body[0])
+                defined.add(member)
                 changed = True
             for member in sorted(required & {"create_all", "drop_all"} - defined):
                 if not (values.get("metadata") and values.get("engine")):
@@ -947,6 +1234,63 @@ def _realize_extension_provider_facade(
                     ]
                 values["session"] = session
         insertion = tree.body.index(assignment)
+        namespace_methods = {
+            "get_or_404": (
+                f"def _portage_{symbol}_get_or_404(\n"
+                "    entity, ident, *, description=None, **kwargs\n"
+                "):\n"
+                f"    return _portage_sqlalchemy_get_or_404(\n"
+                f"        {symbol}, entity, ident, description=description, **kwargs\n"
+                "    )\n"
+            ),
+            "first_or_404": (
+                f"def _portage_{symbol}_first_or_404(statement, *, description=None):\n"
+                f"    return _portage_sqlalchemy_first_or_404(\n"
+                f"        {symbol}, statement, description=description\n"
+                "    )\n"
+            ),
+            "paginate": (
+                f"def _portage_{symbol}_paginate(\n"
+                "    statement, *, page=None, per_page=None, max_per_page=None,\n"
+                "    error_out=True, count=True\n"
+                "):\n"
+                f"    return _portage_sqlalchemy_paginate(\n"
+                f"        {symbol}, statement, page=page, per_page=per_page,\n"
+                "        max_per_page=max_per_page, error_out=error_out, count=count\n"
+                "    )\n"
+            ),
+            "init_app": (
+                f"def _portage_{symbol}_init_app(app):\n"
+                f"    return _portage_sqlalchemy_init_app({symbol}, app)\n"
+            ),
+        }
+        for member in sorted(required & namespace_methods.keys()):
+            replace = (
+                member not in values
+                or member == "init_app" and bool(database_config)
+                or isinstance(values.get(member), ast.Constant)
+                and values[member].value is None
+            )
+            if not replace:
+                continue
+            helper_name = f"_portage_{symbol}_{member}"
+            if not any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == helper_name for node in tree.body
+            ):
+                tree.body.insert(
+                    insertion, ast.parse(namespace_methods[member]).body[0],
+                )
+                insertion += 1
+            value = ast.Name(id=helper_name, ctx=ast.Load())
+            if member in values:
+                pairs = [
+                    (key, value if key == member else existing)
+                    for key, existing in pairs
+                ]
+            else:
+                pairs.append((member, value))
+            values[member] = value
         for member in sorted(required & {"create_all", "drop_all"}):
             if not (values.get("metadata") and values.get("engine")):
                 continue
@@ -1154,6 +1498,129 @@ def _realize_factory_contracts(
         for statement in assignments:
             statement.value.func = ast.Name(id=facade_name, ctx=ast.Load())
             changed = True
+        if factory is not None and "testing" in classes[0].get("members", []):
+            facade_instances = {
+                target.id
+                for statement in ast.walk(factory)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id in facade_names
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            raw_apps = {
+                target.id
+                for statement in ast.walk(factory)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and isinstance(statement.value, ast.Call)
+                and ast.unparse(statement.value.func).split(".")[-1] == "FastAPI"
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            if len(facade_instances) == 1:
+                owner = next(iter(facade_instances))
+                for node in ast.walk(factory):
+                    if (
+                        isinstance(node, ast.Attribute) and node.attr == "testing"
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id in raw_apps
+                    ):
+                        node.value = ast.Name(id=owner, ctx=ast.Load())
+                        changed = True
+    if decision and factory and not any(
+        "testing" in item.get("members", []) for item in classes
+    ):
+        app_names = {
+            target.id
+            for statement in ast.walk(factory)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and ast.unparse(statement.value.func).split(".")[-1]
+            in {"FastAPI", *facade_names}
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+
+        class TestingReadRewriter(ast.NodeTransformer):
+            replacements = 0
+
+            def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+                if (
+                    isinstance(node.ctx, ast.Load) and node.attr == "testing"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in app_names
+                ):
+                    self.replacements += 1
+                    return ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Attribute(
+                                value=ast.Attribute(
+                                    value=ast.Name(id=node.value.id, ctx=ast.Load()),
+                                    attr="state", ctx=ast.Load(),
+                                ),
+                                attr="config", ctx=ast.Load(),
+                            ),
+                            attr="get", ctx=ast.Load(),
+                        ),
+                        args=[ast.Constant(value="TESTING"), ast.Constant(value=False)],
+                        keywords=[],
+                    )
+                return self.generic_visit(node)
+
+        rewriter = TestingReadRewriter()
+        rewriter.visit(factory)
+        changed = changed or bool(rewriter.replacements)
+    if decision and factory:
+        lifespan_names = {
+            keyword.value.id
+            for call in ast.walk(factory)
+            if isinstance(call, ast.Call)
+            for keyword in call.keywords
+            if keyword.arg == "lifespan" and isinstance(keyword.value, ast.Name)
+        }
+        lifespan_functions = {
+            node.name: node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in lifespan_names
+            and any(
+                isinstance(part, (ast.Yield, ast.YieldFrom)) for part in ast.walk(node)
+            )
+        }
+        undecorated = [
+            function for function in lifespan_functions.values()
+            if not any(
+                ast.unparse(decorator).split(".")[-1] == "asynccontextmanager"
+                for decorator in function.decorator_list
+            )
+        ]
+        if undecorated:
+            decorator_name = next((
+                alias.asname or alias.name
+                for statement in tree.body
+                if isinstance(statement, ast.ImportFrom)
+                and statement.module == "contextlib"
+                for alias in statement.names if alias.name == "asynccontextmanager"
+            ), "")
+            if not decorator_name:
+                tree.body.insert(0, ast.ImportFrom(
+                    module="contextlib",
+                    names=[ast.alias(name="asynccontextmanager")], level=0,
+                ))
+                decorator_name = "asynccontextmanager"
+            for function in undecorated:
+                function.decorator_list.insert(
+                    0, ast.Name(id=decorator_name, ctx=ast.Load()),
+                )
+            changed = True
     if decision and factory:
         for contract in decision.get("local_imports", []):
             moved = []
@@ -1243,6 +1710,67 @@ def _realize_factory_contracts(
                 node.value = ast.BinOp(
                     left=defaults, op=ast.BitOr(), right=node.value,
                 )
+                changed = True
+        has_config_assignment = any(
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                ast.unparse(target).endswith(".state.config")
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+            for node in ast.walk(factory or tree)
+        )
+        if factory is not None and sources and not has_config_assignment:
+            config_ref = next((
+                node for statement in factory.body for node in ast.walk(statement)
+                if isinstance(node, ast.Attribute) and node.attr == "config"
+                and isinstance(node.value, ast.Attribute) and node.value.attr == "state"
+            ), None)
+            insert_at = next((
+                index for index, statement in enumerate(factory.body)
+                if config_ref is not None and any(
+                    node is config_ref for node in ast.walk(statement)
+                )
+            ), -1)
+            if config_ref is None:
+                returned = {
+                    node.value.id for node in ast.walk(factory)
+                    if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+                }
+                app_assignment = next((
+                    (index, target.id)
+                    for index, statement in enumerate(factory.body)
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                    and isinstance(statement.value, ast.Call)
+                    for target in (
+                        statement.targets if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                    if isinstance(target, ast.Name) and target.id in returned
+                ), None)
+                if app_assignment is not None:
+                    insert_at, app_name = app_assignment
+                    insert_at += 1
+                    config_ref = ast.Attribute(
+                        value=ast.Attribute(
+                            value=ast.Name(id=app_name, ctx=ast.Load()),
+                            attr="state", ctx=ast.Load(),
+                        ),
+                        attr="config", ctx=ast.Load(),
+                    )
+            if config_ref is not None:
+                defaults = None
+                for source in sources:
+                    mapping = _uppercase_object_config(source)
+                    defaults = mapping if defaults is None else ast.BinOp(
+                        left=defaults, op=ast.BitOr(), right=mapping,
+                    )
+                target = deepcopy(config_ref)
+                target.ctx = ast.Store()
+                factory.body.insert(insert_at, ast.Assign(
+                    targets=[target], value=defaults,
+                ))
                 changed = True
     if decision and factory and decision.get("initializers"):
         returned_apps = {
@@ -1432,10 +1960,7 @@ def _realize_factory_contracts(
             and (statement.module or "").split(".")[-1] in runtime_modules
             for alias in statement.names if alias.name in runtime_class_exports
         }
-        for function in (
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ):
+        for function in [factory] if factory is not None else []:
             middleware = [
                 (index, statement, statement.value.args[0].id)
                 for index, statement in enumerate(function.body)
@@ -1565,12 +2090,12 @@ def _realize_factory_contracts(
     ]
     returned_apps = {
         node.value.id
-        for node in ast.walk(tree)
+        for node in (ast.walk(factory) if factory is not None else ())
         if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
     }
     constructors = [
         statement.value
-        for statement in ast.walk(tree)
+        for statement in (ast.walk(factory) if factory is not None else ())
         if isinstance(statement, (ast.Assign, ast.AnnAssign))
         and isinstance(statement.value, ast.Call)
         and any(
@@ -1634,24 +2159,31 @@ def _realize_factory_contracts(
                 in _module_names(provider)
                 for alias in statement.names if alias.name == name
             ), None)
-            if local_name is None:
-                if provider_import is None:
-                    module = provider.removesuffix(".py").replace("/", ".")
-                    provider_import = ast.ImportFrom(
-                        module=module, names=[], level=0,
-                    )
-                    insert_at = 1 if (
-                        tree.body and isinstance(tree.body[0], ast.Expr)
-                        and isinstance(tree.body[0].value, ast.Constant)
-                        and isinstance(tree.body[0].value.value, str)
-                    ) else 0
-                    while insert_at < len(tree.body) and isinstance(
-                        tree.body[insert_at], (ast.Import, ast.ImportFrom)
-                    ):
-                        insert_at += 1
-                    tree.body.insert(insert_at, provider_import)
-                provider_import.names.append(ast.alias(name=name))
-                local_name = name
+            local_name = local_name or name
+            if provider_import is not None:
+                selected = [
+                    alias for alias in provider_import.names if alias.name == name
+                ] or [ast.alias(name=name)]
+                provider_import.names = [
+                    alias for alias in provider_import.names if alias.name != name
+                ]
+                if not provider_import.names:
+                    tree.body.remove(provider_import)
+            else:
+                selected = [ast.alias(
+                    name=name, asname=local_name if local_name != name else None,
+                )]
+            if not any(
+                isinstance(statement, ast.ImportFrom)
+                and _resolve_module(statement.module, statement.level, path)
+                in _module_names(provider)
+                and any(alias.name == name for alias in statement.names)
+                for statement in factory.body
+            ):
+                module = provider.removesuffix(".py").replace("/", ".")
+                factory.body.insert(0, ast.ImportFrom(
+                    module=module, names=selected, level=0,
+                ))
                 changed = True
             call = ast.Call(
                 func=ast.Name(id=depends_name or "Depends", ctx=ast.Load()),

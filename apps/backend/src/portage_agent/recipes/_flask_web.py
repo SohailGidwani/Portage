@@ -13,6 +13,166 @@ from ._flask_analysis import (
 )
 
 
+def _normalize_translation_literals(
+    path: str, content: str, seam_plan: dict | None,
+) -> str:
+    decision = next((
+        item for item in (seam_plan or {}).get("decisions", {}).values()
+        if item.get("kind") == "translation_literals" and item.get("path") == path
+    ), None)
+    tree = _parsed(content)
+    if decision is None or tree is None:
+        return content
+    bindings = set(decision.get("bindings", []))
+
+    class Replace(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if (
+                ast.unparse(node.func) in bindings and len(node.args) == 1
+                and all(keyword.arg is not None for keyword in node.keywords)
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                self.changed = True
+                if not node.keywords:
+                    return node.args[0]
+                return ast.BinOp(
+                    left=node.args[0], op=ast.Mod(),
+                    right=ast.Dict(
+                        keys=[ast.Constant(keyword.arg) for keyword in node.keywords],
+                        values=[keyword.value for keyword in node.keywords],
+                    ),
+                )
+            return node
+
+    replace = Replace()
+    tree = replace.visit(tree)
+    if not replace.changed:
+        return content
+    remaining = {
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    for statement in list(tree.body):
+        if not (
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "flask_babel"
+        ):
+            continue
+        statement.names = [
+            alias for alias in statement.names
+            if (alias.asname or alias.name) in remaining
+        ]
+        if not statement.names:
+            tree.body.remove(statement)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _normalize_fastapi_mail_import(content: str) -> str:
+    """Replace the unavailable model-invented package with a small stdlib surface."""
+    tree = _parsed(content)
+    if tree is None:
+        return content
+    supported = {"ConnectionConfig", "FastMail", "MessageSchema", "MessageType"}
+    bindings: dict[str, str] = {}
+    insertion = None
+    for statement in list(tree.body):
+        if not isinstance(statement, ast.ImportFrom) or statement.module != "fastapi_mail":
+            continue
+        kept = []
+        for alias in statement.names:
+            if alias.name in supported:
+                bindings[alias.name] = alias.asname or alias.name
+            else:
+                kept.append(alias)
+        if len(kept) == len(statement.names):
+            continue
+        insertion = tree.body.index(statement) if insertion is None else insertion
+        statement.names = kept
+        if not kept:
+            tree.body.remove(statement)
+    if not bindings or insertion is None:
+        return content
+
+    definitions = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    additions: list[ast.stmt] = []
+    for original in ("ConnectionConfig", "MessageSchema"):
+        local = bindings.get(original)
+        if local and local not in definitions:
+            additions.extend(ast.parse(
+                f"class {local}:\n"
+                "    def __init__(self, **values):\n"
+                "        self.__dict__.update(values)\n"
+            ).body)
+    message_type = bindings.get("MessageType")
+    if message_type and message_type not in definitions:
+        additions.extend(ast.parse(
+            f"class {message_type}:\n"
+            "    plain = 'plain'\n"
+            "    html = 'html'\n"
+        ).body)
+    fast_mail = bindings.get("FastMail")
+    if fast_mail and fast_mail not in definitions:
+        additions.extend([
+            ast.Import(names=[ast.alias(name="smtplib", asname="_portage_smtplib")]),
+            ast.ImportFrom(
+                module="email.message",
+                names=[ast.alias(name="EmailMessage", asname="_PortageEmailMessage")],
+                level=0,
+            ),
+        ])
+        additions.extend(ast.parse(
+            f"class {fast_mail}:\n"
+            "    def __init__(self, config):\n"
+            "        self.config = config\n"
+            "    async def send_message(self, message):\n"
+            "        email = _PortageEmailMessage()\n"
+            "        email['Subject'] = str(getattr(message, 'subject', ''))\n"
+            "        sender = getattr(message, 'sender', None) or "
+            "getattr(self.config, 'MAIL_FROM', '')\n"
+            "        recipients = list(getattr(message, 'recipients', ()) or ())\n"
+            "        email['From'] = str(sender)\n"
+            "        email['To'] = ', '.join(map(str, recipients))\n"
+            "        body = str(getattr(message, 'body', ''))\n"
+            "        subtype = str(getattr(message, 'subtype', 'plain')).lower()\n"
+            "        if subtype.endswith('html'):\n"
+            "            email.add_alternative(body, subtype='html')\n"
+            "        else:\n"
+            "            email.set_content(body)\n"
+            "        for attachment in getattr(message, 'attachments', ()) or ():\n"
+            "            if isinstance(attachment, tuple) and len(attachment) == 3:\n"
+            "                filename, content_type, data = attachment\n"
+            "                main, _, sub = str(content_type).partition('/')\n"
+            "                email.add_attachment(\n"
+            "                    data, maintype=main or 'application',\n"
+            "                    subtype=sub or 'octet-stream', filename=filename\n"
+            "                )\n"
+            "        use_ssl = bool(getattr(self.config, 'MAIL_SSL_TLS', False))\n"
+            "        client_type = (_portage_smtplib.SMTP_SSL if use_ssl "
+            "else _portage_smtplib.SMTP)\n"
+            "        server = getattr(self.config, 'MAIL_SERVER', 'localhost')\n"
+            "        port = int(getattr(self.config, 'MAIL_PORT', 465 if use_ssl else 25))\n"
+            "        with client_type(server, port) as client:\n"
+            "            if not use_ssl and getattr(self.config, 'MAIL_STARTTLS', False):\n"
+            "                client.starttls()\n"
+            "            username = getattr(self.config, 'MAIL_USERNAME', None)\n"
+            "            password = getattr(self.config, 'MAIL_PASSWORD', None)\n"
+            "            if username:\n"
+            "                client.login(username, password or '')\n"
+            "            client.send_message(email)\n"
+        ).body)
+    tree.body[insertion:insertion] = additions
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
 def _normalize_template_response(content: str) -> str:
     """Mechanically upgrade the one deprecated Starlette template call shape.
 
@@ -219,6 +379,121 @@ def _realize_template_consumers(
     tree = _parsed(content)
     if not decisions or tree is None:
         return content
+    provider_functions = {
+        provider: set(names)
+        for decision in decisions
+        for provider, names in decision.get("provider_functions", {}).items()
+    }
+    required = {
+        name
+        for decision in decisions
+        for name in decision.get("consumer_functions", {}).get(path, [])
+    }
+    owners = {
+        name: [provider for provider, names in provider_functions.items() if name in names]
+        for name in required
+    }
+    owned = {name: providers[0] for name, providers in owners.items() if len(providers) == 1}
+    imports_changed = False
+
+    # Models often reproduce a tiny local TemplateResponse wrapper or import a frozen
+    # function from the wrong created artifact. The source and accepted provider plan
+    # already decide both facts, so wire that decision mechanically.
+    template_helpers = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func).split(".")[-1] == "TemplateResponse"
+            for call in ast.walk(node)
+        )
+    }
+    aliases: dict[str, str] = {}
+    if "render_template" in owned and "render_template" not in {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } and len(template_helpers) == 1:
+        aliases[template_helpers.pop()] = "render_template"
+    for statement in list(tree.body):
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        module = _resolve_module(statement.module, statement.level, path)
+        kept = []
+        for alias in statement.names:
+            if alias.name in owned and module not in _module_names(owned[alias.name]):
+                aliases[alias.asname or alias.name] = alias.name
+                continue
+            kept.append(alias)
+        if len(kept) != len(statement.names):
+            imports_changed = True
+            statement.names = kept
+            if not kept:
+                tree.body.remove(statement)
+
+    if aliases:
+        class ReplaceTemplateAliases(ast.NodeTransformer):
+            def visit_Name(self, node):  # noqa: N802
+                replacement = aliases.get(node.id)
+                return ast.Name(id=replacement, ctx=node.ctx) if replacement else node
+
+        tree = ReplaceTemplateAliases().visit(tree)
+        tree.body = [
+            statement for statement in tree.body
+            if not (
+                isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and statement.name in aliases
+            )
+        ]
+        imports_changed = True
+
+    for name, provider in sorted(owned.items()):
+        if not any(
+            isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            and node.id == name for node in ast.walk(tree)
+        ):
+            continue
+        imported = next((
+            statement for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path)
+            in _module_names(provider)
+        ), None)
+        if imported is None:
+            imported = ast.ImportFrom(
+                module=provider.removesuffix(".py").replace("/", "."),
+                names=[], level=0,
+            )
+            tree.body.insert(0, imported)
+        if not any(alias.name == name for alias in imported.names):
+            imported.names.append(ast.alias(name=name))
+            imports_changed = True
+    loaded_names = {
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    for statement in list(tree.body):
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        module = _resolve_module(statement.module, statement.level, path)
+        provider = next((
+            candidate for candidate in provider_functions
+            if module in _module_names(candidate)
+        ), "")
+        if not provider:
+            continue
+        kept = []
+        for alias in statement.names:
+            local = alias.asname or alias.name
+            if (
+                alias.name == "*" or alias.name in provider_functions[provider]
+                or local in loaded_names
+            ):
+                kept.append(alias)
+            else:
+                imports_changed = True
+        statement.names = kept
+        if not kept:
+            tree.body.remove(statement)
     request_first = {
         (provider, name)
         for decision in decisions
@@ -238,7 +513,10 @@ def _realize_template_consumers(
                 for alias in statement.names if alias.name == name
             )
     if not local_names:
-        return content
+        if not imports_changed:
+            return content
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree) + "\n"
 
     request_types = {
         alias.asname or alias.name
@@ -324,7 +602,7 @@ def _realize_template_consumers(
 
     realize = Realize()
     tree = realize.visit(tree)
-    if not (signature_changed or realize.changed):
+    if not (imports_changed or signature_changed or realize.changed):
         return content
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
@@ -429,25 +707,27 @@ def _realize_template_provider_globals(
             provider_path
         )
     ), None)
-    if imported is None:
-        imported = ast.ImportFrom(module=provider, names=[], level=0)
-        insert_at = 1 if (
-            tree.body and isinstance(tree.body[0], ast.Expr)
-            and isinstance(tree.body[0].value, ast.Constant)
-            and isinstance(tree.body[0].value.value, str)
-        ) else 0
-        while insert_at < len(tree.body) and isinstance(
-            tree.body[insert_at], (ast.Import, ast.ImportFrom)
-        ):
-            insert_at += 1
-        tree.body.insert(insert_at, imported)
-    if not any(alias.name == "current_user" for alias in imported.names):
-        imported.names.append(ast.alias(name="current_user"))
+    if imported is not None:
+        imported.names = [
+            alias for alias in imported.names if alias.name != "current_user"
+        ]
+        if not imported.names:
+            tree.body.remove(imported)
     for function in (
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == "render_template"
     ):
+        if not any(
+            isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path)
+            in _module_names(provider_path)
+            and any(alias.name == "current_user" for alias in statement.names)
+            for statement in function.body
+        ):
+            function.body.insert(0, ast.ImportFrom(
+                module=provider, names=[ast.alias(name="current_user")], level=0,
+            ))
         values = next((
             statement.value for statement in function.body
             if isinstance(statement, (ast.Assign, ast.AnnAssign))
@@ -834,34 +1114,51 @@ def _realize_request_hook_names(
     path: str, content: str, seam_plan: dict | None,
 ) -> str:
     """Restore a frozen hook name when generation only added a dependency suffix."""
-    required = {
-        hook["function"]
+    hooks = {
+        hook["function"]: hook
         for decision in (seam_plan or {}).get("decisions", {}).values()
         if decision.get("kind") == "request_hooks" and decision.get("path") == path
         for hook in decision.get("hooks", []) if hook.get("function")
     }
     tree = _parsed(content)
-    if not required or tree is None:
+    if not hooks or tree is None:
         return content
     functions = {
         node.name: node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     changed = False
-    for name in sorted(required - functions.keys()):
+    for name in sorted(hooks.keys() - functions.keys()):
         candidates = [
             functions.get(f"{name}{suffix}")
             for suffix in ("_dep", "_dependency")
             if functions.get(f"{name}{suffix}") is not None
         ]
-        if len(candidates) != 1:
+        if len(candidates) == 1:
+            function = candidates[0]
+            old_name = function.name
+            function.name = name
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id == old_name:
+                    node.id = name
+        elif source := hooks[name].get("source"):
+            parsed = _parsed(source)
+            if parsed is None or len(parsed.body) != 1 or not isinstance(
+                parsed.body[0], (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                continue
+            insert_at = 1 if (
+                tree.body and isinstance(tree.body[0], ast.Expr)
+                and isinstance(tree.body[0].value, ast.Constant)
+                and isinstance(tree.body[0].value.value, str)
+            ) else 0
+            while insert_at < len(tree.body) and isinstance(
+                tree.body[insert_at], (ast.Import, ast.ImportFrom)
+            ):
+                insert_at += 1
+            tree.body.insert(insert_at, parsed.body[0])
+        else:
             continue
-        function = candidates[0]
-        old_name = function.name
-        function.name = name
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id == old_name:
-                node.id = name
         changed = True
     if not changed:
         return content

@@ -1050,7 +1050,7 @@ def framework_seam_violations(
             and _resolve_module(statement.module, statement.level, path)
             in _module_names(auth_provider)
             and any(alias.name == "current_user" for alias in statement.names)
-            for statement in tree.body
+            for statement in ast.walk(tree)
         )
         injected = any(
             isinstance(node, ast.Dict)
@@ -4390,6 +4390,7 @@ async def _execute_initial_cluster(
                         "model": model_label,
                         "action": "contract_rejected",
                         "violations": final_broken.get(task.target_path, [])[:10],
+                        "rejected_draft": contents.get(task.target_path, "")[:12000],
                         "at": _now(),
                     },
                 )
@@ -4953,6 +4954,7 @@ async def execute_node(state: GraphState) -> GraphState:
                         "model": model_label,
                         "action": "contract_rejected",
                         "violations": final_broken[:10],
+                        "rejected_draft": content[:12000],
                         "at": _now(),
                     },
                 )

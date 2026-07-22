@@ -754,6 +754,13 @@ def test_unowned_same_project_import_is_rejected_before_sandbox():
     violations = contract_violations(relative, {}, "watchlist/app.py", seam_plan)
     assert any("watchlist.utils" in item and "neither exists" in item for item in violations)
 
+    seam_plan = {
+        "project_modules": ["pkg", "pkg.email"], "project_roots": ["pkg"],
+    }
+    assert contract_violations(
+        "from email.message import EmailMessage\n", {}, "pkg/email.py", seam_plan,
+    ) == []
+
 
 @pytest.mark.asyncio
 async def test_architect_call_is_validated_accounted_and_frozen(tmp_path, monkeypatch):

@@ -1278,9 +1278,12 @@ def _request_hook_facts(source: str) -> list[dict]:
         }
         if not decorators:
             continue
+        preserved = ast.parse(ast.unparse(function)).body[0]
+        preserved.decorator_list = []
         hooks.append({
             "function": function.name,
             "scope": sorted(decorators)[0],
+            "source": ast.unparse(preserved),
             "session_keys": sorted({
                 node.args[0].value
                 for node in ast.walk(function)
@@ -1374,6 +1377,9 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
                 consumer_tree = _parsed(files.get(consumer, ""))
                 if consumer_tree is None:
                     continue
+                literal_wrappers = set(_flask_babel_literal_bindings(
+                    files.get(consumer, ""),
+                ))
                 for node in ast.walk(consumer_tree):
                     if (
                         isinstance(node, ast.Call)
@@ -1397,7 +1403,18 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
                                 try:
                                     value = ast.literal_eval(node.value)
                                 except (TypeError, ValueError):
-                                    continue
+                                    wrapped = node.value
+                                    if not (
+                                        isinstance(wrapped, ast.Call)
+                                        and ast.unparse(wrapped.func) in literal_wrappers
+                                        and len(wrapped.args) == 1
+                                        and not wrapped.keywords
+                                    ):
+                                        continue
+                                    try:
+                                        value = ast.literal_eval(wrapped.args[0])
+                                    except (TypeError, ValueError):
+                                        continue
                                 if isinstance(value, (str, int, float, bool, type(None))):
                                     attribute_values[target.attr] = value
                 for function in (
@@ -1704,6 +1721,19 @@ def _direct_test_context_imports(files: dict[str, str]) -> dict[str, list[dict]]
     return found
 
 
+def _flask_current_app_consumers(files: dict[str, str]) -> list[str]:
+    """Files that source Flask's ambient application proxy."""
+    return sorted(
+        path for path, source in files.items()
+        if (tree := _parsed(source)) is not None
+        and any(
+            isinstance(node, ast.ImportFrom) and node.module == "flask"
+            and any(alias.name == "current_app" for alias in node.names)
+            for node in tree.body
+        )
+    )
+
+
 def _render_alias(alias: dict) -> str:
     return alias["name"] + (f" as {alias['asname']}" if alias.get("asname") else "")
 
@@ -1848,6 +1878,29 @@ def _template_framework_globals(files: dict[str, str]) -> list[str]:
         for name in ["current_user"]
         if has_login_manager and re.search(rf"\b{re.escape(name)}\b", templates)
     ]
+
+
+def _flask_babel_literal_bindings(source: str) -> list[str]:
+    """Names whose one-literal-argument calls can become plain target strings."""
+    tree = _parsed(source)
+    if tree is None:
+        return []
+    bindings = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and statement.module == "flask_babel"
+        for alias in statement.names
+        if alias.name in {"_", "gettext", "lazy_gettext"}
+    }
+    bindings.update(
+        f"{alias.asname or alias.name}.{name}"
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names if alias.name == "flask_babel"
+        for name in ("gettext", "lazy_gettext")
+    )
+    return sorted(bindings)
 
 
 def _template_context_processor_contracts(files: dict[str, str]) -> list[dict]:

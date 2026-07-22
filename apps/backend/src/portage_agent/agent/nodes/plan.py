@@ -629,7 +629,8 @@ async def plan_node(state: GraphState) -> GraphState:
         module for path in project_paths for module in _module_names(path)
     })
     seam_plan["project_roots"] = sorted({
-        module.split(".")[0] for module in seam_plan["project_modules"] if module
+        path.removesuffix(".py").split("/", 1)[0]
+        for path in project_paths if path
     })
     if replan and state.get("seam_plan"):
         old = state["seam_plan"]

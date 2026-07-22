@@ -47,6 +47,8 @@ from ._flask_analysis import (
     _factory_endpoint_aliases,
     _factory_local_imports,
     _factory_static_mount,
+    _flask_babel_literal_bindings,
+    _flask_current_app_consumers,
     _flask_login_consumer_contracts,
     _initializer_contracts,
     _instance_export_contracts,
@@ -67,6 +69,7 @@ from ._flask_analysis import (
     _view_decorator_contracts,
 )
 from ._flask_runtime import (
+    _normalize_project_import_levels,
     _realize_ambient_request_binding,
     _realize_cli_factory,
     _realize_decorated_provider_protocols,
@@ -80,10 +83,12 @@ from ._flask_runtime import (
 )
 from ._flask_web import (
     _normalize_exception_handler_status,
+    _normalize_fastapi_mail_import,
     _normalize_mutated_fetchone_rows,
     _normalize_redirect_urls,
     _normalize_session_middleware_import,
     _normalize_template_response,
+    _normalize_translation_literals,
     _normalize_werkzeug_abort,
     _realize_authentication_consumers,
     _realize_blueprint_error_handlers,
@@ -118,6 +123,9 @@ class FlaskToFastAPIRecipe:
     def normalize_generated(
         path: str, content: str, seam_plan: dict | None = None,
     ) -> str:
+        content = _normalize_project_import_levels(path, content, seam_plan)
+        content = _normalize_translation_literals(path, content, seam_plan)
+        content = _normalize_fastapi_mail_import(content)
         content = _normalize_session_middleware_import(content)
         content = _normalize_template_response(content)
         content = _normalize_exception_handler_status(content)
@@ -390,6 +398,17 @@ class FlaskToFastAPIRecipe:
                         return _current().pop(name, default)
 
 
+                class _CurrentAppProxy:
+                    def __getattr__(self, name: str):
+                        try:
+                            return getattr(_current()["app"], name)
+                        except KeyError as exc:
+                            raise RuntimeError("no active application context") from exc
+
+                    def __bool__(self):
+                        return "app" in _current()
+
+
                 class _SessionProxy(MutableMapping):
                     @staticmethod
                     def _values() -> dict:
@@ -412,6 +431,7 @@ class FlaskToFastAPIRecipe:
 
 
                 g = _GProxy()
+                current_app = _CurrentAppProxy()
                 session = _SessionProxy()
 
 
@@ -433,7 +453,10 @@ class FlaskToFastAPIRecipe:
 
                 class {class_name}(BaseHTTPMiddleware):
                     async def dispatch(self, request: Request, call_next):
-                        state = {{"request": request, "session": request.session}}
+                        state = {{
+                            "app": request.app, "request": request,
+                            "session": request.session,
+                        }}
                         token = _push_context(state)
                         try:
                             return await call_next(request)
@@ -649,7 +672,9 @@ class FlaskToFastAPIRecipe:
                             self._tokens = []
 
                         def {entry_member}(self):
-                            self._tokens.append(_push_context())
+                            self._tokens.append(_push_context({{
+                                "app": self._app, "session": {{}},
+                            }}))
                             return self._app
 
                         def {exit_member}(self):
@@ -732,7 +757,7 @@ class FlaskToFastAPIRecipe:
 
                     @contextmanager
                     def app_context(self):
-                        token = _push_context()
+                        token = _push_context({{"app": self, "session": {{}}}})
                         try:
                             yield self
                         finally:
@@ -1052,6 +1077,7 @@ class FlaskToFastAPIRecipe:
             if "authentication" in item.get("capabilities", [])
         ]
         template_globals = _template_framework_globals(files)
+        current_app_consumers = _flask_current_app_consumers(files)
         returned_lifecycles = _returned_lifecycle_contracts(files, factory_paths)
         template_owners = [
             item for item in completed
@@ -1220,6 +1246,8 @@ class FlaskToFastAPIRecipe:
                     if "session_and_flash" in runtime_owner.get("capabilities", []) else {}
                 ),
             }
+            if current_app_consumers:
+                runtime_support["current_app"] = "variable"
             if len(template_owners) == 1 and (
                 runtime_owner["path"] != template_owners[0]["path"]
             ):
@@ -1919,6 +1947,21 @@ class FlaskToFastAPIRecipe:
                 ),
             }
 
+        for pf in planned:
+            bindings = _flask_babel_literal_bindings(files.get(pf.path, ""))
+            if bindings:
+                decisions[f"translation_literals:{pf.path}"] = {
+                    "kind": "translation_literals",
+                    "path": pf.path,
+                    "files": [pf.path],
+                    "bindings": bindings,
+                    "instruction": (
+                        "Replace source Flask-Babel gettext/lazy_gettext calls whose sole "
+                        "argument is a literal with that same target string; do not retain "
+                        "the unavailable Flask-Babel runtime dependency."
+                    ),
+                }
+
         auth_owners = [
             pf for pf in planned
             if pf.action == "create" and "authentication" in (
@@ -2376,6 +2419,7 @@ class FlaskToFastAPIRecipe:
             )
         )
         if runtime_context_providers and test_context_providers:
+            current_app_consumers = _flask_current_app_consumers(files)
             runtime_classes = {
                 pf.path: sorted(
                     export["name"]
@@ -2388,12 +2432,13 @@ class FlaskToFastAPIRecipe:
                 "kind": "ambient_context_runtime",
                 "files": sorted({
                     *runtime_context_providers, *test_context_providers, *factory_paths,
-                    *session_paths,
+                    *session_paths, *current_app_consumers,
                 }),
                 "runtime_providers": runtime_context_providers,
                 "runtime_classes": runtime_classes,
                 "test_providers": test_context_providers,
                 "factory_files": sorted(factory_paths),
+                "current_app_consumers": current_app_consumers,
                 "instruction": (
                     "Use one ambient request-state implementation, never parallel "
                     "ContextVars. The runtime provider owns the live ContextVar-backed "
@@ -2436,6 +2481,13 @@ class FlaskToFastAPIRecipe:
                 "files": template_files,
                 "provider_files": template_provider_paths,
                 "provider_functions": template_functions,
+                "consumer_functions": {
+                    consumer: sorted(_exercised_flask_template_functions(
+                        files, {consumer},
+                    ))
+                    for consumer in template_files
+                    if consumer not in template_provider_paths
+                },
                 "context_globals": _template_framework_globals(files),
                 "authentication_provider": (
                     auth_owners[0].path if len(auth_owners) == 1 else ""

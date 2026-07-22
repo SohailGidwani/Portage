@@ -375,6 +375,7 @@ async def test_plan_checkpoints_cut_and_uses_it_as_coordinated_unit(tmp_path, mo
     })
 
     assert result["seam_plan"]["version"] == 2
+    assert "views" not in result["seam_plan"]["project_roots"]
     assert result["seam_plan"]["execution_cuts"] == [{
         "id": "executable-cut-1",
         "paths": ["pkg/views.py", "pkg/__init__.py", "tests/conftest.py"],

@@ -531,6 +531,11 @@ def create_app():
             bare_lifespan, plan, "pkg/__init__.py",
         )
     )
+    realized = recipe.normalize_generated(
+        "pkg/__init__.py", bare_lifespan, plan,
+    )
+    assert "@asynccontextmanager\nasync def lifespan(app):" in realized
+    assert framework_seam_violations(realized, plan, "pkg/__init__.py") == []
 
 
 def test_blueprint_route_names_are_frozen_realized_and_checked():
@@ -1263,6 +1268,10 @@ def login():
     }]
     assert plan["decisions"]["request_hooks:pkg/auth.py"]["hooks"] == [{
         "function": "load_logged_in_user", "scope": "before_app_request",
+        "source": (
+            "def load_logged_in_user():\n"
+            "    g.user = session.get('user_id')"
+        ),
         "session_keys": ["user_id"], "context_members": ["user"],
     }]
 
@@ -1298,6 +1307,20 @@ async def login(request: Request):
     assert "def load_logged_in_user(" in normalized
     assert "Depends(load_logged_in_user)" in normalized
     assert "load_logged_in_user_dependency" not in normalized
+
+    restored = recipe.normalize_generated(
+        "pkg/auth.py",
+        "from fastapi import APIRouter, Depends\n"
+        "from pkg.runtime import g, session\n"
+        "bp = APIRouter(dependencies=[Depends(load_logged_in_user)])\n",
+        plan,
+    )
+    assert "def load_logged_in_user():" in restored
+    assert "g.user = session.get('user_id')" in restored
+    assert not any(
+        "pre-request hook" in item
+        for item in framework_seam_violations(restored, plan, "pkg/auth.py")
+    )
     assert framework_seam_violations(normalized, plan, "pkg/auth.py") == []
 
 
@@ -1364,7 +1387,7 @@ def test_template_consumers_pass_the_endpoint_request_to_the_provider():
     }
     generated = """\
 from starlette.requests import Request
-from .rendering import render_template as render
+from .rendering import render_template as render, templates
 
 async def page(request: Request):
     return render('page.html', value=1)
@@ -1373,6 +1396,31 @@ async def page(request: Request):
     normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
 
     assert "render(request, 'page.html', value=1)" in normalized
+    assert "templates" not in normalized
+
+    frozen = {"decisions": {"templates": {
+        **plan["decisions"]["templates"],
+        "consumer_functions": {
+            "pkg/views.py": ["render_template", "url_for"],
+        },
+        "provider_functions": {
+            "pkg/rendering.py": ["render_template", "url_for"],
+        },
+    }}}
+    miswired = """\
+from fastapi.templating import Jinja2Templates
+from pkg.runtime import url_for
+templates = Jinja2Templates(directory='templates')
+def render(request, name, **context):
+    return templates.TemplateResponse(request, name, context)
+def page(request):
+    return render(request, 'page.html'), url_for('home')
+"""
+    normalized = recipe.normalize_generated("pkg/views.py", miswired, frozen)
+    assert "from pkg.rendering import render_template, url_for" in normalized
+    assert "from pkg.runtime import url_for" not in normalized
+    assert "def render(" not in normalized
+    assert "render_template(request, 'page.html')" in normalized
 
     missing_request = """\
 from fastapi import APIRouter, Depends
@@ -1385,6 +1433,114 @@ async def page(store=Depends(object)):
     normalized = recipe.normalize_generated("pkg/views.py", missing_request, plan)
     assert "async def page(request: Request, store=Depends(object))" in normalized
     assert "render(request, 'page.html', value=1)" in normalized
+
+
+def test_template_auth_global_is_loaded_at_render_time_to_avoid_provider_cycles():
+    plan = {"decisions": {"templates": {
+        "kind": "template_runtime",
+        "files": ["pkg/templating.py"],
+        "provider_files": ["pkg/templating.py"],
+        "context_globals": ["current_user"],
+        "authentication_provider": "pkg/authentication.py",
+    }}}
+    generated = (
+        "from pkg.authentication import current_user\n"
+        "def render_template():\n"
+        "    values = {}\n"
+        "    return values\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/templating.py", generated, plan)
+
+    assert "\nfrom pkg.authentication import current_user" not in normalized
+    assert "    from pkg.authentication import current_user" in normalized
+    assert "'current_user': current_user" in normalized
+    assert not any(
+        "must inject the frozen" in item
+        for item in framework_seam_violations(normalized, plan, "pkg/templating.py")
+    )
+
+
+def test_source_translation_literals_and_invented_mail_dependency_are_realized():
+    files = {"pkg/notifications.py": (
+        "from flask_babel import gettext as translate\n"
+        "def title(): return translate('Welcome')\n"
+    )}
+    planned = [_pf("pkg/notifications.py", "support", "auth_login")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    assert plan["decisions"][
+        "translation_literals:pkg/notifications.py"
+    ]["bindings"] == ["translate"]
+    translated = recipe.normalize_generated(
+        "pkg/notifications.py",
+        "def title():\n    return translate('Welcome')\n",
+        plan,
+    )
+    namespace = {}
+    exec(translated, namespace)
+    assert namespace["title"]() == "Welcome"
+    assert "translate(" not in translated
+
+    underscore_files = {"pkg/views.py": (
+        "from flask_babel import _\n"
+        "def title(name): return _('Welcome %(name)s', name=name)\n"
+    )}
+    underscore_plan = recipe.build_seam_plan(
+        underscore_files, [_pf("pkg/views.py", "router", "route_to_endpoint")], {}, [],
+    )
+    assert underscore_plan["decisions"][
+        "translation_literals:pkg/views.py"
+    ]["bindings"] == ["_"]
+    translated = recipe.normalize_generated(
+        "pkg/views.py", underscore_files["pkg/views.py"], underscore_plan,
+    )
+    assert "flask_babel" not in translated
+    namespace = {}
+    exec(translated, namespace)
+    assert namespace["title"]("Ada") == "Welcome Ada"
+
+    generated_mail = """\
+from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+config = ConnectionConfig(MAIL_FROM='sender@example.com', MAIL_SERVER='smtp.example.com')
+message = MessageSchema(
+    subject='Subject', recipients=['reader@example.com'], body='<b>Hello</b>',
+    subtype=MessageType.html,
+)
+"""
+    normalized_mail = recipe.normalize_generated(
+        "pkg/email.py", generated_mail, {},
+    )
+    assert "fastapi_mail" not in normalized_mail
+    namespace = {}
+    exec(normalized_mail, namespace)
+
+    class Mailbox:
+        sent = []
+
+        def __init__(self, server, port):
+            self.server = server
+            self.port = port
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def send_message(self, message):
+            self.sent.append(message)
+
+    namespace["_portage_smtplib"].SMTP = Mailbox
+    namespace["_portage_smtplib"].SMTP_SSL = Mailbox
+    __import__("asyncio").run(
+        namespace["FastMail"](namespace["config"]).send_message(
+            namespace["message"],
+        )
+    )
+    sent = Mailbox.sent[-1]
+    assert sent["Subject"] == "Subject"
+    assert sent["From"] == "sender@example.com"
+    assert sent["To"] == "reader@example.com"
 
 
 def test_request_hook_wiring_is_checked_across_its_provider_consumer_cut():
@@ -1412,6 +1568,30 @@ def test_request_hook_wiring_is_checked_across_its_provider_consumer_cut():
         ),
     }
     assert _cluster_violations(good, {}, plan, {}) == {}
+
+
+def test_misleveled_relative_import_uses_nearest_existing_project_module():
+    plan = {
+        "project_modules": [
+            "pkg", "pkg.api", "pkg.models", "pkg.runtime", "models", "runtime",
+        ],
+        "decisions": {},
+    }
+    generated = (
+        "from .models import User\n"
+        "from .runtime import session\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/api/authentication.py", generated, plan)
+
+    assert "from pkg.models import User" in normalized
+    assert "from pkg.runtime import session" in normalized
+    assert not any(
+        "neither exists" in item
+        for item in framework_seam_violations(
+            normalized, plan, "pkg/api/authentication.py",
+        )
+    )
 
 
 def test_before_app_request_is_promoted_from_router_to_global_dependency():
@@ -1465,7 +1645,8 @@ def create_app():
     realized = recipe.normalize_generated("pkg/__init__.py", factory, plan)
 
     assert "from fastapi import FastAPI, Depends" in realized
-    assert "from .auth import bp, load_user" in realized
+    assert "from .auth import bp" in realized
+    assert "    from pkg.auth import load_user" in realized
     assert "FastAPI(dependencies=[Depends(load_user)])" in realized
     assert _cluster_violations(
         {"pkg/auth.py": auth, "pkg/__init__.py": realized}, {}, plan, {},
@@ -1740,6 +1921,33 @@ def test_direct_test_surface_is_rendered_and_constructed_by_its_consumer(tmp_pat
         for item in framework_seam_violations(realized, plan, "pkg/app.py")
     )
 
+    testing_provider = PlannedFile(
+        path="pkg/testing.py", role="support", action="create",
+        artifact_contract={
+            "capabilities": ["direct_test_surface"],
+            "exports": [{
+                "name": "AppFacade", "kind": "class", "members": ["testing"],
+            }],
+            "consumers": ["pkg/app.py"], "depends_on": [],
+        },
+    )
+    testing_plan = recipe.build_seam_plan(
+        {}, [testing_provider, factory], {}, [],
+    )
+    duplicate_app = """\
+from fastapi import FastAPI
+from pkg.testing import AppFacade
+def create_app():
+    raw_app = FastAPI()
+    application = AppFacade(testing=False)
+    if not raw_app.testing:
+        application.state.ready = True
+    return application
+"""
+    realized = recipe.normalize_generated("pkg/app.py", duplicate_app, testing_plan)
+    assert "if not application.testing:" in realized
+    assert "raw_app.testing" not in realized
+
 
 def test_public_export_may_call_local_factory_that_returns_owned_facade():
     manifest = {
@@ -2004,12 +2212,16 @@ def create_app():
 
     missing_install = bad_factory.replace(
         "lifespan=RuntimeContext.manage_session", "lifespan=RuntimeContext()",
-    ).replace("    app.add_middleware(RuntimeContext)\n", "")
+    ).replace("    app.add_middleware(RuntimeContext)\n", "").replace(
+        "def create_app():",
+        "def helper():\n    value = object()\n    return value\ndef create_app():",
+    )
     normalized_missing = recipe.normalize_generated(
         "pkg/app.py", missing_install, plan,
     )
     assert "lifespan=" not in normalized_missing
     assert "app.add_middleware(RuntimeContext)" in normalized_missing
+    assert "value.add_middleware" not in normalized_missing
     assert normalized_missing.index("add_middleware(RuntimeContext)") < (
         normalized_missing.index("add_middleware(SessionMiddleware")
     )
@@ -2217,6 +2429,10 @@ def test_contract_compiler_canonicalizes_context_and_test_facade(
     files = {
         "pkg/app.py": "from flask import Flask\ndef create_app(): return Flask(__name__)\n",
         "pkg/auth.py": "from flask import g, session\nprint(g.user, session.get('id'))\n",
+        "pkg/search.py": (
+            "from flask import current_app\n"
+            "def enabled(): return bool(current_app.state.search)\n"
+        ),
         "tests/test_factory.py": (
             "def test_factory(app):\n"
             "    assert app.testing\n"
@@ -2228,6 +2444,7 @@ def test_contract_compiler_canonicalizes_context_and_test_facade(
     planned = [
         _pf("pkg/app.py", "app_factory", "app_factory"),
         _pf("pkg/auth.py", "router", "request_context", "sessions_flash"),
+        _pf("pkg/search.py", "support", "request_context"),
         _pf("tests/test_factory.py", "test_harness", "test_harness"),
         _pf("tests/test_auth.py", "test_harness", "test_harness"),
     ]
@@ -2273,7 +2490,7 @@ def test_contract_compiler_canonicalizes_context_and_test_facade(
         export["name"] for export in runtime["exports"]
         if export["kind"] == "function"
     }
-    assert {"g", "session", "flash", "get_flashed_messages"} <= {
+    assert {"g", "session", "current_app", "flash", "get_flashed_messages"} <= {
         export["name"] for export in runtime["exports"]
     }
     assert next(
@@ -2304,7 +2521,31 @@ def test_contract_compiler_canonicalizes_context_and_test_facade(
         str(tmp_path),
     )
     assert "class RequestContextMiddleware(BaseHTTPMiddleware)" in rendered_runtime
+    assert "current_app = _CurrentAppProxy()" in rendered_runtime
+    assert '"app": request.app' in rendered_runtime
     assert "class app_context(FastAPI)" in rendered_testing
+
+
+def test_source_current_app_consumer_uses_frozen_runtime_proxy_not_factory_reentry():
+    plan = {"decisions": {"ambient": {
+        "kind": "ambient_context_runtime",
+        "runtime_providers": ["pkg/runtime.py"],
+        "runtime_classes": {"pkg/runtime.py": ["RuntimeContext"]},
+        "current_app_consumers": ["pkg/search.py"],
+    }}}
+    generated = (
+        "from pkg import create_app\n"
+        "app = create_app()\n"
+        "def enabled():\n"
+        "    return bool(app.state.config.get('SEARCH_URL'))\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/search.py", generated, plan)
+
+    assert "create_app" not in normalized
+    assert "app =" not in normalized
+    assert "from pkg.runtime import current_app" in normalized
+    assert "current_app.state.config.get('SEARCH_URL')" in normalized
 
 
 def test_combined_template_owner_gets_canonical_export_and_renderer_declines(tmp_path):
@@ -2642,6 +2883,8 @@ def test_factory_normalization_completes_partial_object_config_from_source_contr
         "def create_app(config_class=Config):\n"
         "    app = FastAPI()\n"
         "    app.state.config = {'TESTING': False}\n"
+        "    if app.testing:\n"
+        "        pass\n"
         "    return app\n"
     )
 
@@ -2649,9 +2892,21 @@ def test_factory_normalization_completes_partial_object_config_from_source_contr
 
     assert "dir(config_class)" in normalized
     assert "'TESTING': False" in normalized
+    assert "app.state.config.get('TESTING', False)" in normalized
+    assert "app.testing" not in normalized
     assert not any(
         "omits original default keys" in item
         for item in framework_seam_violations(normalized, plan, "pkg/app.py")
+    )
+
+    update_only = generated.replace(
+        "app.state.config = {'TESTING': False}",
+        "app.state.config.update({'TESTING': False})",
+    )
+    normalized = recipe.normalize_generated("pkg/app.py", update_only, plan)
+    assert "app.state.config = {_portage_config_key: getattr(config_class" in normalized
+    assert normalized.index("app.state.config =") < normalized.index(
+        "app.state.config.update"
     )
 
 
@@ -2715,7 +2970,7 @@ def test_extension_provider_uses_source_factory_database_config():
         not in normalized
     )
     assert "uri = app.state.config.get('SQLALCHEMY_DATABASE_URI')" in normalized
-    assert "self.session.configure(bind=self.engine)" in normalized
+    assert "provider.session.configure(bind=provider.engine)" in normalized
 
 
 def test_dynamic_class_lambda_methods_receive_the_bound_instance():
@@ -2764,7 +3019,9 @@ def test_direct_decorator_provider_protocol_is_binding_aware_and_realized():
     files = {
         "pkg/security.py": (
             "from flask_httpauth import HTTPTokenAuth\n"
+            "from flask_babel import lazy_gettext as translate\n"
             "sentinel = HTTPTokenAuth()\n"
+            "sentinel.label = translate('Access')\n"
             "@sentinel.verify\n"
             "def remember(value): return value\n"
         ),
@@ -2783,10 +3040,12 @@ def test_direct_decorator_provider_protocol_is_binding_aware_and_realized():
     protocol = plan["decisions"]["provider_protocol:pkg/security.py:sentinel"]
     assert protocol["decorator_members"] == ["guard", "verify"]
     assert protocol["callable_members"] == ["init_app"]
+    assert protocol["attribute_values"] == {"label": "Access"}
     assert protocol["consumers"] == ["pkg/views.py"]
 
     generated = (
-        "class Carrier: pass\n"
+        "class Carrier:\n"
+        "    label = translate('wrong')\n"
         "sentinel = Carrier()\n"
         "@sentinel.verify\n"
         "def remember(value): return value\n"
@@ -2802,6 +3061,7 @@ def test_direct_decorator_provider_protocol_is_binding_aware_and_realized():
     namespace = {}
     exec(normalized, namespace)
     assert type(namespace["sentinel"]).__name__ == "Carrier"
+    assert namespace["sentinel"].label == "Access"
     assert namespace["remember"]("kept") == "kept"
     assert namespace["sentinel"].init_app(object()) is None
     assert framework_seam_violations(
@@ -3104,7 +3364,7 @@ def test_returned_lifecycle_contract_uses_source_names_and_real_object(tmp_path)
     events = []
     executable = rendered.replace(
         "from pkg.runtime import _pop_context, _push_context",
-        "def _push_context():\n"
+        "def _push_context(state=None):\n"
         "    events.append('entered')\n"
         "    return len(events)\n"
         "def _pop_context(token):\n"
@@ -3153,10 +3413,8 @@ def test_request_hook_materialization_cannot_reintroduce_provider_cycle():
 
     normalized = recipe.normalize_generated("app/__init__.py", generated, plan)
 
-    assert "from app.main.routes import before_request" in normalized
-    assert normalized.index("db = DBFacade()") < normalized.index(
-        "from app.main.routes import before_request"
-    )
+    assert "    from app.main.routes import before_request" in normalized
+    assert "\nfrom app.main.routes import before_request" not in normalized
     assert not any(
         "imports consumer" in item
         for item in framework_seam_violations(normalized, plan, "app/__init__.py")
@@ -3310,6 +3568,90 @@ def test_extension_mapping_is_realized_as_source_exercised_object_surface():
     assert framework_seam_violations(
         direct_namespace, plan, "pkg/__init__.py",
     ) == []
+
+
+def test_source_exercised_sqlalchemy_methods_work_on_both_facade_shapes():
+    members = [
+        "Model", "create_all", "drop_all", "first_or_404", "get_or_404",
+        "init_app", "metadata", "paginate", "session",
+    ]
+    plan = {"decisions": {"extension_provider:pkg/__init__.py:db": {
+        "kind": "extension_provider", "provider": "pkg/__init__.py",
+        "symbol": "db", "files": ["pkg/__init__.py", "pkg/models.py"],
+        "consumers": ["pkg/models.py"], "members": members,
+    }}}
+    prefix = (
+        "from sqlalchemy import create_engine, select\n"
+        "from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, "
+        "sessionmaker\n"
+        "class Base(DeclarativeBase): pass\n"
+        "engine = create_engine('sqlite://')\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+    )
+    suffix = (
+        "class Record(Base):\n"
+        "    __tablename__ = 'record'\n"
+        "    id: Mapped[int] = mapped_column(primary_key=True)\n"
+    )
+    generated = [
+        prefix
+        + "class DBFacade:\n"
+        "    engine = engine\n"
+        "    Base = Base\n"
+        "    SessionLocal = SessionLocal\n"
+        "db = DBFacade()\n"
+        + suffix,
+        prefix
+        + "db = {'engine': engine, 'Base': Base, "
+        "'SessionLocal': SessionLocal}\n"
+        + suffix,
+    ]
+
+    for content in generated:
+        normalized = recipe.normalize_generated("pkg/__init__.py", content, plan)
+        normalized = recipe.normalize_generated(
+            "pkg/__init__.py",
+            normalized.replace("from sqlalchemy.pool import StaticPool\n", ""),
+            plan,
+        )
+        assert "from sqlalchemy.pool import StaticPool" in normalized
+        assert framework_seam_violations(
+            normalized, plan, "pkg/__init__.py",
+        ) == []
+        namespace = {}
+        exec(normalized, namespace)
+        db = namespace["db"]
+        record = namespace["Record"]
+        select = namespace["select"]
+        db.create_all()
+        db.session.add_all([record(id=1), record(id=2)])
+        db.session.commit()
+
+        assert db.get_or_404(record, 1).id == 1
+        assert db.first_or_404(select(record).where(record.id == 2)).id == 2
+        first = db.paginate(select(record).order_by(record.id), page=1, per_page=1)
+        second = db.paginate(select(record).order_by(record.id), page=2, per_page=1)
+        assert [item.id for item in first.items] == [1]
+        assert (first.total, first.pages, first.has_next, first.next_num) == (
+            2, 2, True, 2,
+        )
+        assert (second.has_prev, second.prev_num) == (True, 1)
+        try:
+            db.get_or_404(record, 99)
+        except namespace["HTTPException"] as exc:
+            assert exc.status_code == 404
+        else:
+            raise AssertionError("get_or_404 returned instead of raising")
+
+        original_engine = db.engine
+        state = type("State", (), {"config": {
+            "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+        }})()
+        app = type("App", (), {"state": state})()
+        db.init_app(app)
+        assert db.engine is not original_engine
+        assert str(db.engine.url) == "sqlite:///:memory:"
+        db.session.remove()
 
 
 def test_repeated_capability_requires_one_artifact_owner_covering_all_consumers():

@@ -170,5 +170,6 @@ async def test_cluster_never_writes_a_persistently_invalid_final_repair(
     assert any(
         call.kwargs.get("status") == "skipped"
         and call.kwargs.get("append_attempt", {}).get("action") == "contract_rejected"
+        and call.kwargs.get("append_attempt", {}).get("rejected_draft") == source
         for call in update.await_args_list
     )
