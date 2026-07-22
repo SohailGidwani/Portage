@@ -66,6 +66,33 @@ def test_plan_only_acceptance_metric_is_independent_of_test_counts():
     assert result.metric("architect_acceptance_rate") == 1.0
 
 
+@pytest.mark.parametrize("tree_state", ["hybrid", "restored_coherent"])
+def test_non_migrated_tree_cannot_inflate_the_test_pass_metric(
+    tmp_path, tree_state,
+):
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "tasks_total": 2, "tasks_done": 1, "tasks": [],
+        "recovery": {}, "llm_usage": {}, "oracle_integrity": {},
+        "migration_outcome": "failed", "tree_state": tree_state,
+    }))
+    now = datetime.now(UTC)
+    job = SimpleNamespace(
+        status="done", test_summary={"passed": 23, "total": 24},
+        report_path=str(report), created_at=now, updated_at=now,
+    )
+    repo = CorpusRepo(
+        name="sample", repo_url="/sample", recipe="flask_to_fastapi",
+        tier="structural", stresses=[], source="bundled",
+    )
+
+    result = _harvest(repo, "baseline", 1, job, uuid.uuid4())
+
+    assert result.tree_state == tree_state
+    assert result.tests_passed == 0
+    assert result.metric("test_pass_rate") == 0.0
+
+
 @pytest.mark.asyncio
 async def test_replay_suite_requires_diagnostic_name_before_enqueue():
     with pytest.raises(ValueError, match="replay suite names"):

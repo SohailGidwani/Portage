@@ -202,8 +202,8 @@ def test_resource_router_factory_and_harness_are_one_cut():
         "pkg/db.py", "pkg/views.py", "pkg/__init__.py", "tests/conftest.py",
     ]
     assert set(analysis["cuts"][0]["edge_kinds"]) == {
-        "extension_initialization", "factory_harness", "framework_state",
-        "resource_lifecycle", "router_registration",
+        "extension_initialization", "factory_harness", "factory_provider_call",
+        "framework_state", "resource_lifecycle", "router_registration",
     }
 
 

@@ -100,6 +100,7 @@ class RunResult:
     architect_accepted: bool = False
     architect_repairs: int = 0
     architect_rejection_class: str = ""
+    tree_state: str = ""
 
     def metric(self, name: str) -> float:
         if name == "suite_green":
@@ -217,6 +218,10 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     r.oracle_integrity_rate = float(oracle.get("integrity_rate") or 0.0)
     r.no_progress_retries = int(rec.get("no_progress_retries") or 0)
     r.migration_outcome = str(report.get("migration_outcome") or "failed")
+    r.tree_state = str(report.get("tree_state") or ts.get("tree_state") or "")
+    if r.tree_state in {"hybrid", "restored_coherent"}:
+        # A non-migrated suite is forensic evidence, not a migration score.
+        r.tests_passed = 0
 
     if plan_only and job.status == "done":
         architect = (report.get("artifact_plan") or {}).get("architect")

@@ -59,6 +59,7 @@ from .common import (
     non_python_listing,
     planned_artifact_topology_violations,
     read_file,
+    restore_cut_checkpoint,
     run_git,
     worktree_diff,
     write_file,
@@ -82,6 +83,49 @@ _CLUSTER_BLOCK = re.compile(
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+async def _restore_rejected_batch(
+    worktree: str, batch_paths: list[str], checkpoint: dict, snapshots: list,
+) -> list[str]:
+    """Restore an executable cut when any member was rejected before Verify."""
+    by_path = {task.target_path: task for task in snapshots if task.target_path}
+    rejected = {
+        path: by_path[path]
+        for path in batch_paths
+        if path in by_path
+        and by_path[path].status in {TaskStatus.skipped.value, TaskStatus.failed.value}
+    }
+    if not rejected or not checkpoint:
+        return []
+
+    records = checkpoint.get("files", {})
+    restored = restore_cut_checkpoint(worktree, checkpoint)
+    for path in restored:
+        task = by_path.get(path)
+        record = records.get(path, {})
+        if task is None:
+            continue
+        if not record.get("existed"):
+            await run_git("reset", "--", path, cwd=worktree)
+        baseline_done = record.get("status") == TaskStatus.done.value
+        current = read_file(worktree, path) or ""
+        await task_store.update_task(
+            task.id,
+            status=(TaskStatus.done.value if baseline_done else TaskStatus.skipped.value),
+            content_hash=content_hash(current) if record.get("existed") else None,
+            error=(
+                None if baseline_done else
+                getattr(rejected.get(path), "error", None)
+                or "another executable-cut member was rejected; restored the whole cut"
+            ),
+            cascade_subtasks=True,
+            append_attempt={
+                "action": "rejected_cut_checkpoint_restore",
+                "at": _now(),
+            },
+        )
+    return restored
 
 
 def _tier_for(attempt: int) -> tuple[str, str, str]:
@@ -463,6 +507,63 @@ def caller_contract_violations(
     return out
 
 
+def planned_provider_import_violations(
+    content: str, manifest: dict[str, dict], path: str,
+) -> list[str]:
+    """Keep consumer imports inside the frozen surface of planned providers."""
+    providers: dict[str, set[str]] = {}
+    for pin in manifest.values():
+        if pin.get("provenance") == "planned_create" and pin.get("module") != path:
+            providers.setdefault(pin["module"], set()).add(pin["symbol"])
+    if not providers:
+        return []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    def provider_for(module: str) -> str | None:
+        matches = [owner for owner in providers if module in _module_names(owner)]
+        return matches[0] if len(matches) == 1 else None
+
+    module_bindings: dict[str, str] = {}
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = _resolve_module(node.module, node.level, path)
+            owner = provider_for(module)
+            for alias in node.names:
+                if owner and alias.name != "*" and alias.name not in providers[owner]:
+                    out.append(
+                        f"{path}:{node.lineno}: imports undeclared `{alias.name}` from "
+                        f"planned provider {owner}; declare it in that provider's frozen "
+                        "exports or consume an existing export"
+                    )
+                    continue
+                candidate = f"{module}.{alias.name}".lstrip(".")
+                if candidate_owner := provider_for(candidate):
+                    module_bindings[alias.asname or alias.name] = candidate_owner
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if owner := provider_for(alias.name):
+                    module_bindings[alias.asname or alias.name.split(".")[0]] = owner
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in module_bindings
+        ):
+            continue
+        owner = module_bindings[node.value.id]
+        if node.attr not in providers[owner]:
+            out.append(
+                f"{path}:{node.lineno}: reads undeclared `{node.attr}` from planned "
+                f"provider {owner}; declare it in that provider's frozen exports or "
+                "consume an existing export"
+            )
+    return list(dict.fromkeys(out))
+
+
 def planned_capability_consumer_violations(
     content: str, manifest: dict[str, dict], path: str,
 ) -> list[str]:
@@ -514,9 +615,44 @@ def planned_capability_consumer_violations(
             )
             )
 
+        local_factories = {
+            node.name: node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def factory_returns_constructor(
+            name: str, factories: dict = local_factories,
+        ) -> bool:
+            function = factories.get(name)
+            if function is None:
+                return False
+            constructed = {
+                target.id
+                for statement in ast.walk(function)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and is_constructor(statement.value)
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if isinstance(target, ast.Name)
+            }
+            return any(
+                isinstance(node, ast.Return) and (
+                    is_constructor(node.value)
+                    or isinstance(node.value, ast.Name) and node.value.id in constructed
+                )
+                for node in ast.walk(function)
+            )
+
         exported = any(
             isinstance(statement, (ast.Assign, ast.AnnAssign))
-            and is_constructor(statement.value)
+            and (
+                is_constructor(statement.value)
+                or isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and factory_returns_constructor(statement.value.func.id)
+            )
             and any(
                 isinstance(target, ast.Name)
                 and (not public_symbols or target.id in public_symbols)
@@ -592,14 +728,129 @@ def _direct_body_nodes(
     return found
 
 
+def _constructed_surface_members(tree: ast.Module, symbol: str) -> set[str]:
+    """Members statically exposed by one module-level constructed facade."""
+    value = next((
+        statement.value
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == symbol
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+        )
+    ), None)
+    members = {
+        target.attr
+        for statement in tree.body if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name) and target.value.id == symbol
+    }
+    if not isinstance(value, (ast.Call, ast.Name)):
+        return members
+    class_name = (
+        value.func.id if isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+        else value.id if isinstance(value, ast.Name) else ""
+    )
+    if isinstance(value, ast.Call):
+        members.update(keyword.arg for keyword in value.keywords if keyword.arg)
+    class_node = next((
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ), None)
+    if class_node is None:
+        return members
+    members.update(
+        node.name for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    )
+    members.update(
+        target.id
+        for node in class_node.body if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+    )
+    members.update(
+        node.target.id for node in class_node.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    )
+    initializer = next((
+        node for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "__init__"
+    ), None)
+    if initializer is not None:
+        members.update(
+            target.attr
+            for node in ast.walk(initializer)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name) and target.value.id == "self"
+        )
+    return members
+
+
+def _constructed_callable_members(tree: ast.Module, symbol: str) -> set[str]:
+    """Callable subset of a module-level provider's statically realized surface."""
+    functions = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    members = {
+        target.attr
+        for statement in tree.body if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name) and target.value.id == symbol
+        and (
+            isinstance(statement.value, ast.Lambda)
+            or isinstance(statement.value, ast.Name) and statement.value.id in functions
+        )
+    }
+    value = next((
+        statement.value
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == symbol
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+        )
+    ), None)
+    class_name = (
+        value.func.id
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+        else ""
+    )
+    provider_class = next((
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ), None)
+    if provider_class is not None:
+        members.update(
+            node.name for node in provider_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    return members
+
+
 def framework_seam_violations(
     content: str, seam_plan: dict, path: str, manifest: dict[str, dict] | None = None,
 ) -> list[str]:
     """Reject capabilities that no frozen plan-owned artifact implements."""
-    relevant = [
-        d for d in seam_plan.get("decisions", {}).values()
-        if path in d.get("files", [])
-    ]
+    decisions = list(seam_plan.get("decisions", {}).values())
+    relevant = [d for d in decisions if path in d.get("files", [])]
     owned_pins = [
         pin for pin in (manifest or {}).values()
         if pin.get("provenance") == "planned_create"
@@ -628,6 +879,376 @@ def framework_seam_violations(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     out: list[str] = []
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "provider_protocol"
+        and item.get("provider") == path
+    ):
+        missing = (
+            set(decision.get("decorator_members", []))
+            | set(decision.get("callable_members", []))
+        ) - (
+            _constructed_callable_members(tree, decision["symbol"])
+        )
+        if missing:
+            out.append(
+                f"{path}: provider `{decision['symbol']}` is missing callable "
+                f"source-decorator members {sorted(missing)}"
+            )
+        missing_attributes = set(decision.get("attribute_members", [])) - (
+            _constructed_surface_members(tree, decision["symbol"])
+        )
+        if missing_attributes:
+            out.append(
+                f"{path}: provider `{decision['symbol']}` is missing source-assigned "
+                f"members {sorted(missing_attributes)}"
+            )
+        assigned_values = {}
+        for statement in tree.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == decision["symbol"]
+                ):
+                    continue
+                try:
+                    assigned_values[target.attr] = ast.literal_eval(statement.value)
+                except (TypeError, ValueError):
+                    pass
+        provider_assignment = next((
+            statement for statement in tree.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == decision["symbol"]
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+        ), None)
+        provider_class_name = (
+            provider_assignment.value.func.id
+            if provider_assignment is not None
+            and isinstance(provider_assignment.value, ast.Call)
+            and isinstance(provider_assignment.value.func, ast.Name)
+            else ""
+        )
+        provider_class = next((
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == provider_class_name
+        ), None)
+        for statement in provider_class.body if provider_class else []:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    try:
+                        assigned_values.setdefault(
+                            target.id, ast.literal_eval(statement.value),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+        for member, expected in decision.get("attribute_values", {}).items():
+            if assigned_values.get(member) != expected:
+                out.append(
+                    f"{path}: provider `{decision['symbol']}.{member}` must preserve "
+                    f"the source literal value {expected!r}"
+                )
+        for callback in decision.get("callbacks", []):
+            expected_tree = ast.parse(callback["source"])
+            actual = next((
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == callback["function"]
+            ), None)
+            if actual is None or ast.dump(actual) != ast.dump(expected_tree.body[0]):
+                out.append(
+                    f"{path}: preserve source-neutral provider callback "
+                    f"`{callback['function']}` exactly"
+                )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "authentication_runtime"
+        and path in item.get("consumer_bindings", {})
+    ):
+        bindings = decision["consumer_bindings"][path]
+        provider = decision["provider"]
+        imported = {
+            (alias.name, alias.asname or alias.name)
+            for statement in tree.body if isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path)
+            in _module_names(provider)
+            for alias in statement.names
+        }
+        expected = {(item["symbol"], item["local"]) for item in bindings}
+        missing = expected - imported
+        if missing:
+            out.append(
+                f"{path}: authentication consumer must import frozen provider names "
+                f"{sorted(missing)} from {provider}"
+            )
+        top_level = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        duplicated = top_level & {item["local"] for item in bindings}
+        if duplicated:
+            out.append(
+                f"{path}: authentication consumer duplicates provider-owned names "
+                f"{sorted(duplicated)}"
+            )
+        for binding in bindings:
+            allowed = {
+                (shape["positional"], tuple(shape["keywords"]))
+                for shape in binding.get("call_shapes", [])
+            }
+            if not allowed:
+                continue
+            calls = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == binding["local"]
+                and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                and all(keyword.arg is not None for keyword in node.keywords)
+            ]
+            if not calls:
+                out.append(
+                    f"{path}: missing source-observed call to authentication provider "
+                    f"`{binding['local']}`"
+                )
+            for call in calls:
+                shape = (
+                    len(call.args),
+                    tuple(sorted(keyword.arg for keyword in call.keywords if keyword.arg)),
+                )
+                if shape not in allowed:
+                    out.append(
+                        f"{path}:{call.lineno}: authentication call `{binding['local']}` "
+                        f"has shape {shape}, expected one of {sorted(allowed)}"
+                    )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "template_runtime"
+        and path in item.get("provider_files", [])
+        and "current_user" in item.get("context_globals", [])
+    ):
+        auth_provider = decision.get("authentication_provider", "")
+        imported = any(
+            isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path)
+            in _module_names(auth_provider)
+            and any(alias.name == "current_user" for alias in statement.names)
+            for statement in tree.body
+        )
+        injected = any(
+            isinstance(node, ast.Dict)
+            and any(
+                isinstance(key, ast.Constant) and key.value == "current_user"
+                for key in node.keys
+            )
+            for node in ast.walk(tree)
+        )
+        if not imported or not injected:
+            out.append(
+                f"{path}: template provider must inject the frozen `current_user` "
+                f"proxy from {auth_provider}"
+            )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "template_context_processors"
+    ):
+        if path in decision.get("factory_files", []):
+            for contract in (
+                item for item in decision.get("processors", [])
+                if item["provider"] == path
+            ):
+                factory = next((
+                    node for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == contract["factory"]
+                ), None)
+                callback = next((
+                    node for node in (factory.body if factory else [])
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == contract["function"]
+                ), None)
+                if callback is None:
+                    out.append(
+                        f"{path}: template context processor "
+                        f"`{contract['function']}` is missing from its source factory"
+                    )
+                    continue
+                if contract.get("source"):
+                    expected = ast.parse(contract["source"]).body[0]
+                    expected.decorator_list = []
+                    if ast.dump(callback) != ast.dump(expected):
+                        out.append(
+                            f"{path}: preserve source-neutral template context "
+                            f"processor `{contract['function']}` exactly"
+                        )
+                target = (
+                    f"{contract['receiver']}.state._portage_context_processors"
+                )
+                registered = any(
+                    isinstance(statement, (ast.Assign, ast.AnnAssign))
+                    and any(
+                        ast.unparse(candidate) == target
+                        for candidate in (
+                            statement.targets if isinstance(statement, ast.Assign)
+                            else [statement.target]
+                        )
+                    )
+                    and isinstance(statement.value, (ast.Tuple, ast.List))
+                    and contract["function"] in {
+                        item.id for item in statement.value.elts
+                        if isinstance(item, ast.Name)
+                    }
+                    for statement in factory.body
+                )
+                if not registered:
+                    out.append(
+                        f"{path}: register source template context processor "
+                        f"`{contract['function']}` on the target application"
+                    )
+        if path in decision.get("template_provider_files", []):
+            has_registry_read = any(
+                isinstance(node, ast.Constant)
+                and node.value == "_portage_context_processors"
+                for node in ast.walk(tree)
+            )
+            has_mapping_merge = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "values"
+                and node.func.attr == "update"
+                and node.args and isinstance(node.args[0], ast.Call)
+                for node in ast.walk(tree)
+            )
+            if not has_registry_read or not has_mapping_merge:
+                out.append(
+                    f"{path}: template provider must merge all frozen source "
+                    "context-processor mappings at request time"
+                )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "returned_lifecycle"
+        and item.get("provider") == path
+    ):
+        owner = next((
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == decision.get("class")
+        ), None)
+        for contract in decision.get("contracts", []):
+            factory = next((
+                node for node in (owner.body if owner else [])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == contract["factory_member"]
+            ), None)
+            returned_class = next((
+                node.value.func.id
+                for node in (ast.walk(factory) if factory is not None else ())
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+            ), "")
+            lifecycle_class = next((
+                node for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name == returned_class
+            ), None)
+            realized = {
+                node.name for node in (lifecycle_class.body if lifecycle_class else [])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            required = {
+                contract["entry_member"], contract["exit_member"],
+                "__enter__", "__exit__",
+            }
+            if factory is None or not required <= realized:
+                out.append(
+                    f"{path}: `{contract['factory_member']}` must return a lifecycle "
+                    f"object with callable members {sorted(required)}"
+                )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "extension_provider"
+        and item.get("provider") == path
+    ):
+        symbol = decision["symbol"]
+        missing = set(decision.get("members", [])) - _constructed_surface_members(
+            tree, symbol,
+        )
+        if missing:
+            out.append(
+                f"{path}: SQLAlchemy provider `{symbol}` is missing source-exercised "
+                f"members {sorted(missing)}"
+            )
+        consumers = decision.get("consumers", [])
+        provider_index = next((
+            index for index, statement in enumerate(tree.body)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == symbol
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+        ), None)
+        for index, node in enumerate(tree.body):
+            modules = []
+            if isinstance(node, ast.ImportFrom):
+                base = _resolve_module(node.module, node.level, path)
+                modules = [base, *(
+                    f"{base}.{alias.name}".lstrip(".") for alias in node.names
+                )]
+            elif isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            consumer = next((
+                consumer for consumer in consumers
+                if any(module in _module_names(consumer) for module in modules)
+            ), None)
+            if consumer and (provider_index is None or index < provider_index):
+                out.append(
+                    f"{path}:{node.lineno}: extension provider `{symbol}` imports "
+                    f"consumer {consumer} before provider initialization; construct "
+                    "the provider first"
+                )
+
+    for _decision in (
+        item for item in relevant
+        if item.get("kind") == "application_factory"
+        and item.get("factory") == path and item.get("config_from_objects")
+    ):
+        for node in ast.walk(tree):
+            copied = None
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "vars" and node.args
+            ):
+                copied = "vars()"
+            elif isinstance(node, ast.Attribute) and node.attr == "__dict__":
+                copied = "__dict__"
+            if copied:
+                out.append(
+                    f"{path}:{node.lineno}: {copied} drops inherited Flask "
+                    "config.from_object settings; copy uppercase dir()/getattr() values"
+                )
 
     if "allowed_import_roots" in seam_plan:
         allowed_imports = {
@@ -749,6 +1370,307 @@ def framework_seam_violations(
                 f"`{node.attr}` API; middleware and exception handlers belong to the "
                 "FastAPI application"
             )
+    for function in (
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func).split(".")[-1] == "exception_handler"
+            for decorator in node.decorator_list
+        )
+    ):
+        if any(
+            isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Tuple)
+            and len(node.value.elts) == 2
+            and isinstance(node.value.elts[1], ast.Constant)
+            and isinstance(node.value.elts[1].value, int)
+            for node in ast.walk(function)
+        ):
+            out.append(
+                f"{path}:{function.lineno}: FastAPI exception handlers must return a "
+                "Response carrying status_code, not a Flask (response, status) tuple"
+            )
+
+    def _exception_names(node: ast.AST | None) -> set[str]:
+        if isinstance(node, ast.Tuple):
+            return {name for item in node.elts for name in _exception_names(item)}
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return {ast.unparse(node).split(".")[-1]}
+        return set()
+
+    def _matches_error_response(call: ast.Call, contract: dict) -> bool:
+        status = next((
+            keyword.value for keyword in call.keywords
+            if keyword.arg == "status_code"
+        ), None)
+        content = next((
+            keyword.value for keyword in call.keywords if keyword.arg == "content"
+        ), None)
+        if not isinstance(status, ast.Constant) or not isinstance(content, ast.Dict):
+            return False
+        keys = sorted(
+            key.value for key in content.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        )
+        return status.value == contract["status_code"] and keys == contract["json_keys"]
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "error_handler_ownership"
+    ):
+        handlers = decision.get("handlers", [])
+        if decision.get("owner") == path:
+            for contract in handlers:
+                functions = [
+                    function for function in ast.walk(tree)
+                    if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and any(
+                        isinstance(decorator, ast.Call) and decorator.args
+                        and ast.unparse(decorator.func).split(".")[-1]
+                        == "exception_handler"
+                        and contract["exception_name"]
+                        in _exception_names(decorator.args[0])
+                        for decorator in function.decorator_list
+                    )
+                ]
+                responses = [
+                    call for function in functions for call in ast.walk(function)
+                    if isinstance(call, ast.Call)
+                    and ast.unparse(call.func).split(".")[-1] == "JSONResponse"
+                ]
+                realized = any(
+                    _matches_error_response(call, contract) for call in responses
+                )
+                if not realized:
+                    out.append(
+                        f"{path}: exception handler `{contract['exception']}` must return "
+                        f"status {contract['status_code']} with top-level JSON keys "
+                        f"{contract['json_keys']}"
+                    )
+
+        owned_names = {item["exception_name"] for item in handlers}
+        for function_name in decision.get("route_functions", {}).get(path, []):
+            function = next((
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            ), None)
+            caught = {
+                name for node in (ast.walk(function) if function is not None else [])
+                if isinstance(node, ast.ExceptHandler)
+                for name in _exception_names(node.type)
+            }
+            if swallowed := caught & owned_names:
+                out.append(
+                    f"{path}: route `{function_name}` catches app-owned exceptions "
+                    f"{sorted(swallowed)}; let them propagate to the frozen response "
+                    "envelope handlers"
+                )
+
+    for decision in (
+        item for item in relevant if item.get("kind") == "blueprint_error_handlers"
+    ):
+        handlers = decision.get("handlers", [])
+        if decision.get("handler_path") == path:
+            for contract in handlers:
+                function = next((
+                    node for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == contract["function"]
+                ), None)
+                if function is None:
+                    out.append(
+                        f"{path}: blueprint error handler `{contract['function']}` is missing"
+                    )
+                    continue
+                invalid_decorators = [
+                    ast.unparse(decorator)
+                    for decorator in function.decorator_list
+                    if isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr in {
+                        "errorhandler", "app_errorhandler", "exception_handler",
+                        "route", "get", "post", "put", "patch", "delete",
+                    }
+                ]
+                if invalid_decorators:
+                    out.append(
+                        f"{path}: blueprint handler `{contract['function']}` must be an "
+                        f"undecorated app-owned function, got {invalid_decorators}"
+                    )
+                calls = {
+                    ast.unparse(node.func).split(".")[-1]
+                    for node in ast.walk(function) if isinstance(node, ast.Call)
+                }
+                if missing := set(contract.get("response_helpers", [])) - calls:
+                    out.append(
+                        f"{path}: blueprint handler `{contract['function']}` omits "
+                        f"source response helpers {sorted(missing)}"
+                    )
+                constants = {
+                    node.value for node in ast.walk(function)
+                    if isinstance(node, ast.Constant)
+                }
+                missing_status = set(contract.get("status_codes", [])) - constants
+                missing_literals = set(contract.get("response_literals", [])) - constants
+                if missing_status or missing_literals:
+                    out.append(
+                        f"{path}: blueprint handler `{contract['function']}` changed "
+                        f"frozen response status/body literals; missing "
+                        f"{sorted({*missing_status, *missing_literals}, key=str)}"
+                    )
+                positional = [
+                    argument.arg
+                    for argument in [*function.args.posonlyargs, *function.args.args]
+                ]
+                if len(positional) < 2 or positional[0] != "request":
+                    out.append(
+                        f"{path}: app-owned handler `{contract['function']}` must accept "
+                        "request and exception arguments"
+                    )
+
+            for helper in (
+                helper for contract in handlers
+                for helper in contract.get("payload_helpers", [])
+            ):
+                function = next((
+                    node for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == helper["function"]
+                ), None)
+                if function is None:
+                    out.append(
+                        f"{path}: response helper `{helper['function']}` is missing"
+                    )
+                    continue
+                constants = {
+                    node.value for node in ast.walk(function)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                }
+                missing = set(helper.get("string_literals", [])) - constants
+                returned = {
+                    node.elts[1].id
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Tuple) and len(node.elts) >= 2
+                    and isinstance(node.elts[1], ast.Name)
+                }
+                missing_status = (
+                    set(helper.get("returned_status_parameters", [])) - returned
+                )
+                if missing or missing_status:
+                    out.append(
+                        f"{path}: response helper `{helper['function']}` changed frozen "
+                        f"payload/status facts; missing literals {sorted(missing)} and "
+                        f"status parameters {sorted(missing_status)}"
+                    )
+
+        if path in decision.get("factory_files", []):
+            top_level_handler_imports = []
+            for contract in handlers:
+                handler_module = contract["handler_path"].removesuffix(".py").replace(
+                    "/", ".",
+                )
+                top_level_handler_imports.extend(
+                    alias.name
+                    for node in tree.body if isinstance(node, ast.ImportFrom)
+                    and _resolve_module(node.module, node.level, path) == handler_module
+                    for alias in node.names if alias.name == contract["function"]
+                )
+            if top_level_handler_imports:
+                out.append(
+                    f"{path}: blueprint handlers must be imported inside the application "
+                    f"factory to avoid provider cycles, got {top_level_handler_imports}"
+                )
+            registrations = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_exception_handler" and len(node.args) >= 2
+            ]
+            for contract in handlers:
+                registration = contract["registration"]
+                if registration["kind"] == "status":
+                    registered = any(
+                        isinstance(call.args[0], ast.Constant)
+                        and call.args[0].value == registration["value"]
+                        for call in registrations
+                    )
+                elif registration["kind"] == "builtin":
+                    registered = any(
+                        isinstance(call.args[0], ast.Name)
+                        and call.args[0].id == registration["symbol"]
+                        for call in registrations
+                    )
+                else:
+                    exception_refs = {
+                        alias.asname or alias.name
+                        for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                        and _resolve_module(node.module, node.level, path)
+                        == registration["module"]
+                        for alias in node.names if alias.name == registration["symbol"]
+                    }
+                    registered = any(
+                        isinstance(call.args[0], ast.Name)
+                        and call.args[0].id in exception_refs
+                        for call in registrations
+                    )
+                handler_module = contract["handler_path"].removesuffix(".py").replace(
+                    "/", ".",
+                )
+                handler_refs = {
+                    alias.asname or alias.name
+                    for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                    and _resolve_module(node.module, node.level, path) == handler_module
+                    for alias in node.names if alias.name == contract["function"]
+                }
+                wrapper_names = {
+                    call.args[1].id for call in registrations
+                    if isinstance(call.args[1], ast.Name)
+                }
+                forwards = any(
+                    isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and function.name in wrapper_names
+                    and any(
+                        isinstance(node, ast.Name) and node.id in handler_refs
+                        for node in ast.walk(function)
+                    )
+                    for function in ast.walk(tree)
+                )
+                if not registered or not handler_refs or not forwards:
+                    out.append(
+                        f"{path}: application factory must register source handler "
+                        f"{handler_module}::{contract['function']} for "
+                        f"{registration.get('source', registration.get('value'))}"
+                    )
+
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "test_harness" and item.get("path") == path
+    ):
+        for function_name in decision.get("direct_json_return_functions", []):
+            functions = [
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            ]
+            direct = any(
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr in {"get_json", "json"}
+                for function in functions for node in ast.walk(function)
+            )
+            unwraps_detail = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "detail"
+                for function in functions for node in ast.walk(function)
+            )
+            if not direct or unwraps_detail:
+                out.append(
+                    f"{path}: test helper `{function_name}` must return response JSON "
+                    "directly; application error envelopes cannot be unwrapped in tests"
+                )
 
     def _attribute_path(node: ast.AST) -> tuple[str, ...]:
         parts: list[str] = []
@@ -831,11 +1753,14 @@ def framework_seam_violations(
                     updates.setdefault(node.args[0].id, []).append(node.lineno)
         return keys, writes, updates
 
-    def _imported_callable_refs(module_path: str, symbol: str) -> set[str]:
+    def _imported_callable_refs(
+        module_path: str, symbol: str,
+        function: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
+    ) -> set[str]:
         refs: set[str] = set()
         wanted = _module_names(module_path)
         tails = {name.split(".")[-1] for name in wanted}
-        for node in tree.body:
+        for node in [*tree.body, *(function.body if function else [])]:
             if isinstance(node, ast.ImportFrom):
                 module = _resolve_module(node.module, node.level, path)
                 if module in wanted or module.split(".")[-1] in tails:
@@ -857,8 +1782,47 @@ def framework_seam_violations(
         item for item in relevant
         if item.get("kind") == "application_factory" and item.get("factory") == path
     ):
+        application_factory = next((
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "create_app"
+        ), None)
+        for contract in decision.get("local_imports", []):
+            top_level = any(
+                isinstance(node, ast.ImportFrom)
+                and _resolve_module(node.module, node.level, path) == contract["module"]
+                and any(alias.name == contract["symbol"] for alias in node.names)
+                for node in tree.body
+            )
+            if top_level:
+                out.append(
+                    f"{path}: source-local import {contract['module']}::"
+                    f"{contract['symbol']} must remain inside create_app to avoid "
+                    "provider cycles"
+                )
         config_keys, config_writes, config_updates = _state_config_written_keys()
         required_keys = set(decision.get("config_keys", []))
+        object_sources = set(decision.get("config_from_objects", []))
+        copies_object_config = any(
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                _is_state_config(target)
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+            and any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == "dir"
+                and len(node.args) == 1
+                and ast.unparse(node.args[0]) in object_sources
+                for node in ast.walk(statement.value)
+            )
+            for statement in ast.walk(application_factory or tree)
+        )
+        if copies_object_config:
+            config_keys.update(required_keys)
         if required_keys and not config_writes:
             out.append(
                 f"{path}: application factory must create a plain app.state.config dict "
@@ -885,10 +1849,10 @@ def framework_seam_violations(
         )
         for initializer in decision.get("initializers", []):
             refs = _imported_callable_refs(
-                initializer["provider"], initializer["symbol"],
+                initializer["provider"], initializer["symbol"], application_factory,
             )
             calls = [
-                node.lineno for node in ast.walk(tree)
+                node.lineno for node in ast.walk(application_factory or tree)
                 if isinstance(node, ast.Call) and ast.unparse(node.func) in refs
             ]
             if not calls:
@@ -905,9 +1869,13 @@ def framework_seam_violations(
         owner_calls = [
             node for node in ast.walk(tree) if is_owned_constructor(node)
         ]
-        for callback in decision.get("cleanup_callbacks", []):
+        # Only a frozen plan-owned facade accepts cleanup callbacks. Raw FastAPI apps
+        # adapted in test plumbing have no such constructor contract.
+        for callback in decision.get("cleanup_callbacks", []) if owner_calls else []:
             for function_name in callback.get("functions", []):
-                refs = _imported_callable_refs(callback["provider"], function_name)
+                refs = _imported_callable_refs(
+                    callback["provider"], function_name, application_factory,
+                )
                 wired = any(
                     any(
                         ast.unparse(node) in refs for node in ast.walk(keyword.value)
@@ -1109,15 +2077,60 @@ def framework_seam_violations(
     for decision in (
         item for item in relevant if item.get("kind") == "route_names"
     ):
+        def route_shape(value: str) -> str:
+            shaped = re.sub(r"\{[^}]+\}", "{}", value)
+            return shaped.rstrip("/") or "/"
+
         functions = {
             node.name: node for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        router_prefixes: dict[str, set[str]] = {}
         for route in decision.get("routes", []):
-            function = functions.get(route["function"])
+            route_path = route.get("path")
+            route_functions = [
+                function for function in functions.values()
+                if function.name == route["function"] or route_path and any(
+                    isinstance(decorator, ast.Call)
+                    and decorator.args
+                    and isinstance(decorator.args[0], ast.Constant)
+                    and isinstance(decorator.args[0].value, str)
+                    and route_shape(decorator.args[0].value)
+                    == route_shape(route_path)
+                    for decorator in function.decorator_list
+                )
+            ]
+            if route.get("prefix"):
+                receivers = {
+                    decorator.func.value.id
+                    for function in route_functions
+                    for decorator in function.decorator_list
+                    if isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and isinstance(decorator.func.value, ast.Name)
+                }
+                receivers.update(
+                    call.func.value.id
+                    for call in ast.walk(tree)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.attr == "add_api_route"
+                    and len(call.args) >= 2
+                    and isinstance(call.args[1], ast.Name)
+                    and (
+                        call.args[1].id == route["function"]
+                        or route_path and isinstance(call.args[0], ast.Constant)
+                        and isinstance(call.args[0].value, str)
+                        and route_shape(call.args[0].value) == route_shape(route_path)
+                    )
+                )
+                for receiver in receivers:
+                    router_prefixes.setdefault(receiver, set()).add(route["prefix"])
             names = {
                 keyword.value.value
-                for decorator in (function.decorator_list if function else [])
+                for function in route_functions
+                for decorator in function.decorator_list
                 if isinstance(decorator, ast.Call)
                 and isinstance(decorator.func, ast.Attribute)
                 and decorator.func.attr in {
@@ -1129,10 +2142,56 @@ def framework_seam_violations(
                 and isinstance(keyword.value, ast.Constant)
                 and isinstance(keyword.value.value, str)
             }
+            names.update(
+                keyword.value.value
+                for call in ast.walk(tree)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "add_api_route"
+                and len(call.args) >= 2
+                and isinstance(call.args[1], ast.Name)
+                and (
+                    call.args[1].id == route["function"]
+                    or route_path and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                    and route_shape(call.args[0].value) == route_shape(route_path)
+                )
+                for keyword in call.keywords
+                if keyword.arg == "name"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            )
             if route["name"] not in names:
                 out.append(
                     f"{path}: route `{route['function']}` must preserve reverse-URL "
                     f"name {route['name']!r}"
+                )
+        for receiver, expected in router_prefixes.items():
+            router = next((
+                statement.value
+                for statement in tree.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and isinstance(statement.value, ast.Call)
+                and ast.unparse(statement.value.func).split(".")[-1] == "APIRouter"
+                and any(
+                    isinstance(target, ast.Name) and target.id == receiver
+                    for target in (
+                        statement.targets if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                )
+            ), None)
+            actual = {
+                keyword.value.value
+                for keyword in (router.keywords if router else [])
+                if keyword.arg == "prefix"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            }
+            if len(expected) == 1 and actual != expected:
+                out.append(
+                    f"{path}: router `{receiver}` must preserve source URL prefix "
+                    f"{next(iter(expected))!r}"
                 )
 
     for decision in (
@@ -1140,11 +2199,18 @@ def framework_seam_violations(
     ):
         for contract in decision.get("decorators", []):
             function = module_defs.get(contract["function"])
-            wrapper = next((
+            nested = [
                 node for node in (function.body if function else [])
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == contract["wrapper"]
-            ), None)
+            ]
+            returned = {
+                node.value.id for node in (ast.walk(function) if function else ())
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+            }
+            wrapper = next(
+                (node for node in nested if node.name == contract["wrapper"]),
+                next((node for node in nested if node.name in returned), None),
+            )
             wrapped = wrapper is not None and any(
                 isinstance(decorator, ast.Call)
                 and ast.unparse(decorator.func).split(".")[-1] == "wraps"
@@ -1307,6 +2373,52 @@ def framework_seam_violations(
                     "context-manager receiver"
                 )
 
+    for decision in (
+        item for item in relevant
+        if item.get("kind") == "planned_test_surface"
+        and item.get("provider") != path and path in item.get("files", [])
+    ):
+        classes = decision.get("classes", [])
+        if len(classes) != 1:
+            continue
+        class_name = classes[0]["name"]
+        provider = decision["provider"]
+        refs = {
+            alias.asname or alias.name
+            for node in tree.body if isinstance(node, ast.ImportFrom)
+            and _resolve_module(node.module, node.level, path) in _module_names(provider)
+            for alias in node.names if alias.name == class_name
+        }
+        returned = {
+            node.value.id for function in tree.body
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and function.name == "create_app"
+            for node in ast.walk(function)
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+        }
+        constructed = {
+            target.id
+            for scope in [tree, *(function for function in tree.body
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and function.name == "create_app")]
+            for statement in scope.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id in refs
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+            and (scope is tree or target.id in returned)
+        }
+        if not refs or not constructed:
+            out.append(
+                f"{path}: public application must construct planned facade "
+                f"{provider}::{class_name}, not a raw FastAPI instance"
+            )
+
     forbidden_attrs = {
         "app_context", "test_client", "test_cli_runner", "container",
         "open_resource", "cli_runner", "instance_path", "testing",
@@ -1376,6 +2488,26 @@ def framework_seam_violations(
         d for d in relevant
         if d.get("kind") == "resource_lifecycle" and d.get("module") == path
     ]
+    ambient_runtime_providers = {
+        provider
+        for decision in decisions
+        if decision.get("kind") == "ambient_context_runtime"
+        for provider in decision.get("runtime_providers", [])
+    }
+    ambient_runtime_modules = {
+        module
+        for provider in ambient_runtime_providers
+        for module in _module_names(provider)
+    }
+    planned_ambient_g_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and _resolve_module(statement.module, statement.level, path)
+        in ambient_runtime_modules
+        for alias in statement.names
+        if alias.name == "g"
+    }
     for decision in (
         item for item in relevant
         if item.get("kind") == "mixed_form_routes" and item.get("path") == path
@@ -1456,7 +2588,9 @@ def framework_seam_violations(
                     f"{path}: ambient runtime provider must own the shared ContextVar "
                     "state used by request and test-context proxies"
                 )
-            runtime_classes = {
+            runtime_classes = set(
+                decision.get("runtime_classes", {}).get(path, [])
+            ) or {
                 pin["symbol"] for pin in (manifest or {}).values()
                 if pin.get("module") == path and pin.get("target_kind") == "class"
             }
@@ -1473,6 +2607,50 @@ def framework_seam_violations(
                     out.append(
                         f"{path}:{cls.lineno}: ambient context class `{class_name}` must "
                         "implement request middleware (`dispatch` or `__call__`)"
+                    )
+                    continue
+                middleware = next((
+                    node for node in cls.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in {"dispatch", "__call__"}
+                ), None) if cls is not None else None
+                if middleware is None:
+                    continue
+                positional = [
+                    *middleware.args.posonlyargs, *middleware.args.args,
+                ]
+                request_name = next((
+                    argument.arg for argument in positional
+                    if argument.arg != "self"
+                ), "")
+                request_bound = any(
+                    isinstance(node, ast.Dict)
+                    and any(
+                        isinstance(key, ast.Constant) and key.value == "request"
+                        and isinstance(value, ast.Name) and value.id == request_name
+                        for key, value in zip(node.keys, node.values, strict=True)
+                    )
+                    for node in ast.walk(middleware)
+                ) or any(
+                    isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and any(
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value == "request"
+                        for target in (
+                            node.targets if isinstance(node, ast.Assign)
+                            else [node.target]
+                        )
+                    )
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == request_name
+                    for node in ast.walk(middleware)
+                )
+                if request_name and not request_bound:
+                    out.append(
+                        f"{path}:{middleware.lineno}: ambient context middleware must "
+                        "retain the active request for request-backed compatibility "
+                        "providers"
                     )
         if path in test_providers and path not in runtime_providers:
             imported_runtime = any(
@@ -1518,6 +2696,17 @@ def framework_seam_violations(
                 if isinstance(node.args[0], ast.Name)
                 and node.args[0].id == "SessionMiddleware"
             ]
+            inline_middleware_positions = [
+                node.lineno
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and any(
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "middleware"
+                    for decorator in node.decorator_list
+                )
+            ]
             constructor_orders = []
             for keyword in (
                 keyword
@@ -1552,6 +2741,8 @@ def framework_seam_violations(
             elif (
                 context_positions and session_positions
                 and max(context_positions) >= min(session_positions)
+                or inline_middleware_positions and session_positions
+                and max(inline_middleware_positions) >= min(session_positions)
                 or wrong_constructor_order
             ):
                 out.append(
@@ -1563,15 +2754,14 @@ def framework_seam_violations(
                 node for node in ast.walk(tree) if isinstance(node, ast.Call)
             ):
                 for keyword in call.keywords:
-                    if (
-                        keyword.arg == "lifespan"
-                        and isinstance(keyword.value, ast.Attribute)
-                        and isinstance(keyword.value.value, ast.Name)
-                        and keyword.value.value.id in runtime_classes
-                    ):
+                    lifespan_context = next((
+                        node.id for node in ast.walk(keyword.value)
+                        if isinstance(node, ast.Name) and node.id in runtime_classes
+                    ), None) if keyword.arg == "lifespan" else None
+                    if lifespan_context:
                         out.append(
                             f"{path}:{call.lineno}: ambient request-context owner "
-                            f"`{keyword.value.value.id}` is middleware, not an "
+                            f"`{lifespan_context}` is middleware, not an "
                             "application lifespan"
                         )
 
@@ -1582,12 +2772,27 @@ def framework_seam_violations(
         for node in ast.walk(function):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in {
                 "app", "application", "request", "current_app", "g",
-            }:
+            } and node.id not in planned_ambient_g_names:
                 out.append(
                     f"{decision['symbol']}:{getattr(node, 'lineno', '?')}: direct resource "
-                    f"helper reads `{node.id}`; pinned helpers must use module-owned "
-                    "configuration and keep their no-context call shape"
+                    f"helper reads `{node.id}`; pinned helpers must use module-owned or "
+                    "frozen runtime-owned context and keep their no-context call shape"
                 )
+        unsupported_g_members = {
+            node.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in planned_ambient_g_names
+        } - set(decision.get("context_cache_members", []))
+        if unsupported_g_members:
+            out.append(
+                f"{decision['symbol']}:{function.lineno}: frozen `g` may cache only "
+                f"source-observed resource members "
+                f"{sorted(decision.get('context_cache_members', []))}; move "
+                f"{sorted(unsupported_g_members)} to module-owned configuration copied "
+                "by the provider initializer"
+            )
 
         if decision.get("context_cache_members"):
             opens_directly = any(
@@ -2022,6 +3227,26 @@ def framework_seam_violations(
     for decision in (d for d in relevant if d.get("kind") == "standalone_cli"):
         commands = decision.get("commands", {})
         command_bindings = decision.get("command_bindings", [])
+        router_types = {
+            alias.asname or alias.name
+            for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and statement.module == "fastapi"
+            for alias in statement.names if alias.name == "APIRouter"
+        }
+        routers = {
+            target.id
+            for statement in tree.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id in router_types
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+        }
         for binding in (
             item for item in command_bindings if item.get("module") == path
         ):
@@ -2084,7 +3309,7 @@ def framework_seam_violations(
             if (
                 isinstance(node, ast.Attribute) and node.attr == "cli"
                 and isinstance(node.value, ast.Name)
-                and node.value.id in {"app", "application"}
+                and node.value.id in {"app", "application", *routers}
             ):
                 out.append(
                     f"{path}:{node.lineno}: FastAPI has no `{ast.unparse(node)}`; keep "
@@ -2295,6 +3520,9 @@ def contract_violations(
     capability_violations = planned_capability_consumer_violations(
         content, manifest, path,
     )
+    provider_import_violations = planned_provider_import_violations(
+        content, manifest, path,
+    )
     seam_violations = framework_seam_violations(
         content, seam_plan or {}, path, manifest,
     )
@@ -2308,7 +3536,8 @@ def contract_violations(
                 f"cannot satisfy its interface contract"]
     if not pins:
         return [
-            *caller_violations, *capability_violations, *seam_violations,
+            *caller_violations, *capability_violations, *provider_import_violations,
+            *seam_violations,
             *topology_violations,
         ]
     defined: dict[str, ast.stmt] = {}
@@ -2324,6 +3553,13 @@ def contract_violations(
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for a in node.names:
                 defined[(a.asname or a.name).split(".")[0]] = node
+    context_vars = {
+        target.id
+        for node in _module_level_stmts(tree) if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func).split(".")[-1] == "ContextVar"
+        for target in node.targets if isinstance(target, ast.Name)
+    }
 
     out: list[str] = []
     for p in pins:
@@ -2347,7 +3583,9 @@ def contract_violations(
             out.append(f"{name}: target kind changed ({expected_kind} -> {actual_kind})")
         if (
             expected_kind == "variable"
-            and "test_context_surface" in p.get("capabilities", [])
+            and set(p.get("capabilities", [])) & {
+                "request_context", "session_and_flash", "test_context_surface",
+            }
             and isinstance(node, (ast.Assign, ast.AnnAssign))
         ):
             value = node.value
@@ -2359,10 +3597,17 @@ def contract_violations(
             )
             if value is None or local_function_alias or isinstance(
                 value, (ast.Constant, ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Lambda),
+            ) or (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "get"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in context_vars
             ):
                 out.append(
                     f"{name}: test-context export must be a runtime-backed proxy, "
-                    "not a literal, function alias, or process-global container"
+                    "not a literal, function alias, process-global container, or "
+                    "one-time ContextVar snapshot"
                 )
 
         required_members = p.get("members", [])
@@ -2498,8 +3743,8 @@ def contract_violations(
                     "function but the pin says keep the original shape"
                 )
     return [
-        *out, *caller_violations, *capability_violations, *seam_violations,
-        *topology_violations,
+        *out, *caller_violations, *capability_violations,
+        *provider_import_violations, *seam_violations, *topology_violations,
     ]
 
 
@@ -2512,6 +3757,40 @@ def all_generation_violations(
     if oracle_entry is not None:
         out.extend(f"oracle: {item}" for item in oracle_violations(oracle_entry, content))
     return out
+
+
+def _validated_deterministic_artifacts(
+    planned: dict[str, PlannedFile], renderer, worktree: str,
+    manifest: dict[str, dict], seam_plan: dict, oracle_manifest: dict,
+    normalizer=None,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Accept valid recipe renders; make renderer defects ordinary task evidence."""
+    rendered: dict[str, str] = {}
+    rejected: dict[str, list[str]] = {}
+    if renderer is None:
+        return rendered, rejected
+    for path, planned_file in planned.items():
+        if planned_file.action != "create":
+            continue
+        try:
+            content = renderer(planned_file, worktree)
+        except Exception as exc:
+            rejected[path] = [
+                f"{type(exc).__name__}: {scrub(str(exc))[:1000]}"
+            ]
+            continue
+        if content is None:
+            continue
+        if normalizer is not None:
+            content = normalizer(path, content, seam_plan)
+        broken = all_generation_violations(
+            content, manifest, path, seam_plan, oracle_manifest.get(path),
+        )
+        if broken:
+            rejected[path] = broken
+        else:
+            rendered[path] = content
+    return rendered, rejected
 
 
 def _undefined_global_violations(content: str, path: str) -> list[str]:
@@ -3091,6 +4370,31 @@ async def _execute_initial_cluster(
                 call_cost += usage3.get("cost_usd", 0.0)
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
 
+        final_broken = _cluster_violations(
+            contents, manifest, seam_plan, oracle_manifest,
+        )
+        if final_broken:
+            message = "; ".join(
+                violation
+                for violations in final_broken.values()
+                for violation in violations
+            )
+            for task in members:
+                await task_store.update_task(
+                    task.id, status=TaskStatus.skipped.value,
+                    cascade_subtasks=True,
+                    error=f"persistent contract violation: {message[:2000]}",
+                    append_attempt={
+                        "attempt": attempt,
+                        "tier": tier,
+                        "model": model_label,
+                        "action": "contract_rejected",
+                        "violations": final_broken.get(task.target_path, [])[:10],
+                        "at": _now(),
+                    },
+                )
+            return call_cost
+
         if _should_corrupt(fault, path=paths[0], first_path=first_path,
                            attempt=attempt, tier=tier):
             contents[paths[0]] += _FAULT_PAYLOAD
@@ -3165,12 +4469,12 @@ async def execute_node(state: GraphState) -> GraphState:
         pf.path: pf for pf in artifact_planned_files(state.get("artifact_plan") or [])
     })
     artifact_renderer = getattr(recipe, "render_created_artifact", None)
-    deterministic_artifacts = {
-        path: content
-        for path, planned_file in original_planned.items()
-        if planned_file.action == "create" and artifact_renderer is not None
-        and (content := artifact_renderer(planned_file, worktree)) is not None
-    }
+    deterministic_artifacts, deterministic_rejections = (
+        _validated_deterministic_artifacts(
+            original_planned, artifact_renderer, worktree, manifest, seam_plan,
+            oracle_manifest, getattr(recipe, "normalize_generated", None),
+        )
+    )
     compat_module = (state.get("test_compat_path") or "_portage_fastapi_test_compat.py")
     compat_module = compat_module.removesuffix(".py").replace("/", ".")
     for path, strategy in test_strategy.items():
@@ -3197,6 +4501,24 @@ async def execute_node(state: GraphState) -> GraphState:
         )
     binding_root = state.get("workspace") or worktree
     tasks_by_path = {t.target_path: t for t in file_tasks if t.target_path}
+    for path, errors in deterministic_rejections.items():
+        task = tasks_by_path.get(path)
+        if task is None or any(
+            attempt.get("action") == "deterministic_artifact_rejected"
+            and attempt.get("errors") == errors
+            for attempt in task.attempts_log
+        ):
+            continue
+        await task_store.update_task(
+            task.id,
+            append_attempt={
+                "tier": "deterministic", "model": "none",
+                "action": "deterministic_artifact_rejected", "errors": errors[:10],
+                "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0,
+                "at": _now(),
+            },
+        )
+        log.warning("  deterministic renderer declined %s: %s", path, errors[:3])
     contract_repair_owner = state.get("contract_repair_owner") or ""
     active_units = {
         unit["paths"][0]: unit
@@ -3394,13 +4716,6 @@ async def execute_node(state: GraphState) -> GraphState:
 
         if path in deterministic_artifacts:
             generated = deterministic_artifacts[path]
-            broken = all_generation_violations(
-                generated, manifest, path, seam_plan, oracle_manifest.get(path),
-            )
-            if broken:
-                raise ValueError(
-                    f"recipe renderer produced invalid {path}: {'; '.join(broken)}"
-                )
             attempt = t.attempts + 1
             await task_store.update_task(
                 t.id, status=TaskStatus.running.value, attempts=attempt,
@@ -3624,6 +4939,25 @@ async def execute_node(state: GraphState) -> GraphState:
                 usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
                 # both calls' usage is already amended onto their own log entries; the
                 # done-update below must not double-amend (zeroed usage = no-op amend)
+            final_broken = all_generation_violations(
+                content, manifest, path, seam_plan, oracle_manifest.get(path),
+            )
+            if final_broken:
+                await task_store.update_task(
+                    t.id, status=TaskStatus.skipped.value,
+                    cascade_subtasks=True,
+                    error="persistent contract violation: " + "; ".join(final_broken),
+                    append_attempt={
+                        "attempt": attempt,
+                        "tier": tier,
+                        "model": model_label,
+                        "action": "contract_rejected",
+                        "violations": final_broken[:10],
+                        "at": _now(),
+                    },
+                )
+                spent += call_cost
+                continue
             if _should_corrupt(fault, path=path, first_path=first_path,
                                attempt=attempt, tier=tier):
                 log.warning("  FAULT %s | corrupting %s (attempt=%s tier=%s)",
@@ -3649,6 +4983,13 @@ async def execute_node(state: GraphState) -> GraphState:
 
     diff = await worktree_diff(worktree)
     snapshots = await task_store.load_tasks(uuid.UUID(job_id))
+    restored_rejected_cut = await _restore_rejected_batch(
+        worktree, batch_paths, checkpoint, snapshots,
+    )
+    if restored_rejected_cut:
+        snapshots = await task_store.load_tasks(uuid.UUID(job_id))
+        checkpoint = {}
+        diff = await worktree_diff(worktree)
     has_pending_tasks = any(
         snapshot.status == TaskStatus.pending.value for snapshot in snapshots
     )
@@ -3675,6 +5016,17 @@ async def execute_node(state: GraphState) -> GraphState:
         "current_batch_paths": batch_paths,
         "current_batch_tests": batch_tests,
         "current_batch_checkpoint": checkpoint,
+        "cut_restore_pending_verification": bool(restored_rejected_cut),
+        "migration_tree_state": (
+            "restored_coherent" if restored_rejected_cut else
+            state.get("migration_tree_state", "migrated")
+        ),
+        "recovery_actions": ([{
+            "classification": "generation_contract_rejection",
+            "action": "restore_rejected_cut_reverify",
+            "targets": restored_rejected_cut,
+            "at": _now(),
+        }] if restored_rejected_cut else []),
         "has_pending_tasks": has_pending_tasks,
         "step_log": ["execute"],
     }

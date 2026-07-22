@@ -16,12 +16,20 @@ import hashlib
 import logging
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 from portage_agent.config import settings
 from portage_agent.sandbox import DockerSandbox, parse_junit_xml
 
 from ..state import GraphState
-from .common import discard_cut_checkpoint, read_file, worktree_diff, write_file
+from .common import (
+    discard_cut_checkpoint,
+    iter_py_files,
+    new_import_cycle_violations,
+    read_file,
+    worktree_diff,
+    write_file,
+)
 
 log = logging.getLogger("portage.agent")
 
@@ -131,7 +139,27 @@ async def verify_node(state: GraphState) -> GraphState:
     test_args = [str(a) for a in (cfg.get("test_args") or [])]
     affected = state.get("current_batch_tests", []) if migrate else []
     targets = _scoped_targets(affected, test_args)
-    summary, result = await _run_tests(workdir, targets, env=_test_env(cfg))
+    topology_errors = (
+        new_import_cycle_violations(
+            iter_py_files(state.get("workspace") or workdir), iter_py_files(workdir),
+        )
+        if migrate else []
+    )
+    if topology_errors:
+        details = "\n".join(topology_errors)
+        summary = {
+            "total": 1, "passed": 0, "failed": 1, "errors": 0, "skipped": 0,
+            "duration_seconds": 0.0,
+            "cases": [{
+                "classname": "portage.static_topology",
+                "name": "test_no_new_runtime_import_cycles",
+                "outcome": "failed",
+                "details": details,
+            }],
+        }
+        result = SimpleNamespace(stdout=details, stderr="", exit_code=1)
+    else:
+        summary, result = await _run_tests(workdir, targets, env=_test_env(cfg))
     # `passed > 0` is load-bearing: a migration that SKIPS every test produces
     # total>0, failed=0, errors=0 — observed in the wild (the model decorated tests with
     # skip instead of porting them). Zero passing tests is a failure to recover from,
@@ -156,7 +184,9 @@ async def verify_node(state: GraphState) -> GraphState:
     restoring = bool(state.get("cut_restore_pending_verification"))
     if passed:
         discard_cut_checkpoint(state.get("current_batch_checkpoint") or {})
+        discard_cut_checkpoint(state.get("targeted_repair_checkpoint") or {})
         out["current_batch_checkpoint"] = {}
+        out["targeted_repair_checkpoint"] = {}
         out["cut_restore_pending_verification"] = False
     if passed and migrate and not restoring:
         out["verified_batches"] = [{

@@ -1,13 +1,22 @@
 """Dependency batches are deterministic and keep coupled seams atomic."""
 
+import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+
+import portage_agent.agent.nodes.execute as execute_module
+from portage_agent.agent.nodes.common import create_cut_checkpoint
+from portage_agent.agent.nodes.executable_cut import build_executable_cut_analysis
 from portage_agent.agent.nodes.execute import (
+    _restore_rejected_batch,
     expand_to_verifiable_batch,
     is_initial_cluster,
     runtime_contract_repair_attempt,
     select_execution_batch,
 )
+from portage_agent.recipes.base import PlannedFile, Subtask
 
 
 def _task(
@@ -56,6 +65,52 @@ def test_deterministic_adapter_remains_its_own_foundation_batch():
     assert expand_to_verifiable_batch(tasks, [], ["compat.py"]) == ["compat.py"]
 
 
+@pytest.mark.asyncio
+async def test_rejected_member_restores_the_entire_executable_cut(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "pkg" / "app.py"
+    created = tmp_path / "pkg" / "runtime.py"
+    source.parent.mkdir()
+    source.write_text("APP = 'original'\n")
+    checkpoint = create_cut_checkpoint(
+        str(tmp_path), ["pkg/runtime.py", "pkg/app.py"], {
+            "pkg/runtime.py": {"status": "pending", "action": "create"},
+            "pkg/app.py": {"status": "pending", "action": "rewrite"},
+        },
+    )
+    created.write_text("RUNTIME = 'generated'\n")
+    source.write_text("APP = 'generated'\n")
+    tasks = [
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path="pkg/runtime.py", status="done", error=None,
+        ),
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path="pkg/app.py", status="skipped",
+            error="persistent contract violation",
+        ),
+    ]
+    update = AsyncMock()
+    monkeypatch.setattr(execute_module.task_store, "update_task", update)
+    monkeypatch.setattr(execute_module, "run_git", AsyncMock(return_value=(0, "")))
+
+    restored = await _restore_rejected_batch(
+        str(tmp_path), ["pkg/runtime.py", "pkg/app.py"], checkpoint, tasks,
+    )
+
+    assert restored == ["pkg/runtime.py", "pkg/app.py"]
+    assert not created.exists()
+    assert source.read_text() == "APP = 'original'\n"
+    assert all(
+        call.kwargs["status"] == "skipped" for call in update.await_args_list
+    )
+    assert all(
+        call.kwargs["append_attempt"]["action"]
+        == "rejected_cut_checkpoint_restore"
+        for call in update.await_args_list
+    )
+
+
 def test_executable_cut_schedules_provider_and_incompatible_consumer_together():
     tasks = [
         _task("views.py", 10),
@@ -72,6 +127,28 @@ def test_executable_cut_schedules_provider_and_incompatible_consumer_together():
     assert expand_to_verifiable_batch(tasks, cuts, ["views.py", "app.py"]) == [
         "views.py", "app.py",
     ]
+
+
+def test_called_support_provider_shares_the_factory_verification_cut():
+    files = {
+        "pkg/errors.py": "from flask import render_template\ndef register(app):\n    pass\n",
+        "pkg/__init__.py": (
+            "from flask import Flask\nfrom .errors import register\n"
+            "def create_app():\n    app = Flask(__name__)\n    register(app)\n    return app\n"
+        ),
+    }
+    planned = [
+        PlannedFile(
+            "pkg/errors.py", "support",
+            subtasks=[Subtask("templates_render", "templates", "")],
+        ),
+        PlannedFile("pkg/__init__.py", "app_factory"),
+    ]
+
+    analysis = build_executable_cut_analysis(files, planned, {}, {})
+
+    assert analysis["cuts"][0]["paths"] == ["pkg/errors.py", "pkg/__init__.py"]
+    assert analysis["cuts"][0]["edge_kinds"] == ["factory_provider_call"]
 
 
 def test_targeted_consumer_repair_retains_its_full_cut_verification_boundary():

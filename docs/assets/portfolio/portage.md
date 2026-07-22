@@ -15,10 +15,11 @@
 | Chip | Meaning |
 |---|---|
 | Autonomous migration agent | End-to-end Flask → FastAPI without a human in the loop |
-| Eval-proven | K=3 grid · 6 pinned repos · 4 difficulty tiers |
+| Designs target architecture | Plans, owns, creates and wires **new** modules the migration needs — not just file rewrites |
+| Eval-proven | K=3 autonomous grid · 7 pinned repos · 4 difficulty tiers · **61.9% strict green** |
 | CLI + MCP | One engine, two interfaces |
 | Checkpoint resume | Kill the worker mid-run; it continues from Postgres |
-| Honest green bar | Full suite + every task done + zero skips — or red |
+| Honest green bar | Full suite + every task done + zero skips + zero weakened tests — or red |
 | Network-off sandbox | Ephemeral Docker verification, no outbound network |
 
 **Stack tags:** Python · FastAPI · LangGraph · Postgres · pgvector · LiteLLM · Docker · Next.js · MCP · pytest
@@ -27,9 +28,11 @@
 
 ## 01 · System Overview
 
-Portage is an autonomous code-migration agent. Given a repository and a migration recipe, it plans a per-file task DAG, rewrites each file with an LLM on a git worktree, verifies against the repo's own test suite in a network-off Docker sandbox, recovers from failures under bounded budgets, and reports honestly — including when it fails.
+Portage is an autonomous code-migration agent. Given a repository and a migration recipe, it plans the target architecture, rewrites existing files **and creates the new modules the migration requires**, verifies against the repo's own test suite in a network-off Docker sandbox, recovers from failures under bounded budgets, and reports honestly — including when it fails.
 
-v1 ships one recipe: **Flask → FastAPI**. That target is deliberate. Routing decorators, request/response handling, blueprints→routers, error handlers, and app factories need *understanding*, not mechanical rewriting. Deterministic codemods cannot do this reliably. The architecture is recipe-pluggable; the evidence is recipe-specific by design (*narrow + measured*).
+v1 ships one recipe: **Flask → FastAPI**. That target is deliberate. Routing decorators, request/response handling, blueprints→routers, error handlers, app factories, ambient request context (`g`, `session`), Click CLIs, and test-client seams need *understanding*, not mechanical rewriting. Deterministic codemods cannot do this reliably. The architecture is recipe-pluggable; the evidence is recipe-specific by design (*narrow + measured*).
+
+**The capability that unlocked the hard repos:** some migrations are unreachable by rewriting existing files. Flask's `g`/`session` have no FastAPI equivalent — a correct port needs a *new* request-context module, a test-compatibility surface, a rendering layer, and every consumer wired to them coherently. Portage now plans those artifacts (a bounded architecture call), freezes their contracts before generation, compiles the deterministic parts itself, and enforces that a framework-shaped capability is only valid when the plan **owns and implements it** — so a model can't reference a helper it wishes existed. That is what took the canonical Flask tutorial app from *never once green* to green autonomously, repeatably, for ~$0.15 a run.
 
 One core engine, two interfaces:
 
@@ -54,7 +57,9 @@ Next.js dashboard ──REST──> FastAPI API ──enqueue──> Postgres jo
 
 ![Kill the worker mid-run; a restarted worker resumes from the Postgres checkpoint](../kill-resume.gif)
 
-Reproduce: `bash scripts/demo_kill_resume.sh` (or the stricter `scripts/dod_check.sh`).
+A real SIGKILL mid-run: the lease expires, another worker resumes from the Postgres checkpoint — **Ingest never re-runs** — and the migration finishes green (full suite, oracle integrity, all files done).
+
+Reproduce: `bash scripts/demo_kill_resume.sh` (re-record with `vhs scripts/kill-resume.tape`; the stricter gate is `scripts/dod_check.sh`).
 
 ---
 
@@ -78,20 +83,21 @@ A submitted job runs this graph. Every node is checkpointed to Postgres (`thread
 | Node | What it does |
 |---|---|
 | **Ingest** | Clone (optionally SHA-pinned; optional `--subdir`), snapshot as a git worktree, build a structural code graph (code-review-graph). Runs exactly once on resume. |
-| **Plan** | Recipe detects framework usage, classifies each file, builds a task DAG with per-task `verify_spec`. Export-contract AST pass states what sibling files import. |
-| **Execute** | Per-file LLM rewrite on the worktree. Content-hash idempotency: resume skips already-applied files. Driver → escalation model ladder after N failures. |
-| **Verify** | Blast-radius-scoped tests in an ephemeral `--network none` Docker sandbox. JUnit-parsed results. All-skipped suites are failures (`passed > 0`). |
-| **Recover** | Classify failure → targeted rollback + regenerate / model escalation / replan / skip-and-continue. Budgets bound everything. |
-| **Integrate** | Always recomputes the migration diff from the worktree (never trusts a stale cached diff). |
-| **Report** | Reloads task truth from Postgres; emits report with recovery actions, LLM cost, verdict. |
+| **Plan** | Recipe detects framework usage and classifies files; tasks are ordered by a **cycle-safe SCC condensation of the real import graph** (dependencies first); the **interface manifest** freezes every cross-file symbol's target shape; a bounded **architect call** proposes new artifacts and a deterministic **contract compiler** completes what the engine already knows; **executable cuts** define which files must be mutually coherent before tests can honestly run; the oracle census freezes what tests are allowed to change. All of it checkpointed. |
+| **Execute** | LLM generation in dependency order, in bounded coordinated units. Every draft passes mechanical AST gates *before* the sandbox — contract presence and shape, defined-vs-invented capability ownership, provider→consumer import direction, decorator/middleware shape, new-import-cycle rejection. Violations get one accounted repair call with the rejected draft attached. Content-hash idempotent on resume; driver → escalation model ladder. |
+| **Verify** | Per-cut tests in an ephemeral `--network none` Docker sandbox. JUnit-parsed. All-skipped suites are failures (`passed > 0`). |
+| **Recover** | Uniquely attributable failures (contract owner, import-cycle edge, traceback leaf) repair **one artifact** on a separate bounded ledger; otherwise replan / batch retry / skip-and-continue. Failure fingerprints stop no-progress loops; a failed repair returns to the last coherent cut. |
+| **Integrate** | Full suite as the final gate; always recomputes the migration diff from the worktree (never trusts a stale cached diff). An Integrate-only regression can route back through Recover once. |
+| **Report** | Reloads task truth from Postgres; emits the artifact plan, oracle census, per-call cost ledger, recovery actions, diffs, verdict. |
 
-**Honest green** requires all three:
+**Honest green** requires all of:
 
-1. Full test suite passes (not just the blast-radius subset used during iteration).
-2. Every planned task completed.
+1. Full test suite passes (not just the per-cut subset used during iteration).
+2. Every planned task completed; `migration_outcome = success`.
 3. Zero tasks rolled back / skipped by recovery.
+4. Oracle integrity 1.0 — no test deleted, renamed, skipped, or weakened.
 
-A run that recovery rolls back to original sources will pass the original suite — and is scored **red**. That false-green class was caught live (“GREEN 24/24” with an empty diff) and fixed structurally.
+A run that recovery rolls back to original sources will pass the original suite — and is scored **red**. That false-green class was caught live (“GREEN 24/24” with an empty diff) and fixed structurally, as was a model that “passed” by decorating every test with `@pytest.mark.skip`.
 
 ---
 
@@ -123,10 +129,10 @@ verdict  : GREEN — migrated, full suite passing
 
 | Asset | Caption for portfolio |
 |---|---|
-| ![CLI migrate --watch](../cli/01-migrate-watch.png) | Live task transitions during `portage migrate --watch` |
-| ![CLI jobs list](../cli/02-jobs.png) | Recent jobs: id, status, recipe, test counts |
-| ![CLI status](../cli/03-status.png) | Task tree, attempts, and verdict for one job |
-| ![CLI report --diff](../cli/04-diff.png) | Full migration diff (`portage report <id> --diff`) |
+| ![CLI migrate --watch](../cli/01-migrate-watch.png) | Live task transitions and progress during `portage migrate --watch` — including the newly *created* modules (`runtime_context.py`, `templating.py`, …) |
+| ![CLI jobs list](../cli/02-jobs.png) | Recent runs with honest outcomes (`portage jobs`) — SUCCESS / FAILED per the strict green bar |
+| ![CLI status](../cli/03-status.png) | One run's verdict: outcome, full-suite result, plan completion, **oracle integrity**, recovery classification, and LLM cost (`portage status <id>`) |
+| ![CLI diff](../cli/04-diff.png) | The migration patch (`portage diff <id>`) — here showing a brand-new module the agent designed, created against `/dev/null` |
 
 Also supports pinned remotes (`--ref SHA`), apps in a subdirectory (`--subdir`), fire-and-forget without `--watch`, and `report` / `status` / `jobs` for inspection. Full scenario guide: repo `docs/USAGE.md`.
 
@@ -148,8 +154,8 @@ Intended agent loop: `repo_graph` → `blast_radius` → draft diff without writ
 
 | Asset | Caption for portfolio |
 |---|---|
-| ![MCP verify catches a bug](../mcp/01-verify-catches-bug.png) | A breaking diff applied in the sandbox and honestly failed with named tests |
-| ![MCP repo graph + blast radius](../mcp/02-repo-graph-blast-radius.png) | Structural graph + blast-radius impact for a proposed change |
+| ![MCP verify catches a bug](../mcp/01-verify-catches-bug.png) | `verify_patch_in_sandbox` rejects a real regression (a silent `201→200`) in a network-off sandbox — named failing test, original repo untouched |
+| ![MCP repo graph + blast radius](../mcp/02-repo-graph-blast-radius.png) | `repo_graph` (32 nodes · 128 edges) + `blast_radius` resolving one change to the exact tests to re-run |
 
 Wired via `.mcp.json` (Claude Code) or Cursor’s MCP config. Host needs Docker + the sandbox image; graph tools need `code-review-graph` installed. The compose stack does **not** need to be up — MCP is standalone.
 
@@ -179,11 +185,20 @@ Auth (Phase 7): `AUTH_MODE=disabled` locally (synthetic admin; DoD scripts uncha
 
 ## 07 · Key Features
 
+### Artifact-producing plans
+Portage can plan, own, create, wire, verify, repair, and roll back **new** target-architecture modules — not just rewrite existing ones. A bounded architect call proposes up to four artifacts (strict JSON, deterministic validation, one strict-improvement repair); a compiler fills in what the engine already derives (required consumers, typed exports, use-site-derived member shapes: called ⇒ method, read ⇒ attribute); contracts freeze before generation and bind every retry, escalation, replan, and resume. Created files enter the same ordering, cuts, diffs, rollback (removal, not `git checkout`), and cost accounting as rewrites.
+
+### Defined-vs-invented capabilities
+A Flask-shaped capability (`app.test_client`, `app_context`, `g`, `session`) is accepted only when a frozen plan artifact **owns and implements it** and consumers are wired to it — checked receiver-aware, so a hallucination can't be laundered through a matching attribute name. This rule is what turns “the model referenced a module it wished existed” from a silent runtime failure into a pre-sandbox rejection.
+
 ### Durability
 LangGraph Postgres checkpointer after every node. Worker lease with heartbeat; expired leases are reclaimable via `FOR UPDATE SKIP LOCKED`. Ingest is once-only on resume. Execute is content-hash idempotent.
 
-### Bounded recovery
-Crash → deepest planned frame blamed → targeted `git checkout` + regenerate. Same lone file blamed twice → widen to full reset. Residue in an unplanned file → replan. Exhausted tasks → rollback + skip; run finishes with an honest red report.
+### Bounded recovery, targeted first
+Uniquely attributable failures repair the single owning artifact (measured: a stray `.decode()` fixed for $0.011 without touching its ten-file cut). Otherwise: crash → planned frame blamed → targeted rollback + regenerate; same lone file blamed twice → widen; residue in an unplanned file → replan; exhausted tasks → rollback + skip and an honest red. Whole-file regeneration against an unattributed bug was measured as a near-no-op — which is why attribution, not retry budget, is where the engineering went.
+
+### Oracle integrity (tests can't be made easier)
+Test files are protected artifacts. Their names, assertion expressions, `raises`/`parametrize`/skip structure and fixture lifecycles are frozen at Plan; only explicitly sanctioned plumbing may differ (e.g. `get_json()` → `json()`, or an audited two-line import swap to a plan-owned context proxy). Adversarial unit tests prove deleted, renamed, skipped, and weakened assertions are all caught. **100% integrity across every report-bearing run in the latest K=3 grid** — greens and reds alike.
 
 ### Measured model escalation
 First N attempts use the driver tier; later attempts use the escalation tier. Every attempt lands in `tasks.attempts_log` with tier, model, tokens, and USD cost — “how often does escalation rescue?” is a SQL query.
@@ -220,22 +235,27 @@ Every LLM call’s tokens and USD (via LiteLLM pricing) are recorded per attempt
 
 ## 09 · Eval Headline
 
-Suite `k3-baseline`, K=3, 6 repos, GPT-4o driver (Azure) — from the `runs`/`metrics` tables (2026-07-08):
+Suite `eval-full-corpus-k3-20260714`, K=3, 7 pinned repos, GPT-4o driver (Azure), 21 fully autonomous runs — from the `runs`/`metrics` tables:
 
-| Repo | Tier | Green | Avg test-pass | Avg recover | Avg cost | Avg wall |
-|---|---|---|---|---|---|---|
-| flask-items-fixture | baseline | **3/3** | 1.00 | 0.0 | $0.022 | 10s |
-| minimal-flask-api | baseline | **2/3** | 0.67 | 0.3 | $0.013 | 10s |
-| flask-restx-api | framework | 1/3 | 0.67 | 3.3 | $0.044 | 17s |
-| flaskr | structural | 0/3 | 0.67 | 3.7 | $0.250 | 55s |
-| watchlist | structural | 0/3 | 0.67 | 4.0 | $0.261 | 61s |
-| microblog | heavy | 0/3 | 0.00 | 4.3 | $1.503 | 165s |
+| Repo | Tier | Green | Cost | Readout |
+|---|---|---|---|---|
+| flask-structural-fixture | baseline | **3/3** | $0.18 | stable structural seam coverage |
+| minimal-flask-api | baseline | **3/3** | $0.13 | stable external baseline |
+| flask-restx-api | framework | **3/3** | $0.21 | was the extension wall — now stable |
+| flaskr (Pallets tutorial) | structural | **2 green** / 1 engine error | $0.31 | both completed runs 24/24, **zero recovery** |
+| flask-items-fixture | baseline | 2/3 | $0.12 | one test-harness semantic miss (5/6) |
+| watchlist | structural | 0/3 | $0.58 | Flask-SQLAlchemy surface realization |
+| microblog | heavy | 0/3 | $5.34 | one stable import-cycle root cause |
 
-**Reliability boundary is idiom, not size.** JSON APIs (routes + parsing + error handlers) migrate green at ~$0.01–0.02 with zero recovery. Server-rendered apps (templates + sessions + auth + DB seam) complete their task DAGs but fail behaviorally — the named frontier is **cross-file call-shape drift**.
+**Strict autonomous score: 13/21 green (61.9%)** — engine errors counted against the score, not excused. Two grids earlier the same corpus scored **6/21 (28.6%)** with external repos at 0/15; they are now **8/15**. Oracle integrity was **1.0 on every report-bearing run**, and every red restored and re-verified the repo's original suite — no false greens, no weakened tests.
 
-Fault injection on the stable tier (`bad_patch`, `bad_patch_until_escalation`): **100% green on the fixture** (3/3 each). Recovery quality is reported as a delta against baseline, not a single averaged “recovery rate.”
+**The headline result:** `flaskr` — the canonical Flask tutorial app (templates + factory + auth + SQLite + Click CLI) — went from *never green in any grid* to **24/24 tests, 12/12 tasks, zero recovery, $0.154, five model calls**, then repeated it in two more independent autonomous samples. It needed four new modules to exist; the engine designed and wired them.
 
-Full methodology, non-claims, and the 9-category failure taxonomy: [Technical Deep Dive](./portage-deep-dive.md).
+**Reliability boundary is idiom, not size.** JSON APIs and RESTX-style APIs migrate green for ~$0.02–0.07. The remaining reds are no longer spread across every external repo — they are concentrated in extension-heavy applications, and both are now past their structural blockers (watchlist's migrated suite *collects and executes* all 15 tests; microblog's peel ends at a single runtime error-handler semantic).
+
+Fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) is a standing part of the eval and green on the current engine. Recovery quality is reported as a delta against baseline, never a single averaged “recovery rate.”
+
+Full methodology, non-claims, and the failure taxonomy: [Technical Deep Dive](./portage-deep-dive.md).
 
 ---
 
@@ -244,16 +264,20 @@ Full methodology, non-claims, and the 9-category failure taxonomy: [Technical De
 ### Friction
 - A single shared sandbox image cannot serve mutually incompatible dependency pins — four corpus candidates dropped for that reason; unlock is per-repo sandbox images.
 - Skip-and-continue can produce false greens (original suite passes after full rollback) — fixed by reloading task truth + recomputing diffs + requiring full completion.
-- Models can “pass” by decorating every test with skip — Verify now requires `passed > 0`.
-- Export contracts pin *names*, not *call shapes* — `get_db()` drifting between plain function / needs-request / context manager across files is the dominant residual failure.
-- Flask-coupled extensions (`flask_sqlalchemy`, `flask_restx`) need per-extension sub-strategies; partially cracked, not reliable.
+- Models can “pass” by decorating every test with skip — Verify requires `passed > 0`, and the oracle census now catches the whole family mechanically.
+- **Some migrations are unreachable by rewriting files.** Proven by migrating flaskr *by hand* under the same sandbox oracle: 24/24, but only after creating four new modules. That manual run became the acceptance spec — and the engine's missing capability had a name.
+- **A model told us what was missing:** on one repo GPT-4o imported a compatibility module that didn't exist. It wanted the right architecture; the engine had no way to let it own one. Artifact-producing plans exist because of that log line.
+- **Whole-file regeneration is a near-no-op against an unattributed bug** — two measured cases reproduced identical failures across paid regeneration rounds. Attribution, not retry budget, was the bottleneck.
+- Reds are cheapest to debug when reconstructed byte-exact from LangGraph checkpoints and peeled fix-by-fix; several “how far are we really?” questions were answered for ~$0.20 instead of a full grid.
 - LLM nondeterminism means single runs are anecdotes — K-run mean±variance is mandatory, and organic flake is a finding (not noise to hide).
 
 ### Takeaways
 - The hard thing (autonomous migrate + eval) validates the easy thing (MCP verify tool).
-- Honesty bars must be structural, not aspirational — every false-green class found in the wild became a hard predicate.
+- Honesty bars must be structural, not aspirational — every false-green class found in the wild became a hard predicate, and engine crashes count against the score.
 - Recovery is a product feature only if it is measured (fault scenarios, attempts_log, cost deltas).
-- Recipe rules encode observed failures cheaply; structural gaps (call-shape contracts, extension strategies) need architecture, not more prompt text.
+- Recipe rules encode observed failures cheaply; structural gaps (interface contracts, target architecture, extension surfaces) need architecture, not more prompt text.
+- Give the model judgment, take back the bookkeeping: it decides ownership, grouping and design; the engine deterministically supplies facts it already derives, and rejects contradictions loudly. Paying a model to echo your own data is a design smell.
+- Separate your random variables. Architecture acceptance and generation quality are independent; measuring them together makes every fix unattributable.
 - Cost that includes retries is the only honest cost; cheap first-pass numbers lie.
 - Docker Compose + network-off sandboxes make multi-service agent systems operable without cloud lock-in for the verification path.
 

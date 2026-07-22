@@ -33,6 +33,8 @@ from ..state import GraphState
 from .common import (
     _module_names,
     content_hash,
+    create_cut_checkpoint,
+    discard_cut_checkpoint,
     file_diff,
     iter_py_files,
     load_cut_checkpoint,
@@ -212,6 +214,68 @@ def contract_failure_target(
     return next(iter(consumers)) if len(consumers) == 1 else owner
 
 
+def seam_failure_owner(
+    output: str, seam_plan: dict, current_batch: set[str],
+) -> str | None:
+    """Map missing source-observed seam members to their frozen provider."""
+    candidates: set[str] = set()
+    missing_export = re.search(
+        r"cannot import name\s+['\"]?([A-Za-z_]\w*)['\"]?\s+from\s+['\"]([^'\"]+)",
+        output,
+    )
+    if missing_export:
+        symbol, module = missing_export.groups()
+        for decision in seam_plan.get("decisions", {}).values():
+            provider = decision.get("path") or decision.get("provider")
+            exported = (
+                {hook.get("function") for hook in decision.get("hooks", [])}
+                if decision.get("kind") == "request_hooks"
+                else {decision.get("symbol")}
+                if decision.get("kind") == "provider_protocol"
+                else set()
+            )
+            if provider and symbol in exported and module in _module_names(provider):
+                candidates.add(provider)
+
+    missing_attr = re.search(
+        r"AttributeError:\s*['\"][^'\"]+['\"] object has no attribute "
+        r"['\"]([A-Za-z_]\w*)['\"]",
+        output,
+    )
+    if missing_attr:
+        member = missing_attr.group(1)
+        for decision in seam_plan.get("decisions", {}).values():
+            if decision.get("kind") == "provider_protocol" and member in decision.get(
+                "decorator_members", []
+            ):
+                candidates.add(decision["provider"])
+            if decision.get("kind") == "returned_lifecycle" and any(
+                member in {
+                    contract.get("factory_member"), contract.get("entry_member"),
+                    contract.get("exit_member"),
+                }
+                for contract in decision.get("contracts", [])
+            ):
+                candidates.add(decision["provider"])
+            if decision.get("kind") == "extension_provider" and member in decision.get(
+                "members", []
+            ):
+                candidates.add(decision["provider"])
+
+    for decision in seam_plan.get("decisions", {}).values():
+        if decision.get("kind") != "extension_provider":
+            continue
+        if any(
+            re.search(rf"\.{re.escape(member)}\(\)\s+missing\b", output)
+            for member in decision.get("members", [])
+        ):
+            candidates.add(decision["provider"])
+
+    if current_batch:
+        candidates &= current_batch
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
 def circular_import_target(
     output: str, manifest: dict[str, dict], current_batch: set[str], worktree: str,
 ) -> str | None:
@@ -236,6 +300,7 @@ def unique_traceback_leaf_target(output: str, eligible_paths: set[str]) -> str |
     ambiguous leaves deliberately fall back to normal batch recovery.
     """
     leaves: set[str] = set()
+    terminal_leaves: set[str] = set()
     last_frame: str | None = None
     exception_line = re.compile(
         r"^\s*(?:E\s+)?(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
@@ -247,13 +312,32 @@ def unique_traceback_leaf_target(output: str, eligible_paths: set[str]) -> str |
             if re.search(rf"(?:^|[/\\]){re.escape(path)}:\d+:", line)
         ), None)
         if matched:
+            if re.search(r"(?:Error|Exception)(?::|$)", line):
+                terminal_leaves.add(matched)
+                last_frame = None
+                continue
             last_frame = matched
             continue
         if exception_line.match(line):
             if last_frame:
                 leaves.add(last_frame)
             last_frame = None
-    return next(iter(leaves)) if len(leaves) == 1 else None
+    selected = terminal_leaves or leaves
+    return next(iter(selected)) if len(selected) == 1 else None
+
+
+def syntax_error_target(output: str, eligible_paths: set[str]) -> str | None:
+    """Return the sole generated file named by a Python syntax traceback."""
+    if "SyntaxError" not in output:
+        return None
+    candidates = {
+        path for path in eligible_paths
+        if re.search(
+            rf"File\s+['\"][^'\"\n]*[/\\]{re.escape(path)}['\"],\s+line\s+\d+",
+            output,
+        )
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 async def recover_node(state: GraphState) -> GraphState:
@@ -382,16 +466,19 @@ async def recover_node(state: GraphState) -> GraphState:
     crashed = any(m in output for m in _CRASH_MARKERS)
     current_batch = set(state.get("current_batch_paths") or [])
     manifest = state.get("interface_manifest") or {}
-    contract_owner = None if integration_failure else (
-        circular_import_target(output, manifest, current_batch, worktree)
-        or contract_failure_target(output, manifest, current_batch, worktree)
-    )
     eligible_leaf_paths = {
         task.target_path for task in file_tasks
         if task.target_path
         and getattr(task, "type", "") not in {"test_harness", "test_compat"}
         and (not current_batch or task.target_path in current_batch)
     }
+    seam_plan = state.get("seam_plan") or {}
+    contract_owner = None if integration_failure else (
+        syntax_error_target(trace_region, eligible_leaf_paths)
+        or circular_import_target(output, manifest, current_batch, worktree)
+        or contract_failure_target(output, manifest, current_batch, worktree)
+        or seam_failure_owner(output, seam_plan, current_batch)
+    )
     leaf_owner = None if integration_failure or contract_owner else (
         unique_traceback_leaf_target(trace_region, eligible_leaf_paths)
     )
@@ -470,10 +557,19 @@ async def recover_node(state: GraphState) -> GraphState:
         return stop_for_budget()
 
     checkpoint = state.get("current_batch_checkpoint") or load_cut_checkpoint(worktree)
-    if owner and owner_task and not owner_allowance and checkpoint:
+    repair_checkpoint = state.get("targeted_repair_checkpoint") or load_cut_checkpoint(
+        worktree, ".portage-targeted-repair-checkpoint",
+    )
+    if owner and repair_checkpoint and owner not in repair_checkpoint.get("paths", []):
+        # Reaching a different unique owner proves the previous local repair made
+        # progress. Its pre-repair snapshot is no longer the coherent rollback point.
+        discard_cut_checkpoint(repair_checkpoint)
+        repair_checkpoint = {}
+    if owner and owner_task and not owner_allowance and (repair_checkpoint or checkpoint):
         failing_diff = await file_diff(worktree, owner)
-        records = checkpoint.get("files", {})
-        restored_paths = restore_cut_checkpoint(worktree, checkpoint)
+        restored_checkpoint = repair_checkpoint or checkpoint
+        records = restored_checkpoint.get("files", {})
+        restored_paths = restore_cut_checkpoint(worktree, restored_checkpoint)
         tasks_by_path = {task.target_path: task for task in file_tasks}
         for path in restored_paths:
             record = records[path]
@@ -494,11 +590,11 @@ async def recover_node(state: GraphState) -> GraphState:
                 diff=failing_diff if path == owner else None,
                 error=(
                     None if baseline_done else
-                    "targeted repair failed; restored the pre-cut checkpoint"
+                    "targeted repair failed; restored the pre-repair checkpoint"
                 ),
                 cascade_subtasks=True,
                 append_attempt={
-                    "action": "cut_checkpoint_restore",
+                    "action": "targeted_repair_checkpoint_restore",
                     "reason": classification,
                     "visit": visits,
                     "at": _now(),
@@ -513,7 +609,7 @@ async def recover_node(state: GraphState) -> GraphState:
             "recover_budget_used": budget_used,
             "recover_route": "verify",
             "contract_repair_owner": "",
-            "current_batch_checkpoint": {},
+            "targeted_repair_checkpoint": {},
             "cut_restore_pending_verification": True,
             "has_pending_tasks": has_pending,
             "recovery_actions": [{
@@ -533,6 +629,16 @@ async def recover_node(state: GraphState) -> GraphState:
 
     retry_paths: list[str] = []
     skipped_paths: list[str] = []
+    if owner and owner_task and owner_allowance and not repair_checkpoint:
+        repair_checkpoint = create_cut_checkpoint(
+            worktree,
+            [owner],
+            {owner: {
+                "status": owner_task.status,
+                "action": owner_task.verify_spec.get("action", "rewrite"),
+            }},
+            ".portage-targeted-repair-checkpoint",
+        )
     for t in targets:
         assert t.target_path is not None
         targeted_repair = owner == t.target_path
@@ -559,10 +665,11 @@ async def recover_node(state: GraphState) -> GraphState:
             # Preserve the losing attempt's diff BEFORE rolling back — a skipped task
             # whose failing content is gone can't be post-mortemed (the taxonomy needs it).
             failing_diff = await file_diff(worktree, t.target_path)
-            await _rollback_file(
-                worktree, t.target_path,
-                action=t.verify_spec.get("action", "rewrite"),
-            )
+            if not targeted_repair:
+                await _rollback_file(
+                    worktree, t.target_path,
+                    action=t.verify_spec.get("action", "rewrite"),
+                )
             await task_store.update_task(
                 t.id, status=TaskStatus.skipped.value, cascade_subtasks=True,
                 error=(f"no progress after {repeat} identical failures; " if force_skip else
@@ -584,10 +691,11 @@ async def recover_node(state: GraphState) -> GraphState:
             # model on retry, turning blind regeneration into debugging-your-own-code
             # (the factory-convergence lever — 3 blind attempts kept making sibling bugs).
             failing_diff = await file_diff(worktree, t.target_path)
-            await _rollback_file(
-                worktree, t.target_path,
-                action=t.verify_spec.get("action", "rewrite"),
-            )
+            if not targeted_repair:
+                await _rollback_file(
+                    worktree, t.target_path,
+                    action=t.verify_spec.get("action", "rewrite"),
+                )
             await task_store.update_task(
                 t.id, status=TaskStatus.pending.value, cascade_subtasks=True,
                 append_attempt={"action": "rollback_regenerate", "reason": classification,
@@ -609,6 +717,7 @@ async def recover_node(state: GraphState) -> GraphState:
         "recover_route": route,
         "diagnostic_repair_requested": diagnostic_repair,
         "contract_repair_owner": owner or "",
+        "targeted_repair_checkpoint": repair_checkpoint,
         "recovery_actions": [
             {"visit": visits, "classification": classification,
              "action": (

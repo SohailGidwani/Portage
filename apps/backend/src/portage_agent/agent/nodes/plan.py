@@ -50,6 +50,7 @@ from .redaction import scrub
 
 log = logging.getLogger("portage.agent")
 MAX_ARCHITECT_REPAIR_CALLS = 2
+MAX_ARCHITECT_RESAMPLES = 1
 
 
 class ArchitectPlanRejection(ValueError):
@@ -83,17 +84,18 @@ def _validate_artifact_plan(
 ) -> tuple[list[dict], list[dict]]:
     """Apply the same parser, compiler, and policy gate to model and replay plans."""
     raw = payload if isinstance(payload, str) else json.dumps(payload)
+    materialize = getattr(recipe, "materialize_artifact_contracts", None)
     try:
         frozen = parse_artifact_plan(
             _architect_json_payload(raw),
             existing_files=set(files),
             rewrite_paths={item.path for item in planned},
+            allow_empty_exports=materialize is not None,
         )
     except ValueError as exc:
         raise ArchitectPlanRejection([str(exc)]) from exc
 
     completion: list[dict] = []
-    materialize = getattr(recipe, "materialize_artifact_contracts", None)
     if materialize:
         try:
             completed, completion = materialize(frozen, files, planned)
@@ -335,6 +337,7 @@ async def _plan_created_artifacts(
     rejected_response = ""
     current_action = "architect"
     current_repair_number = 0
+    resamples = 0
     contract_completion: list[dict] = []
 
     def parse_and_check(text: str) -> list[dict]:
@@ -417,7 +420,35 @@ async def _plan_created_artifacts(
                 except ArchitectPlanRejection as repaired_violation:
                     rejected_response = scrub(current_text[:2000])
                     if repaired_violation.score >= previous_score:
-                        raise repaired_violation
+                        if resamples >= MAX_ARCHITECT_RESAMPLES:
+                            raise repaired_violation
+                        await task_store.update_task(
+                            architect.id, status=TaskStatus.running.value,
+                            attempts=attempt,
+                            append_attempt=attempt_entry(error=str(repaired_violation)),
+                        )
+                        current_action = "architect_resample"
+                        current_repair_number = 0
+                        usage = {
+                            "prompt_tokens": 0, "completion_tokens": 0,
+                            "cost_usd": 0.0,
+                        }
+                        resamples += 1
+                        fresh = await get_llm().complete(messages, model=model)
+                        current_text = fresh.text
+                        usage = {
+                            "prompt_tokens": fresh.prompt_tokens,
+                            "completion_tokens": fresh.completion_tokens,
+                            "cost_usd": round(fresh.cost_usd, 6),
+                        }
+                        try:
+                            frozen = parse_and_check(current_text)
+                        except ArchitectPlanRejection as fresh_violation:
+                            rejected_response = scrub(current_text[:2000])
+                            previous_score = fresh_violation.score
+                            violation = fresh_violation
+                            continue
+                        break
                     previous_score = repaired_violation.score
                     violation = repaired_violation
             else:  # pragma: no cover - loop exits through success or raised rejection

@@ -12,9 +12,19 @@ from portage_agent.agent.nodes.artifact_plan import (
     artifact_planned_files,
     parse_artifact_plan,
 )
-from portage_agent.agent.nodes.common import build_manifest, dependency_order
+from portage_agent.agent.nodes.common import (
+    build_manifest,
+    create_cut_checkpoint,
+    dependency_order,
+    new_import_cycle_violations,
+)
 from portage_agent.agent.nodes.executable_cut import build_executable_cut_analysis
-from portage_agent.agent.nodes.execute import contract_sections, contract_violations
+from portage_agent.agent.nodes.execute import (
+    _validated_deterministic_artifacts,
+    contract_sections,
+    contract_violations,
+    planned_provider_import_violations,
+)
 from portage_agent.recipes.base import PlannedFile, Subtask
 from portage_agent.recipes.flask_to_fastapi import FlaskToFastAPIRecipe
 
@@ -45,6 +55,128 @@ def _parse(text):
     )
 
 
+def test_invalid_deterministic_artifacts_fall_back_with_reportable_errors(tmp_path):
+    planned = {
+        "pkg/error.py": PlannedFile(path="pkg/error.py", role="support", action="create"),
+        "pkg/invalid.py": PlannedFile(
+            path="pkg/invalid.py", role="support", action="create",
+        ),
+    }
+
+    def render(file, _worktree):
+        if file.path == "pkg/error.py":
+            raise RuntimeError("renderer failed")
+        return "def incomplete(\n"
+
+    rendered, rejected = _validated_deterministic_artifacts(
+        planned, render, str(tmp_path), {}, {}, {},
+    )
+
+    assert rendered == {}
+    assert rejected["pkg/error.py"] == ["RuntimeError: renderer failed"]
+    assert rejected["pkg/invalid.py"]
+
+
+def test_deterministic_artifacts_use_the_same_recipe_normalizer(tmp_path):
+    planned = {
+        "pkg/runtime.py": PlannedFile(
+            path="pkg/runtime.py", role="support", action="create",
+        ),
+    }
+
+    rendered, rejected = _validated_deterministic_artifacts(
+        planned,
+        lambda _file, _worktree: "value = 1\n",
+        str(tmp_path),
+        {},
+        {},
+        {},
+        lambda _path, content, _seams: content.replace("1", "2"),
+    )
+
+    assert rejected == {}
+    assert rendered == {"pkg/runtime.py": "value = 2\n"}
+
+
+def test_consumer_cannot_import_an_undeclared_planned_provider_symbol():
+    manifest = {
+        "pkg/context.py::g": {
+            "module": "pkg/context.py", "symbol": "g",
+            "provenance": "planned_create",
+        },
+    }
+
+    assert planned_provider_import_violations(
+        "from pkg.context import session\n", manifest, "pkg/auth.py",
+    ) == [
+        "pkg/auth.py:1: imports undeclared `session` from planned provider "
+        "pkg/context.py; declare it in that provider's frozen exports or consume "
+        "an existing export"
+    ]
+    assert planned_provider_import_violations(
+        "import pkg.context as context\nprint(context.session)\n",
+        manifest,
+        "pkg/auth.py",
+    )
+    assert planned_provider_import_violations(
+        "from pkg.context import g\nprint(g)\n", manifest, "pkg/auth.py",
+    ) == []
+
+
+def test_new_import_cycles_are_rejected_but_source_cycles_are_preserved():
+    acyclic = {
+        "pkg/a.py": "VALUE = 1\n",
+        "pkg/b.py": "from pkg.a import VALUE\n",
+    }
+    cyclic = {
+        "pkg/a.py": "from pkg.b import VALUE\n",
+        "pkg/b.py": "from pkg.a import VALUE\n",
+    }
+
+    assert new_import_cycle_violations(acyclic, cyclic) == [
+        "new runtime import cycle introduced: pkg/a.py -> pkg/b.py -> pkg/a.py"
+    ]
+    assert new_import_cycle_violations(cyclic, cyclic) == []
+
+    lazy_source = {
+        "pkg/a.py": "def load():\n    from pkg.b import VALUE\n",
+        "pkg/b.py": "from pkg.a import load\nVALUE = 1\n",
+    }
+    assert new_import_cycle_violations(lazy_source, cyclic) == [
+        "new runtime import cycle introduced: pkg/a.py -> pkg/b.py -> pkg/a.py"
+    ]
+
+
+def test_planned_function_signature_freezes_provider_call_shape(tmp_path):
+    provider = PlannedFile(
+        path="pkg/context.py", role="support", action="create",
+        artifact_contract={
+            "purpose": "shared context",
+            "capabilities": ["request_context"],
+            "exports": [{
+                "name": "push_context", "kind": "function",
+                "signature": "def push_context(state=None)", "members": [],
+            }],
+            "consumers": ["pkg/app.py"], "depends_on": [],
+        },
+    )
+    manifest = build_manifest(str(tmp_path), [provider], [])
+
+    assert any(
+        "required arg count grew" in item
+        for item in contract_violations(
+            "def push_context(state):\n    return state\n",
+            manifest,
+            "pkg/context.py",
+        )
+    )
+    assert contract_violations(
+        "def push_context(state=None):\n    return state\n",
+        manifest,
+        "pkg/context.py",
+    ) == []
+
+
 FLASK_ARCHITECT_FILES = {
     "pkg/app.py": "from flask import Flask\ndef create_app(): return Flask(__name__)\n",
     "pkg/auth.py": (
@@ -67,24 +199,189 @@ FLASK_ARCHITECT_FILES = {
 
 
 def _flask_architect_proposal(*, include_authentication: bool) -> str:
-    capabilities = [
-        "direct_test_surface", "request_context", "session_and_flash",
-        "template_rendering", "test_context_surface",
+    artifacts = [
+        {
+            "path": "pkg/runtime_context.py", "role": "support",
+            "purpose": "Own request and session state.",
+            "instructions": "Implement one shared request runtime.",
+            "capabilities": ["request_context", "session_and_flash"],
+            "exports": [{
+                "name": "RuntimeMiddleware", "kind": "class", "members": [],
+            }],
+            "consumers": [], "depends_on": [],
+        },
+        {
+            "path": "pkg/templating.py", "role": "support",
+            "purpose": "Own template rendering.",
+            "instructions": "Implement the frozen template functions.",
+            "capabilities": ["template_rendering"],
+            "exports": [{
+                "name": "render_template", "kind": "function", "members": [],
+            }],
+            "consumers": [], "depends_on": ["pkg/runtime_context.py"],
+        },
+        {
+            "path": "pkg/testing.py", "role": "support",
+            "purpose": "Own the application test surface.",
+            "instructions": "Implement the frozen app facade.",
+            "capabilities": ["direct_test_surface", "test_context_surface"],
+            "exports": [{
+                "name": "CompatApp", "kind": "class", "members": ["test_client"],
+            }],
+            "consumers": [], "depends_on": ["pkg/runtime_context.py"],
+        },
     ]
     if include_authentication:
-        capabilities.insert(0, "authentication")
-    return json.dumps([{
-        "path": "pkg/testing.py",
-        "role": "support",
-        "purpose": "Own the selected shared target runtime.",
-        "instructions": "Implement every frozen capability over real runtime state.",
-        "capabilities": capabilities,
-        "exports": [{
-            "name": "CompatApp", "kind": "class", "members": ["test_client"],
-        }],
-        "consumers": [],
-        "depends_on": [],
-    }])
+        artifacts.append({
+            "path": "pkg/authentication.py", "role": "support",
+            "purpose": "Own shared authentication behavior.",
+            "instructions": "Implement the frozen authentication surface.",
+            "capabilities": ["authentication"],
+            "exports": [{
+                "name": "login_required", "kind": "function", "members": [],
+            }],
+            "consumers": [], "depends_on": ["pkg/runtime_context.py"],
+        })
+    return json.dumps(artifacts)
+
+
+def test_test_facade_contract_prunes_unconsumed_function_exports():
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(FLASK_ARCHITECT_FILES)
+    proposal = json.loads(_flask_architect_proposal(include_authentication=True))
+    testing = next(
+        item for item in proposal if "direct_test_surface" in item["capabilities"]
+    )
+    testing["exports"].append({
+        "name": "invented_factory", "kind": "function", "members": [],
+    })
+    testing["exports"][0]["members"].append("invented_member")
+
+    completed, audit = recipe.materialize_artifact_contracts(
+        proposal, FLASK_ARCHITECT_FILES, planned,
+    )
+
+    testing = next(
+        item for item in completed if "direct_test_surface" in item["capabilities"]
+    )
+    assert all(export["kind"] != "function" for export in testing["exports"])
+    assert any(
+        entry.get("removed_exports") == [{
+            "name": "invented_factory", "kind": "function",
+        }]
+        for entry in audit
+    )
+    assert any(
+        entry.get("removed_class_members") == [{
+            "export": "CompatApp", "members": ["invented_member"],
+        }]
+        for entry in audit
+    )
+    assert recipe.artifact_plan_violations(
+        completed, FLASK_ARCHITECT_FILES, planned,
+    ) == []
+
+
+def test_contract_compiler_completes_a_capability_owner_with_empty_exports():
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(FLASK_ARCHITECT_FILES)
+    proposal = json.loads(_flask_architect_proposal(include_authentication=True))
+    runtime = next(
+        item for item in proposal if "session_and_flash" in item["capabilities"]
+    )
+    runtime["exports"] = []
+    testing = next(
+        item for item in proposal if "direct_test_surface" in item["capabilities"]
+    )
+    testing["exports"] = []
+
+    completed, audit = plan_module._validate_artifact_plan(
+        recipe, proposal, FLASK_ARCHITECT_FILES, planned,
+    )
+
+    runtime = next(
+        item for item in completed if "session_and_flash" in item["capabilities"]
+    )
+    assert {item["name"] for item in runtime["exports"]} >= {
+        "RequestContextMiddleware", "flash", "get_flashed_messages",
+        "get_request_context", "manage_session", "session",
+    }
+    testing = next(
+        item for item in completed if "direct_test_surface" in item["capabilities"]
+    )
+    facade = next(item for item in testing["exports"] if item["kind"] == "class")
+    assert facade["name"] == "FastAPIApp"
+    assert {"app_context", "test_client"} <= set(facade["members"])
+    assert any(item["path"] == runtime["path"] for item in audit)
+
+
+def test_contract_compiler_canonicalizes_recipe_owned_runtime_surface():
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(FLASK_ARCHITECT_FILES)
+    proposal = json.loads(_flask_architect_proposal(include_authentication=True))
+    runtime = next(
+        item for item in proposal if "session_and_flash" in item["capabilities"]
+    )
+    runtime["exports"][0]["members"] = ["session", "user"]
+    runtime["exports"].append({
+        "name": "manage_session", "kind": "function",
+        "signature": "def manage_session()", "members": [],
+    })
+    runtime["exports"].append({
+        "name": "get_session", "kind": "function",
+        "signature": "def get_session(request)", "members": [],
+    })
+
+    completed, audit = recipe.materialize_artifact_contracts(
+        proposal, FLASK_ARCHITECT_FILES, planned,
+    )
+
+    runtime = next(
+        item for item in completed if "session_and_flash" in item["capabilities"]
+    )
+    assert "get_session" not in {item["name"] for item in runtime["exports"]}
+    runtime_class = next(item for item in runtime["exports"] if item["kind"] == "class")
+    assert runtime_class["members"] == ["get_request_context", "manage_session"]
+    manage_session = next(
+        item for item in runtime["exports"] if item["name"] == "manage_session"
+    )
+    assert manage_session["signature"] == "def manage_session(request)"
+    runtime_audit = next(item for item in audit if item["path"] == runtime["path"])
+    assert runtime_audit["removed_exports"] == [{
+        "name": "get_session", "kind": "function",
+    }]
+    assert runtime_audit["removed_class_members"] == [{
+        "export": "RuntimeMiddleware", "members": ["session", "user"],
+    }]
+    assert "manage_session" in runtime_audit["normalized_signatures"]
+
+
+def test_contract_compiler_prunes_unconsumed_test_context_exports():
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(FLASK_ARCHITECT_FILES)
+    proposal = json.loads(_flask_architect_proposal(include_authentication=True))
+    testing = next(
+        item for item in proposal if "test_context_surface" in item["capabilities"]
+    )
+    testing["exports"].extend([
+        {"name": "app_context", "kind": "variable", "members": []},
+        {"name": "testing", "kind": "variable", "members": []},
+    ])
+
+    completed, audit = recipe.materialize_artifact_contracts(
+        proposal, FLASK_ARCHITECT_FILES, planned,
+    )
+
+    testing = next(
+        item for item in completed if "test_context_surface" in item["capabilities"]
+    )
+    assert {
+        item["name"] for item in testing["exports"] if item["kind"] != "class"
+    } == {"g", "session"}
+    testing_audit = next(item for item in audit if item["path"] == testing["path"])
+    assert {item["name"] for item in testing_audit["removed_exports"]} >= {
+        "app_context", "testing",
+    }
 
 
 def test_valid_plan_is_normalized_and_rehydrates_create_task():
@@ -401,6 +698,16 @@ def test_test_context_exports_must_be_runtime_backed_proxies():
             "def get_g(): pass\ng = get_g\n", manifest, "pkg/context.py",
         )
     )
+    assert any(
+        "one-time ContextVar snapshot" in item
+        for item in contract_violations(
+            "from contextvars import ContextVar\n"
+            "_context = ContextVar('context', default={})\n"
+            "g = _context.get()\n",
+            manifest,
+            "pkg/context.py",
+        )
+    )
     assert contract_violations(
         "class Proxy: pass\ng = Proxy()\n", manifest, "pkg/context.py",
     ) == []
@@ -541,11 +848,20 @@ async def test_real_flask_policy_rejection_triggers_repair_after_materialization
     )
 
     assert complete.await_count == 2
-    assert frozen[0]["capabilities"][0] == "authentication"
-    exports = {item["name"]: item for item in frozen[0]["exports"]}
-    assert exports["g"]["kind"] == "variable"
-    assert exports["session"]["kind"] == "variable"
-    assert exports["CompatApp"]["members"] == ["app_context", "test_client"]
+    runtime = next(
+        item for item in frozen if "request_context" in item["capabilities"]
+    )
+    testing = next(
+        item for item in frozen if "direct_test_surface" in item["capabilities"]
+    )
+    assert any("authentication" in item["capabilities"] for item in frozen)
+    runtime_exports = {item["name"]: item for item in runtime["exports"]}
+    testing_exports = {item["name"]: item for item in testing["exports"]}
+    assert runtime_exports["g"]["kind"] == "variable"
+    assert runtime_exports["session"]["kind"] == "variable"
+    assert testing_exports["CompatApp"]["members"] == [
+        "app_context", "test_client",
+    ]
     entries = [call.kwargs["append_attempt"] for call in update.await_args_list]
     assert [entry["action"] for entry in entries] == [
         "architect", "architect_repair",
@@ -664,6 +980,25 @@ async def test_report_distinguishes_architect_calls_repairs_and_completion(
     }
     assert report["artifact_plan"]["contract_completion"] == completion
     assert report["llm_usage"]["calls"] == 2
+    assert report["tree_state"] == "migrated"
+    assert report["test_summary"]["tree_state"] == "migrated"
+
+
+def test_report_tree_classifier_detects_mixed_cut_lineage(tmp_path):
+    source = tmp_path / "pkg.py"
+    created = tmp_path / "provider.py"
+    source.write_text("VALUE = 1\n")
+    checkpoint = create_cut_checkpoint(
+        str(tmp_path), ["pkg.py", "provider.py"], {
+            "pkg.py": {"status": "pending", "action": "rewrite"},
+            "provider.py": {"status": "pending", "action": "create"},
+        },
+    )
+    created.write_text("PROVIDER = 1\n")
+
+    assert report_module._checkpoint_tree_state(
+        str(tmp_path), checkpoint,
+    ) == "hybrid"
 
 
 @pytest.mark.asyncio
@@ -852,7 +1187,7 @@ async def test_architect_gets_second_repair_only_after_strict_improvement(
 
 
 @pytest.mark.asyncio
-async def test_architect_stops_when_first_repair_does_not_improve(
+async def test_architect_resamples_once_when_repair_does_not_improve(
     tmp_path, monkeypatch,
 ):
     architect = SimpleNamespace(
@@ -869,6 +1204,10 @@ async def test_architect_stops_when_first_repair_does_not_improve(
         SimpleNamespace(
             text=_valid(path="pkg/lateral.py"), prompt_tokens=20,
             completion_tokens=6, cost_usd=0.02,
+        ),
+        SimpleNamespace(
+            text=_valid(path="pkg/accepted.py"), prompt_tokens=30,
+            completion_tokens=7, cost_usd=0.03,
         ),
     ])
     monkeypatch.setattr(
@@ -890,6 +1229,8 @@ async def test_architect_stops_when_first_repair_does_not_improve(
 
         @staticmethod
         def artifact_plan_violations(plan, files, planned):
+            if plan[0]["path"] == "pkg/accepted.py":
+                return []
             return ["violation one", "violation two"]
 
     frozen, _ = await plan_module._plan_created_artifacts(
@@ -899,9 +1240,79 @@ async def test_architect_stops_when_first_repair_does_not_improve(
         existing_plan=None, workspace=str(tmp_path),
     )
 
-    assert frozen == []
-    assert complete.await_count == 2
+    assert frozen[0]["path"] == "pkg/accepted.py"
+    assert complete.await_count == 3
     entries = [call.kwargs["append_attempt"] for call in update.await_args_list]
-    assert [entry["action"] for entry in entries] == ["architect", "architect_repair"]
-    assert entries[-1]["repair_number"] == 1
-    assert update.await_args.kwargs["status"] == "skipped"
+    assert [entry["action"] for entry in entries] == [
+        "architect", "architect_repair", "architect_resample",
+    ]
+    assert entries[1]["repair_number"] == 1
+    assert "repair_number" not in entries[-1]
+    assert update.await_args.kwargs["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_invalid_resample_gets_the_remaining_bounded_repair(
+    tmp_path, monkeypatch,
+):
+    architect = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000095",
+        status="pending", attempts=0,
+        verify_spec={"kind": "architecture", "action": "architect"},
+    )
+    update = AsyncMock()
+    complete = AsyncMock(side_effect=[
+        SimpleNamespace(
+            text=_valid(path="pkg/first.py"), prompt_tokens=10,
+            completion_tokens=5, cost_usd=0.01,
+        ),
+        SimpleNamespace(
+            text=_valid(path="pkg/lateral.py"), prompt_tokens=20,
+            completion_tokens=6, cost_usd=0.02,
+        ),
+        SimpleNamespace(
+            text=_valid(path="pkg/still_invalid.py"), prompt_tokens=30,
+            completion_tokens=7, cost_usd=0.03,
+        ),
+        SimpleNamespace(
+            text=_valid(path="pkg/accepted.py"), prompt_tokens=40,
+            completion_tokens=8, cost_usd=0.04,
+        ),
+    ])
+    monkeypatch.setattr(
+        plan_module.task_store, "ensure_architect_task", AsyncMock(return_value=architect),
+    )
+    monkeypatch.setattr(plan_module.task_store, "update_task", update)
+    monkeypatch.setattr(
+        plan_module, "get_llm", lambda: SimpleNamespace(complete=complete),
+    )
+
+    class Recipe:
+        @staticmethod
+        def should_plan_artifacts(files, planned):
+            return True
+
+        @staticmethod
+        def build_artifact_plan_prompt(**kwargs):
+            return "plan artifacts"
+
+        @staticmethod
+        def artifact_plan_violations(plan, files, planned):
+            if plan[0]["path"] == "pkg/accepted.py":
+                return []
+            return ["same violation"]
+
+    frozen, _ = await plan_module._plan_created_artifacts(
+        job_id="00000000-0000-0000-0000-000000000094",
+        recipe=Recipe(), files={"pkg/app.py": ""},
+        planned=[PlannedFile(path="pkg/app.py", role="app_factory")],
+        existing_plan=None, workspace=str(tmp_path),
+    )
+
+    assert frozen[0]["path"] == "pkg/accepted.py"
+    assert complete.await_count == 4
+    entries = [call.kwargs["append_attempt"] for call in update.await_args_list]
+    assert [entry["action"] for entry in entries] == [
+        "architect", "architect_repair", "architect_resample", "architect_repair",
+    ]
+    assert update.await_args.kwargs["status"] == "done"

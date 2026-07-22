@@ -1,1634 +1,102 @@
-"""The Flask → FastAPI recipe (v1).
-
-Detects Flask source, classifies each file's transformations, and builds behaviour-preserving
-rewrite prompts. The migration deliberately spans the things deterministic tools can't do:
-routing decorators, path/query/body parsing, blueprints→routers, error handlers→exception
-handlers, the app factory, and the test-client seam.
-
-Framework-agnostic modules (no `flask` import, not a test harness) are left alone — they're
-the stable core the routes call, so the migration stays focused on the framework seam.
-"""
+"""The source-derived Flask to FastAPI migration recipe."""
 
 from __future__ import annotations
 
 import ast
-import re
 import textwrap
 from copy import deepcopy
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from portage_agent.agent.nodes.common import (
-    _module_names,
-    _resolve_module,
-    imported_bindings_from_sources,
+from portage_agent.agent.nodes.common import imported_bindings_from_sources, iter_py_files
+
+from ._flask_analysis import (
+    _ALLOWED_IMPORT_ROOTS,
+    _APP_FACTORY,
+    _BLUEPRINT,
+    _CLI_SEAM,
+    _ERRORHANDLER,
+    _FLASK_FAMILY_IMPORT,
+    _FLASK_LOGIN,
+    _FLASK_LOGIN_NAMES,
+    _FLASK_SQLALCHEMY,
+    _G_CONTEXT,
+    _NOTE_DB_SURFACE,
+    _NOTE_LOGIN_SURFACE,
+    _NOTE_RESOURCE_FN,
+    _REQUEST_PARSE,
+    _RESOURCE_FUNCTION,
+    _ROUTE,
+    _SESSION_FLASH,
+    _SUBTASKS,
+    _TEMPLATE_FUNCTIONS,
+    _TEMPLATES,
+    _TEST_CLIENT,
+    _artifact_capability_requirements,
+    _artifact_placement_contract,
+    _blueprint_error_handler_facts,
+    _blueprint_factories,
+    _click_command_contracts,
+    _click_registrar_contracts,
+    _decorated_provider_protocols,
+    _detected_artifact_surfaces,
+    _direct_json_return_functions,
+    _direct_test_context_imports,
+    _exception_handler_contracts,
+    _exercised_flask_template_functions,
+    _factory_config_facts,
+    _factory_endpoint_aliases,
+    _factory_local_imports,
+    _factory_static_mount,
+    _flask_login_consumer_contracts,
+    _initializer_contracts,
+    _instance_export_contracts,
+    _is_test_file,
+    _mixed_form_routes,
+    _parsed,
+    _plain_string_routes,
+    _render_alias,
+    _request_hook_facts,
+    _resource_facts,
+    _returned_lifecycle_contracts,
+    _route_functions_without_local_handlers,
+    _route_name_contracts,
+    _sqlalchemy_provider_contracts,
+    _template_context_processor_contracts,
+    _template_framework_globals,
+    _test_path_reason,
+    _view_decorator_contracts,
 )
-
+from ._flask_runtime import (
+    _realize_ambient_request_binding,
+    _realize_cli_factory,
+    _realize_decorated_provider_protocols,
+    _realize_dynamic_instance_exports,
+    _realize_extension_provider_facade,
+    _realize_extension_provider_order,
+    _realize_factory_contracts,
+    _realize_implicit_sqlalchemy_tables,
+    _realize_resource_consumers,
+    _realize_resource_contracts,
+)
+from ._flask_web import (
+    _normalize_exception_handler_status,
+    _normalize_mutated_fetchone_rows,
+    _normalize_redirect_urls,
+    _normalize_session_middleware_import,
+    _normalize_template_response,
+    _normalize_werkzeug_abort,
+    _realize_authentication_consumers,
+    _realize_blueprint_error_handlers,
+    _realize_error_handler_ownership,
+    _realize_request_hook_names,
+    _realize_route_contracts,
+    _realize_template_consumers,
+    _realize_template_context_processors,
+    _realize_template_provider_globals,
+    _realize_view_decorator_contracts,
+)
 from .base import MAX_CREATED_ARTIFACTS, PinRule, PlannedFile, Subtask, register
 from .flask_test_compat import render_flask_test_compat
-
-# --- marker → subtask detection -------------------------------------------------------
-_FLASK_IMPORT = re.compile(r"^\s*(from\s+flask\b|import\s+flask\b)", re.MULTILINE)
-_FLASK_FAMILY_IMPORT = re.compile(
-    r"^\s*(?:from|import)\s+"
-    r"(?:flask(?:\b|_)|flask_login\b|flask_sqlalchemy\b|flask_restx\b)",
-    re.MULTILINE,
-)
-_ROUTE = re.compile(r"\.route\s*\(|methods\s*=")
-_BLUEPRINT = re.compile(r"\bBlueprint\s*\(")
-_REQUEST_PARSE = re.compile(r"request\.(args|get_json|json|form|values|data)\b")
-_ERRORHANDLER = re.compile(r"\berrorhandler\s*\(")
-_APP_FACTORY = re.compile(r"\bFlask\s*\(|def\s+create_app\b")
-_TEST_CLIENT = re.compile(r"\.test_client\s*\(|get_json\s*\(")
-_TEMPLATES = re.compile(r"\brender_template\s*\(|\bget_flashed_messages\b")
-_SESSION_FLASH = re.compile(
-    r"\bflash\s*\(|(?<!\.)\bsession\[|(?<!\.)\bsession\.get\b|"
-    r"(?<!\.)\bsession\.clear\b"
-)
-_G_CONTEXT = re.compile(r"\bg\.[a-zA-Z_]|before_app_request|before_request|\bcurrent_app\b")
-_FLASK_LOGIN = re.compile(
-    r"\bflask_login\b|\blogin_required\b|\bcurrent_user\b|\blogin_user\b|\blogout_user\b"
-)
-_AUTH_RUNTIME = re.compile(
-    r"\blogin_required\b|\bcurrent_user\b|\blogin_user\b|\blogout_user\b"
-)
-_FLASK_SQLALCHEMY = re.compile(r"\bflask_sqlalchemy\b|\bSQLAlchemy\s*\(")
-_CLI_SEAM = re.compile(r"\bapp\.cli\b|\btest_cli_runner\s*\(|\bclick\.|\.invoke\s*\(")
-_CLICK_COMMAND = re.compile(
-    r"@click\.command\(\s*['\"]([^'\"]+)['\"]\s*\)\s*"
-    r"(?:@[^\n]+\s*)*def\s+(\w+)\s*\(",
-    re.MULTILINE,
-)
-_TEMPLATE_URL_FOR = re.compile(
-    r"\burl_for\(\s*['\"]([^'\"]+)['\"]"
-)
-_DIRECT_TEST_MEMBERS = ("app_context", "test_client", "test_cli_runner", "testing")
-_DIRECT_TEST_CONTEXT_GLOBALS = frozenset({"g", "session", "current_app", "request"})
-_ARTIFACT_BASENAME_BY_CAPABILITY = {
-    "authentication": "authentication.py",
-    "database_extension": "database.py",
-    "direct_test_surface": "testing.py",
-    "request_context": "context.py",
-    "session_and_flash": "session.py",
-    "template_rendering": "templating.py",
-    "test_context_surface": "runtime_context.py",
-}
-_GENERAL_ARTIFACT_BASENAMES = ("runtime.py", "compat.py", "support.py", "adapters.py")
-_ALLOWED_IMPORT_ROOTS = {
-    "_portage_fastapi_test_compat",
-    "click", "fastapi", "httpx", "itsdangerous", "jinja2", "multipart", "pydantic",
-    "pytest", "sqlalchemy", "starlette", "uvicorn", "werkzeug",
-}
-
-# The flask_login API surface — single source for the auth_login pin rule's match set
-# AND the request_context pin rule's carve-out (see pin_rules below), so the two
-# function-kind rules stay disjoint by construction.
-_FLASK_LOGIN_NAMES = {"login_user", "logout_user", "current_user", "login_required"}
-_RESOURCE_FUNCTION = re.compile(
-    r"^(get|open|connect)_(db|database|session|connection)$"
-)
-
-
-def _parsed(source: str) -> ast.Module | None:
-    try:
-        return ast.parse(source)
-    except SyntaxError:
-        return None
-
-
-def _config_keys(tree: ast.AST) -> list[str]:
-    """Literal keys read from a Flask-style ``*.config`` mapping."""
-    keys: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "config"
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        ):
-            keys.add(node.slice.value)
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "get"
-            and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "config"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            keys.add(node.args[0].value)
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "from_mapping"
-            and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "config"
-        ):
-            keys.update(keyword.arg for keyword in node.keywords if keyword.arg)
-    return sorted(keys)
-
-
-def _factory_config_facts(source: str) -> dict:
-    tree = _parsed(source)
-    if tree is None:
-        return {"keys": [], "override_parameters": [], "optional_parameters": []}
-    overrides = {
-        node.args[0].id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "update"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "config"
-        and node.args
-        and isinstance(node.args[0], ast.Name)
-    }
-    optional = set()
-    for function in (
-        node for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ):
-        positional = [*function.args.posonlyargs, *function.args.args]
-        for argument, default in zip(
-            positional[-len(function.args.defaults):] if function.args.defaults else [],
-            function.args.defaults,
-            strict=True,
-        ):
-            if isinstance(default, ast.Constant) and default.value is None:
-                optional.add(argument.arg)
-        optional.update(
-            argument.arg for argument, default in zip(
-                function.args.kwonlyargs, function.args.kw_defaults, strict=True,
-            )
-            if isinstance(default, ast.Constant) and default.value is None
-        )
-    return {
-        "keys": _config_keys(tree),
-        "override_parameters": sorted(overrides),
-        "optional_parameters": sorted(optional & overrides),
-    }
-
-
-def _resource_facts(source: str, helper_name: str) -> dict:
-    tree = _parsed(source)
-    if tree is None:
-        return {
-            "config_keys": [], "context_cache_members": [], "resource_files": [],
-            "cleanup_functions": [], "initializer": "", "sqlite_cross_thread": False,
-        }
-    functions = {
-        node.name: node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    helper = functions.get(helper_name)
-    cache_members = sorted({
-        node.attr for node in ast.walk(helper) if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name) and node.value.id == "g"
-    }) if helper is not None else []
-    resource_files = sorted({
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "open_resource"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    })
-    cleanup_functions = sorted(
-        name for name, function in functions.items()
-        if name != helper_name and any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "close"
-            for node in ast.walk(function)
-        )
-    )
-    return {
-        "config_keys": _config_keys(tree),
-        "context_cache_members": cache_members,
-        "resource_files": resource_files,
-        "cleanup_functions": cleanup_functions,
-        "initializer": "init_app" if "init_app" in functions else "",
-        "sqlite_cross_thread": any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "sqlite3" and node.func.attr == "connect"
-            for node in ast.walk(tree)
-        ),
-    }
-
-
-def _click_command_contracts(files: dict[str, str]) -> list[dict]:
-    contracts: list[dict] = []
-    for path, source in files.items():
-        tree = _parsed(source)
-        if tree is None:
-            continue
-        functions = {
-            node.name: node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        names = set(functions)
-        for command_name, function_name in _CLICK_COMMAND.findall(source):
-            function = functions.get(function_name)
-            if function is None:
-                continue
-            contracts.append({
-                "name": command_name,
-                "function": function_name,
-                "module": path,
-                # Module-global lookup is intentional: tests may monkeypatch this handler.
-                "handlers": sorted({
-                    node.func.id for node in ast.walk(function)
-                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id in names and node.func.id != function_name
-                }),
-            })
-    return sorted(contracts, key=lambda item: (item["module"], item["function"]))
-
-
-def _initializer_contracts(
-    files: dict[str, str], planned: list[PlannedFile], owner: str, symbol: str,
-) -> list[dict]:
-    roles = {item.path: item.role for item in planned}
-    contracts = []
-    for binding in imported_bindings_from_sources(files, owner):
-        if roles.get(binding.importer) != "app_factory":
-            continue
-        tree = _parsed(files.get(binding.importer, ""))
-        if tree is None:
-            continue
-        target = binding.local if binding.symbol == symbol else (
-            f"{binding.local}.{symbol}" if binding.symbol is None else ""
-        )
-        if target and any(
-            isinstance(node, ast.Call) and ast.unparse(node.func) == target
-            for node in ast.walk(tree)
-        ):
-            contracts.append({
-                "factory": binding.importer,
-                "provider": owner,
-                "symbol": symbol,
-                "original_call": f"{target}(app)",
-            })
-    return contracts
-
-
-def _plain_string_routes(source: str) -> list[str]:
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    return sorted({
-        function.name
-        for function in ast.walk(tree)
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
-            isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Attribute)
-            and decorator.func.attr == "route"
-            for decorator in function.decorator_list
-        )
-        and any(
-            isinstance(node, ast.Return)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-            for node in ast.walk(function)
-        )
-    })
-
-
-def _factory_endpoint_aliases(source: str) -> list[dict]:
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    aliases = []
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "add_url_rule"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            continue
-        endpoint = next(
-            (keyword.value.value for keyword in node.keywords
-             if keyword.arg == "endpoint"
-             and isinstance(keyword.value, ast.Constant)
-             and isinstance(keyword.value.value, str)),
-            "",
-        )
-        if endpoint:
-            aliases.append({"path": node.args[0].value, "name": endpoint})
-    return aliases
-
-
-def _route_name_contracts(source: str) -> list[dict]:
-    """Freeze Flask's blueprint-qualified reverse-URL names."""
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    blueprints = {
-        target.id: statement.value.args[0].value
-        for statement in tree.body
-        if isinstance(statement, (ast.Assign, ast.AnnAssign))
-        and isinstance(statement.value, ast.Call)
-        and (
-            isinstance(statement.value.func, ast.Name)
-            and statement.value.func.id == "Blueprint"
-            or isinstance(statement.value.func, ast.Attribute)
-            and statement.value.func.attr == "Blueprint"
-        )
-        and statement.value.args
-        and isinstance(statement.value.args[0], ast.Constant)
-        and isinstance(statement.value.args[0].value, str)
-        for target in (
-            statement.targets if isinstance(statement, ast.Assign)
-            else [statement.target]
-        )
-        if isinstance(target, ast.Name)
-    }
-    contracts = []
-    for function in (
-        node for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ):
-        for decorator in function.decorator_list:
-            if not (
-                isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr == "route"
-                and isinstance(decorator.func.value, ast.Name)
-            ):
-                continue
-            endpoint = next(
-                (keyword.value.value for keyword in decorator.keywords
-                 if keyword.arg == "endpoint"
-                 and isinstance(keyword.value, ast.Constant)
-                 and isinstance(keyword.value.value, str)),
-                function.name,
-            )
-            receiver = decorator.func.value.id
-            prefix = blueprints.get(receiver)
-            contracts.append({
-                "function": function.name,
-                "receiver": receiver,
-                "name": f"{prefix}.{endpoint}" if prefix else endpoint,
-            })
-    return contracts
-
-
-def _view_decorator_contracts(source: str) -> list[dict]:
-    """Record decorators whose returned wrapper preserves the wrapped signature."""
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    contracts = []
-    for function in (
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.args.args
-    ):
-        nested = {
-            node.name: node for node in function.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        returned = {
-            node.value.id for node in function.body
-            if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
-        }
-        for name in sorted(returned & nested.keys()):
-            wrapper = nested[name]
-            if any(
-                isinstance(decorator, ast.Call)
-                and ast.unparse(decorator.func).split(".")[-1] == "wraps"
-                for decorator in wrapper.decorator_list
-            ):
-                contracts.append({
-                    "function": function.name,
-                    "parameter": function.args.args[0].arg,
-                    "wrapper": name,
-                })
-    return contracts
-
-
-def _factory_static_mount(files: dict[str, str], factory_path: str) -> dict:
-    package = PurePosixPath(factory_path).parent
-    static_root = package / "static" if str(package) != "." else PurePosixPath("static")
-    has_static = any(
-        static_root == PurePosixPath(path)
-        or static_root in PurePosixPath(path).parents
-        for path in files
-    )
-    template_uses_static = any(
-        PurePosixPath(path).suffix.lower() in {".html", ".jinja", ".jinja2"}
-        and "static" in _TEMPLATE_URL_FOR.findall(source)
-        for path, source in files.items()
-    )
-    return (
-        {"path": "/static", "name": "static", "directory": static_root.as_posix()}
-        if has_static and template_uses_static else {}
-    )
-
-
-def _mixed_form_routes(source: str) -> list[dict]:
-    """GET+POST Flask routes whose form fields must stay optional on GET."""
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    routes = []
-    for function in (
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ):
-        methods: set[str] = set()
-        for decorator in function.decorator_list:
-            if not (
-                isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr == "route"
-            ):
-                continue
-            methods = {"GET"}
-            value = next(
-                (keyword.value for keyword in decorator.keywords
-                 if keyword.arg == "methods"),
-                None,
-            )
-            if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
-                methods = {
-                    item.value.upper() for item in value.elts
-                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
-                }
-        if not {"GET", "POST"} <= methods:
-            continue
-        fields = sorted({
-            node.slice.value
-            for node in ast.walk(function)
-            if isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Attribute)
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "request" and node.value.attr == "form"
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        })
-        if fields:
-            routes.append({"function": function.name, "fields": fields})
-    return routes
-
-
-def _request_hook_facts(source: str) -> list[dict]:
-    tree = _parsed(source)
-    if tree is None:
-        return []
-    hooks = []
-    for function in (
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ):
-        decorators = {
-            decorator.func.attr
-            for decorator in function.decorator_list
-            if isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Attribute)
-            and decorator.func.attr in {"before_app_request", "before_request"}
-        } | {
-            decorator.attr
-            for decorator in function.decorator_list
-            if isinstance(decorator, ast.Attribute)
-            and decorator.attr in {"before_app_request", "before_request"}
-        }
-        if not decorators:
-            continue
-        hooks.append({
-            "function": function.name,
-            "scope": sorted(decorators)[0],
-            "session_keys": sorted({
-                node.args[0].value
-                for node in ast.walk(function)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "session" and node.func.attr == "get"
-                and node.args and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            }),
-            "context_members": sorted({
-                node.attr for node in ast.walk(function)
-                if isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name) and node.value.id == "g"
-            }),
-        })
-    return hooks
-
-
-def _normalize_template_response(content: str) -> str:
-    """Mechanically upgrade the one deprecated Starlette template call shape.
-
-    GPT-4o repeatedly reproduces the old API after exact feedback. This transform is
-    framework-level and semantics-preserving: it only runs when a real Jinja2Templates
-    instance and an enclosing request argument make the rewrite unambiguous.
-    """
-    tree = _parsed(content)
-    if tree is None:
-        return content
-    instances = {
-        target.id
-        for statement in tree.body
-        if isinstance(statement, (ast.Assign, ast.AnnAssign))
-        and isinstance(statement.value, ast.Call)
-        and (
-            isinstance(statement.value.func, ast.Name)
-            and statement.value.func.id == "Jinja2Templates"
-            or isinstance(statement.value.func, ast.Attribute)
-            and statement.value.func.attr == "Jinja2Templates"
-        )
-        for target in (
-            statement.targets if isinstance(statement, ast.Assign)
-            else [statement.target]
-        )
-        if isinstance(target, ast.Name)
-    }
-    if not instances:
-        return content
-    direct_names = {
-        alias.asname or alias.name
-        for statement in tree.body
-        if isinstance(statement, ast.ImportFrom)
-        and statement.module in {"starlette.responses", "fastapi.responses"}
-        for alias in statement.names if alias.name == "TemplateResponse"
-    }
-
-    class Upgrade(ast.NodeTransformer):
-        def __init__(self):
-            self.requests: list[str] = []
-            self.changed = False
-
-        def _function(self, node):
-            positional = [*node.args.posonlyargs, *node.args.args]
-            self.requests.append(positional[0].arg if positional else "")
-            node = self.generic_visit(node)
-            self.requests.pop()
-            return node
-
-        visit_FunctionDef = _function
-        visit_AsyncFunctionDef = _function
-
-        def visit_Call(self, node):  # noqa: N802
-            node = self.generic_visit(node)
-            request_name = self.requests[-1] if self.requests else ""
-            if not request_name or not node.args:
-                return node
-            direct = isinstance(node.func, ast.Name) and node.func.id in direct_names
-            bound = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "TemplateResponse"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in instances
-            )
-            if not (direct or bound):
-                return node
-            if (
-                isinstance(node.args[0], ast.Name)
-                and node.args[0].id == request_name
-            ):
-                return node
-            context = node.args[1] if len(node.args) > 1 else ast.Dict(keys=[], values=[])
-            if isinstance(context, ast.Dict):
-                kept = [
-                    (key, value) for key, value in zip(
-                        context.keys, context.values, strict=True,
-                    )
-                    if not (
-                        isinstance(key, ast.Constant) and key.value == "request"
-                    )
-                ]
-                context = ast.Dict(
-                    keys=[key for key, _ in kept],
-                    values=[value for _, value in kept],
-                )
-            node.func = ast.Attribute(
-                value=ast.Name(id=sorted(instances)[0], ctx=ast.Load()),
-                attr="TemplateResponse", ctx=ast.Load(),
-            )
-            node.args = [
-                ast.Name(id=request_name, ctx=ast.Load()), node.args[0], context,
-            ]
-            node.keywords = [kw for kw in node.keywords if kw.arg != "request"]
-            self.changed = True
-            return node
-
-    upgrade = Upgrade()
-    tree = upgrade.visit(tree)
-    if not upgrade.changed:
-        return content
-    for statement in list(tree.body):
-        if not (
-            isinstance(statement, ast.ImportFrom)
-            and statement.module in {"starlette.responses", "fastapi.responses"}
-        ):
-            continue
-        statement.names = [
-            alias for alias in statement.names if alias.name != "TemplateResponse"
-        ]
-        if not statement.names:
-            tree.body.remove(statement)
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _normalize_redirect_urls(content: str) -> str:
-    """Keep Flask's relative ``url_for`` default in RedirectResponse calls."""
-    tree = _parsed(content)
-    if tree is None:
-        return content
-
-    class RelativeRedirect(ast.NodeTransformer):
-        changed = False
-
-        def visit_Call(self, node):  # noqa: N802
-            self.generic_visit(node)
-            if ast.unparse(node.func).split(".")[-1] != "RedirectResponse":
-                return node
-            targets = [keyword for keyword in node.keywords if keyword.arg == "url"]
-            values = [target.value for target in targets] or node.args[:1]
-            for value in values:
-                if not (
-                    isinstance(value, ast.Call)
-                    and isinstance(value.func, ast.Attribute)
-                    and value.func.attr == "url_for"
-                ):
-                    continue
-                relative = ast.Attribute(value=value, attr="path", ctx=ast.Load())
-                if targets:
-                    targets[0].value = relative
-                else:
-                    node.args[0] = relative
-                self.changed = True
-            return node
-
-    normalizer = RelativeRedirect()
-    tree = normalizer.visit(tree)
-    if not normalizer.changed:
-        return content
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _normalize_werkzeug_abort(content: str) -> str:
-    """Replace Flask/Werkzeug's implicit abort handling with FastAPI HTTPException."""
-    tree = _parsed(content)
-    if tree is None:
-        return content
-    abort_names = {
-        alias.asname or alias.name
-        for statement in tree.body
-        if isinstance(statement, ast.ImportFrom)
-        and statement.module == "werkzeug.exceptions"
-        for alias in statement.names if alias.name == "abort"
-    }
-    uses_http_exception = any(
-        isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-        and node.id == "HTTPException"
-        for node in ast.walk(tree)
-    )
-    imported_http_exception = any(
-        isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
-        and any(alias.name == "HTTPException" for alias in statement.names)
-        for statement in tree.body
-    )
-    if not abort_names and (not uses_http_exception or imported_http_exception):
-        return content
-    for statement in list(tree.body):
-        if not (
-            isinstance(statement, ast.ImportFrom)
-            and statement.module == "werkzeug.exceptions"
-        ):
-            continue
-        statement.names = [alias for alias in statement.names if alias.name != "abort"]
-        if not statement.names:
-            tree.body.remove(statement)
-    http_exception = next((
-        alias.asname or alias.name
-        for statement in tree.body
-        if isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
-        for alias in statement.names if alias.name == "HTTPException"
-    ), None)
-    if http_exception is None:
-        fastapi_import = next((
-            statement for statement in tree.body
-            if isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
-        ), None)
-        if fastapi_import is None:
-            fastapi_import = ast.ImportFrom(
-                module="fastapi", names=[ast.alias(name="HTTPException")], level=0,
-            )
-            import_at = 1 if (
-                tree.body and isinstance(tree.body[0], ast.Expr)
-                and isinstance(tree.body[0].value, ast.Constant)
-                and isinstance(tree.body[0].value.value, str)
-            ) else 0
-            while (
-                import_at < len(tree.body)
-                and isinstance(tree.body[import_at], ast.ImportFrom)
-                and tree.body[import_at].module == "__future__"
-            ):
-                import_at += 1
-            tree.body.insert(import_at, fastapi_import)
-        else:
-            fastapi_import.names.append(ast.alias(name="HTTPException"))
-        http_exception = "HTTPException"
-    defined = {
-        node.name for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    helpers = [
-        ast.parse(
-            f"def {name}(status_code, description=None):\n"
-            f"    raise {http_exception}(status_code=status_code, detail=description)"
-        ).body[0]
-        for name in sorted(abort_names - defined)
-    ]
-    insert_at = 1 if (
-        tree.body and isinstance(tree.body[0], ast.Expr)
-        and isinstance(tree.body[0].value, ast.Constant)
-        and isinstance(tree.body[0].value.value, str)
-    ) else 0
-    while insert_at < len(tree.body) and isinstance(
-        tree.body[insert_at], (ast.Import, ast.ImportFrom)
-    ):
-        insert_at += 1
-    tree.body[insert_at:insert_at] = helpers
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _realize_factory_contracts(
-    path: str, content: str, seam_plan: dict | None,
-) -> str:
-    """Materialize frozen factory wiring that has one mechanical realization."""
-    decisions = (seam_plan or {}).get("decisions", {}).values()
-    decision = next((
-        item for item in decisions
-        if item.get("kind") == "application_factory" and item.get("factory") == path
-    ), None)
-    tree = _parsed(content)
-    if tree is None:
-        return content
-    changed = False
-    ambient = next((
-        item for item in (seam_plan or {}).get("decisions", {}).values()
-        if item.get("kind") == "ambient_context_runtime"
-        and path in item.get("factory_files", [])
-    ), None)
-    if ambient:
-        runtime_modules = {
-            PurePosixPath(provider).stem
-            for provider in ambient.get("runtime_providers", [])
-        }
-        context_names = {
-            alias.asname or alias.name
-            for statement in tree.body if isinstance(statement, ast.ImportFrom)
-            and (statement.module or "").split(".")[-1] in runtime_modules
-            for alias in statement.names
-        }
-        for function in (
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ):
-            middleware = [
-                (index, statement, statement.value.args[0].id)
-                for index, statement in enumerate(function.body)
-                if isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Call)
-                and isinstance(statement.value.func, ast.Attribute)
-                and statement.value.func.attr == "add_middleware"
-                and statement.value.args
-                and isinstance(statement.value.args[0], ast.Name)
-            ]
-            sessions = [item for item in middleware if item[2] == "SessionMiddleware"]
-            contexts = [item for item in middleware if item[2] in context_names]
-            if len(sessions) == len(contexts) == 1 and sessions[0][0] < contexts[0][0]:
-                session_statement = sessions[0][1]
-                function.body.remove(session_statement)
-                context_index = function.body.index(contexts[0][1])
-                function.body.insert(context_index + 1, session_statement)
-                changed = True
-        for keyword in (
-            keyword
-            for call in ast.walk(tree) if isinstance(call, ast.Call)
-            for keyword in call.keywords
-            if keyword.arg == "middleware"
-            and isinstance(keyword.value, (ast.List, ast.Tuple))
-        ):
-            specs = keyword.value.elts
-            sessions = [
-                index for index, item in enumerate(specs)
-                if isinstance(item, ast.Call) and item.args
-                and isinstance(item.args[0], ast.Name)
-                and item.args[0].id == "SessionMiddleware"
-            ]
-            contexts = [
-                index for index, item in enumerate(specs)
-                if isinstance(item, ast.Call) and item.args
-                and isinstance(item.args[0], ast.Name)
-                and item.args[0].id in context_names
-            ]
-            if len(sessions) == len(contexts) == 1 and sessions[0] > contexts[0]:
-                session = specs.pop(sessions[0])
-                specs.insert(contexts[0], session)
-                changed = True
-        for call in (
-            node for node in ast.walk(tree) if isinstance(node, ast.Call)
-        ):
-            invalid = [
-                keyword for keyword in call.keywords
-                if keyword.arg == "lifespan"
-                and isinstance(keyword.value, ast.Attribute)
-                and isinstance(keyword.value.value, ast.Name)
-                and keyword.value.value.id in context_names
-            ]
-            if invalid:
-                call.keywords = [
-                    keyword for keyword in call.keywords if keyword not in invalid
-                ]
-                changed = True
-
-    global_hooks = [
-        (item["path"], hook["function"])
-        for item in (seam_plan or {}).get("decisions", {}).values()
-        if item.get("kind") == "request_hooks" and path in item.get("files", [])
-        for hook in item.get("hooks", [])
-        if hook.get("scope") == "before_app_request"
-    ]
-    returned_apps = {
-        node.value.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
-    }
-    constructors = [
-        statement.value
-        for statement in ast.walk(tree)
-        if isinstance(statement, (ast.Assign, ast.AnnAssign))
-        and isinstance(statement.value, ast.Call)
-        and any(
-            isinstance(target, ast.Name) and target.id in returned_apps
-            for target in (
-                statement.targets if isinstance(statement, ast.Assign)
-                else [statement.target]
-            )
-        )
-    ]
-    if len(constructors) == 1:
-        depends_name = next((
-            alias.asname or alias.name
-            for statement in tree.body
-            if isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
-            for alias in statement.names if alias.name == "Depends"
-        ), None)
-        if global_hooks and depends_name is None:
-            fastapi_import = next((
-                statement for statement in tree.body
-                if isinstance(statement, ast.ImportFrom)
-                and statement.module == "fastapi" and statement.level == 0
-            ), None)
-            if fastapi_import is None:
-                fastapi_import = ast.ImportFrom(
-                    module="fastapi", names=[], level=0,
-                )
-                insert_at = 1 if (
-                    tree.body and isinstance(tree.body[0], ast.Expr)
-                    and isinstance(tree.body[0].value, ast.Constant)
-                    and isinstance(tree.body[0].value.value, str)
-                ) else 0
-                while (
-                    insert_at < len(tree.body)
-                    and isinstance(tree.body[insert_at], ast.ImportFrom)
-                    and tree.body[insert_at].module == "__future__"
-                ):
-                    insert_at += 1
-                tree.body.insert(insert_at, fastapi_import)
-            fastapi_import.names.append(ast.alias(name="Depends"))
-            depends_name = "Depends"
-            changed = True
-
-        dependencies = next(
-            (keyword for keyword in constructors[0].keywords
-             if keyword.arg == "dependencies"),
-            None,
-        )
-        for provider, name in sorted(global_hooks):
-            provider_import = next((
-                statement for statement in tree.body
-                if isinstance(statement, ast.ImportFrom)
-                and _resolve_module(statement.module, statement.level, path)
-                in _module_names(provider)
-            ), None)
-            local_name = next((
-                alias.asname or alias.name
-                for statement in tree.body
-                if isinstance(statement, ast.ImportFrom)
-                and _resolve_module(statement.module, statement.level, path)
-                in _module_names(provider)
-                for alias in statement.names if alias.name == name
-            ), None)
-            if local_name is None:
-                if provider_import is None:
-                    module = provider.removesuffix(".py").replace("/", ".")
-                    provider_import = ast.ImportFrom(
-                        module=module, names=[], level=0,
-                    )
-                    insert_at = 1 if (
-                        tree.body and isinstance(tree.body[0], ast.Expr)
-                        and isinstance(tree.body[0].value, ast.Constant)
-                        and isinstance(tree.body[0].value.value, str)
-                    ) else 0
-                    while insert_at < len(tree.body) and isinstance(
-                        tree.body[insert_at], (ast.Import, ast.ImportFrom)
-                    ):
-                        insert_at += 1
-                    tree.body.insert(insert_at, provider_import)
-                provider_import.names.append(ast.alias(name=name))
-                local_name = name
-                changed = True
-            call = ast.Call(
-                func=ast.Name(id=depends_name or "Depends", ctx=ast.Load()),
-                args=[ast.Name(id=local_name, ctx=ast.Load())], keywords=[],
-            )
-            values = dependencies.value.elts if dependencies and isinstance(
-                dependencies.value, (ast.List, ast.Tuple)
-            ) else []
-            if any(ast.dump(value) == ast.dump(call) for value in values):
-                continue
-            if dependencies is None:
-                dependencies = ast.keyword(
-                    arg="dependencies", value=ast.List(elts=[], ctx=ast.Load()),
-                )
-                constructors[0].keywords.append(dependencies)
-                values = dependencies.value.elts
-            if isinstance(dependencies.value, (ast.List, ast.Tuple)):
-                dependencies.value.elts.append(deepcopy(call))
-                changed = True
-
-    aliases = decision.get("endpoint_aliases", []) if decision else []
-    if aliases:
-        for function in (
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ):
-            kept = [
-                statement for statement in function.body
-                if not (
-                    isinstance(statement, ast.Expr)
-                    and isinstance(statement.value, ast.Call)
-                    and isinstance(statement.value.func, ast.Attribute)
-                    and statement.value.func.attr in {"append", "extend", "insert"}
-                    and ast.unparse(statement.value.func.value).endswith(
-                        ".router.routes"
-                    )
-                )
-            ]
-            changed |= len(kept) != len(function.body)
-            function.body = kept
-    existing = {
-        (
-            node.args[0].value,
-            next((
-                keyword.value.value for keyword in node.keywords
-                if keyword.arg == "name"
-                and isinstance(keyword.value, ast.Constant)
-                and isinstance(keyword.value.value, str)
-            ), ""),
-        )
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {
-            "add_api_route", "add_route", "api_route", "get", "post", "put",
-            "patch", "delete", "options", "head",
-        }
-        and node.args and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    }
-    missing = [
-        alias for alias in aliases
-        if (alias["path"], alias["name"]) not in existing
-    ]
-    if missing:
-        returns = [
-            (function, index, statement.value.id)
-            for function in tree.body
-            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for index, statement in enumerate(function.body)
-            if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Name)
-        ]
-        if len(returns) == 1:
-            function, index, app_name = returns[0]
-            function.body[index:index] = [
-                ast.parse(
-                    f"{app_name}.add_api_route({alias['path']!r}, lambda: None, "
-                    f"name={alias['name']!r}, include_in_schema=False)"
-                ).body[0]
-                for alias in missing
-            ]
-            changed = True
-    if not changed:
-        return content
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _realize_route_contracts(
-    path: str, content: str, seam_plan: dict | None,
-) -> str:
-    """Set mechanically-known FastAPI route names used by reverse lookup."""
-    decision = next((
-        item for item in (seam_plan or {}).get("decisions", {}).values()
-        if item.get("kind") == "route_names" and item.get("path") == path
-    ), None)
-    tree = _parsed(content)
-    if decision is None or tree is None:
-        return content
-    expected: dict[str, set[str]] = {}
-    for route in decision.get("routes", []):
-        expected.setdefault(route["function"], set()).add(route["name"])
-    changed = False
-    for function in (
-        node for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and len(expected.get(node.name, ())) == 1
-    ):
-        name = next(iter(expected[function.name]))
-        for decorator in function.decorator_list:
-            if not (
-                isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr in {
-                    "api_route", "get", "post", "put", "patch", "delete",
-                    "options", "head",
-                }
-            ):
-                continue
-            keyword = next(
-                (item for item in decorator.keywords if item.arg == "name"), None,
-            )
-            value = ast.Constant(name)
-            if keyword is None:
-                decorator.keywords.append(ast.keyword(arg="name", value=value))
-            elif not (
-                isinstance(keyword.value, ast.Constant)
-                and keyword.value.value == name
-            ):
-                keyword.value = value
-            else:
-                continue
-            changed = True
-    if not changed:
-        return content
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _realize_view_decorator_contracts(
-    path: str, content: str, seam_plan: dict | None,
-) -> str:
-    """Restore ``functools.wraps`` when the original view decorator used it."""
-    decision = next((
-        item for item in (seam_plan or {}).get("decisions", {}).values()
-        if item.get("kind") == "view_decorators" and item.get("path") == path
-    ), None)
-    tree = _parsed(content)
-    if decision is None or tree is None:
-        return content
-    functools_name = next((
-        alias.asname or alias.name
-        for statement in tree.body if isinstance(statement, ast.Import)
-        for alias in statement.names if alias.name == "functools"
-    ), None)
-    wraps_name = next((
-        alias.asname or alias.name
-        for statement in tree.body
-        if isinstance(statement, ast.ImportFrom) and statement.module == "functools"
-        for alias in statement.names if alias.name == "wraps"
-    ), None)
-    changed = False
-    functions = {
-        node.name: node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    for contract in decision.get("decorators", []):
-        function = functions.get(contract["function"])
-        wrapper = next((
-            node for node in (function.body if function else [])
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == contract["wrapper"]
-        ), None)
-        if wrapper is None:
-            continue
-        wrapped = any(
-            isinstance(decorator, ast.Call)
-            and ast.unparse(decorator.func).split(".")[-1] == "wraps"
-            for decorator in wrapper.decorator_list
-        )
-        if not wrapped:
-            if functools_name is None and wraps_name is None:
-                functools_name = "functools"
-                insert_at = 1 if (
-                    tree.body and isinstance(tree.body[0], ast.Expr)
-                    and isinstance(tree.body[0].value, ast.Constant)
-                    and isinstance(tree.body[0].value.value, str)
-                ) else 0
-                while insert_at < len(tree.body) and isinstance(
-                    tree.body[insert_at], (ast.Import, ast.ImportFrom)
-                ):
-                    insert_at += 1
-                tree.body.insert(
-                    insert_at, ast.Import(names=[ast.alias(name="functools")]),
-                )
-            decorator = (
-                ast.Name(id=wraps_name, ctx=ast.Load()) if wraps_name else
-                ast.Attribute(
-                    value=ast.Name(id=functools_name, ctx=ast.Load()),
-                    attr="wraps", ctx=ast.Load(),
-                )
-            )
-            wrapper.decorator_list.insert(0, ast.Call(
-                func=decorator,
-                args=[ast.Name(id=contract["parameter"], ctx=ast.Load())],
-                keywords=[],
-            ))
-            changed = True
-        wrapper_parameters = {
-            argument.arg for argument in [
-                *wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs,
-            ]
-        }
-        for call in (
-            node for node in ast.walk(wrapper)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == contract["parameter"]
-        ):
-            existing = {keyword.arg for keyword in call.keywords if keyword.arg}
-            forwarded = [
-                argument for argument in call.args
-                if isinstance(argument, ast.Name)
-                and argument.id in wrapper_parameters - existing
-            ]
-            if not forwarded:
-                continue
-            call.args = [argument for argument in call.args if argument not in forwarded]
-            named = [
-                ast.keyword(
-                    arg=argument.id,
-                    value=ast.Name(id=argument.id, ctx=ast.Load()),
-                )
-                for argument in forwarded
-            ]
-            splat = next(
-                (index for index, keyword in enumerate(call.keywords)
-                 if keyword.arg is None),
-                len(call.keywords),
-            )
-            call.keywords[splat:splat] = named
-            changed = True
-    if not changed:
-        return content
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-def _realize_resource_contracts(
-    path: str, content: str, seam_plan: dict | None,
-) -> str:
-    """Remove duplicate cleanup wiring already owned by the frozen app facade."""
-    decisions = [
-        item for item in (seam_plan or {}).get("decisions", {}).values()
-        if item.get("kind") == "resource_lifecycle" and item.get("module") == path
-    ]
-    tree = _parsed(content)
-    if not decisions or tree is None:
-        return content
-    changed = False
-    for decision in decisions:
-        initializer_name = decision.get("initializer")
-        cleanup_names = set(decision.get("cleanup_functions", []))
-        initializer = next((
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == initializer_name
-        ), None)
-        if initializer is None or not initializer.args.args:
-            continue
-        app_name = initializer.args.args[0].arg
-
-        def duplicate_cleanup(
-            statement: ast.stmt,
-            prefix: str = f"{app_name}.state.",
-            cleanups: frozenset[str] = frozenset(cleanup_names),
-        ) -> bool:
-            return bool(
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Call)
-                and isinstance(statement.value.func, ast.Attribute)
-                and statement.value.func.attr == "append"
-                and ast.unparse(statement.value.func.value).startswith(prefix)
-                and statement.value.args
-                and isinstance(statement.value.args[0], ast.Name)
-                and statement.value.args[0].id in cleanups
-            )
-
-        kept = [statement for statement in initializer.body if not duplicate_cleanup(statement)]
-        changed |= len(kept) != len(initializer.body)
-        initializer.body = kept
-    if not changed:
-        return content
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
-# R1 target-interface notes: module constants used BOTH inside the matching _SUBTASKS
-# instruction and in pin_rules below — checklist and contract share the literal string,
-# so they cannot drift (v3: single source, not a mirror-by-convention comment).
-_NOTE_RESOURCE_FN = (
-    "{name}: KEEP the original callable shape — same args, same return, callers do not "
-    "change. For FastAPI DI, ADD a companion yield dependency that wraps it "
-    "(`def {name}_dep(): resource = {name}(); try: yield resource; finally: close`) and "
-    "use `Depends({name}_dep)` in endpoints; cleanup lives in the dependency, NEVER in "
-    "callers (no bare `next(gen())` anywhere — it leaks the generator). If the original "
-    "helper read Flask `current_app` configuration, keep its zero-argument public shape by "
-    "having the existing factory/init seam copy configuration into module-owned state; "
-    "NEVER make the helper read an undefined global app/request or FastAPI instance path."
-)
-_NOTE_LOGIN_SURFACE = (
-    "{name}: reimplemented on the session but importable under this exact name with the "
-    "attribute surface callers/templates read (is_authenticated, id, ...)."
-)
-_NOTE_DB_SURFACE = (
-    "{name}: the flask_sqlalchemy object becomes a plain-SQLAlchemy surface KEEPING this "
-    "module-level name and the attribute surface callers use (session/Model-equivalent: "
-    "engine + SessionLocal + Base, or a db_session facade)."
-)
-
-
-_SUBTASKS: dict[str, Subtask] = {
-    "app_factory": Subtask(
-        "app_factory",
-        "Migrate the application factory",
-        "Replace the Flask app factory with a FastAPI one: `create_app()` must build a "
-        "`FastAPI()` instance and `include_router(...)` the migrated router, keeping the "
-        "function name `create_app` and its factory shape (other modules import it). "
-        "Flask's `app.config` is a PLAIN DICT — migrate it as one: `app.state.config = {}` "
-        "(a real dict), `config.from_mapping(...)`/`.update(...)` → dict update, "
-        "`app.config['X']` → `app.state.config['X']`. Never call methods on "
-        "`starlette.datastructures.State` itself (it has no update/get). FastAPI has no "
-        "`instance_path`: compute the equivalent directory as a plain local `os.path` value "
-        "and store only resulting config values, never `app.instance_path`.",
-    ),
-    "error_handler": Subtask(
-        "error_handler",
-        "Convert error handlers",
-        "Convert every `@app.errorhandler(Exc)` into `@app.exception_handler(Exc)` that "
-        "returns `fastapi.responses.JSONResponse(status_code=..., content=...)` with the "
-        "SAME status code and JSON body as before.",
-    ),
-    "blueprint_to_router": Subtask(
-        "blueprint_to_router",
-        "Blueprint → APIRouter",
-        "Replace `flask.Blueprint(...)` with `fastapi.APIRouter()`. Keep the EXACT "
-        "module-level variable name importers expect (`bp`, `router`, or another original "
-        "name); do not rename it merely to `router`.",
-    ),
-    "route_to_endpoint": Subtask(
-        "route_to_endpoint",
-        "Routes → typed endpoints",
-        "Convert each `@bp.route('/p', methods=[M])` to the matching `@router.<method>('/p')`. "
-        "Turn Flask path converters like `<int:item_id>` into FastAPI path params "
-        "`/{item_id}` with a typed arg `item_id: int`. Preserve EVERY status code "
-        "(e.g. 201 via `status_code=201`; a 204 by returning a 204 `Response`). "
-        "Replace Werkzeug/Flask `abort(code, message)` with a raised FastAPI "
-        "`HTTPException(status_code=code, detail=message)`.",
-    ),
-    "request_parsing": Subtask(
-        "request_parsing",
-        "Request parsing",
-        "Replace `request.args.get(...)` with typed query parameters and `request.get_json()` "
-        "with a JSON body parameter (a `dict` or a Pydantic model). Preserve optionality and "
-        "defaults exactly (e.g. `?done=true` is an optional bool; a missing body is allowed).",
-    ),
-    "test_harness": Subtask(
-        "test_harness",
-        "Migrate the test client seam",
-        "Rewrite framework PLUMBING only; every assertion must keep its exact meaning. "
-        "Flask's `app.test_client()` → `fastapi.testclient.TestClient(app)`; "
-        "`resp.get_json()` → `resp.json()`; `resp.get_data(as_text=True)` → `resp.text`; "
-        "`client.get(..., follow_redirects=True)` keeps the same kwarg. A test that "
-        "inspects `flask.session`/`g` directly (e.g. inside `with client:`) must assert "
-        "the SAME fact through observable behaviour instead (response content, cookies, a "
-        "follow-up request) — never delete or weaken the assertion. PRESERVE THE FILE'S "
-        "STRUCTURE: do not add module-level statements the original didn't have (e.g. "
-        "never call `create_app()` at import time if the original built the app inside a "
-        "fixture or setUp). If Flask's bound CLI runner becomes `click.testing.CliRunner`, "
-        "preserve the existing fixture/caller interface: either return a tiny adapter whose "
-        "`invoke(args=[command, ...])` dispatches to the real exported Click command, or "
-        "migrate only that invocation plumbing to `invoke(command, args=[...])`; never "
-        "attach a fake runner to FastAPI/app.state.",
-    ),
-    "templates_render": Subtask(
-        "templates_render",
-        "render_template → Jinja2Templates",
-        "Replace `render_template(name, **ctx)` with `fastapi.templating.Jinja2Templates`. "
-        "Create ONE module-level `templates = Jinja2Templates(directory=...)` pointing at "
-        "the EXISTING templates directory and return "
-        "`templates.TemplateResponse(request, name, ctx)`. The .html files must NOT be "
-        "edited, so every Jinja global they use must keep working: give every route a "
-        "`name=` equal to its old Flask endpoint name (e.g. `name=\"blog.index\"`) so the "
-        "templates' `url_for(...)` resolves via Starlette; inject anything else the "
-        "templates reference (`g`, `get_flashed_messages`) into the context dict on every "
-        "render (a small shared `render(request, name, **ctx)` helper is the clean way). "
-        "`redirect(url)` becomes `RedirectResponse(url, status_code=302)` — NEVER the "
-        "default 307, which re-sends POST bodies and breaks form flows.",
-    ),
-    "sessions_flash": Subtask(
-        "sessions_flash",
-        "session / flash → SessionMiddleware",
-        "Add `starlette.middleware.sessions.SessionMiddleware` (a `secret_key` is required) "
-        "to the app with `app.add_middleware(SessionMiddleware, ...)`. The middleware "
-        "class signs cookie-backed ASGI sessions; it is NOT itself a session value or "
-        "proxy and must never be instantiated into a module-level `session` variable. "
-        "Flask's `session[...]` maps to the active `request.session[...]`. Implement "
-        "`flash(msg)` as appending to `request.session.setdefault('_flashes', [])`, and "
-        "provide `get_flashed_messages()` to templates as a per-render callable that POPS "
-        "'_flashes' from the session (Flask semantics: read-once).",
-    ),
-    "auth_login": Subtask(
-        "auth_login",
-        "flask_login → session-based auth",
-        "`flask_login` is Flask-only and there is NO drop-in FastAPI package in the "
-        "allowed set (do NOT import `fastapi_login`/`fastapi_users` — they don't exist "
-        "here). Reimplement the small surface actually used: `login_user(u)` → store the "
-        "user id in `request.session`; `logout_user()` → remove it/clear the session; "
-        "`current_user` → a dependency/helper that loads the user from the session and "
-        "returns an anonymous stand-in with `is_authenticated=False` when absent (keep "
-        "the attribute names templates/tests read); `@login_required` → a check that "
-        "redirects (302) to the login page exactly like flask_login did."
-        + "\nInterface decision: " + _NOTE_LOGIN_SURFACE,
-    ),
-    "sqlalchemy_plain": Subtask(
-        "sqlalchemy_plain",
-        "flask_sqlalchemy → plain SQLAlchemy",
-        "`flask_sqlalchemy` needs a Flask app — replace it with PLAIN SQLAlchemy while "
-        "keeping the module-level `db`-like surface everything imports: an `engine` + "
-        "`SessionLocal = sessionmaker(...)` + a `Base(DeclarativeBase)`. `db.Model` "
-        "subclasses become `Base` subclasses with the same `__tablename__`/columns "
-        "(`db.Column(db.String(20))` → `Column(String(20))` — same types, same "
-        "constraints). `db.session` uses become an explicit session (module-level scoped "
-        "session is acceptable to keep call sites unchanged: `db_session.add/commit/...`). "
-        "`db.create_all()`/`drop_all()` → `Base.metadata.create_all(engine)`/`drop_all`. "
-        "Configure the engine from the SAME config value the app used "
-        "(`SQLALCHEMY_DATABASE_URI`), resolved at create_app/init time."
-        + "\nInterface decision: " + _NOTE_DB_SURFACE,
-    ),
-    "request_context": Subtask(
-        "request_context",
-        "g / before_request → dependencies",
-        "Replace the `g` object and `before_app_request`/`before_request` hooks with "
-        "explicit per-request wiring: a dependency (or helper called at the top of each "
-        "endpoint) that computes what the hook stored on `g` (e.g. `g.user` from the "
-        "session, `g.db` connection) and passes it to the endpoint and into the template "
-        "context under the SAME attribute names the templates use. `current_app.config` "
-        "moves to module-level config or the app instance. Preserve existing direct-call "
-        "resource helpers such as `get_db()` for non-endpoint callers; FastAPI endpoints "
-        "must acquire those resources through a companion yield dependency so teardown "
-        "runs reliably. Do NOT register teardown as middleware (wrong signature), call a "
-        "generator with bare `next(...)`, or use `app.state` as a context manager; "
-        "`app.state` holds only config/constants."
-        + "\nInterface decision for cross-file resource functions: " + _NOTE_RESOURCE_FN,
-    ),
-}
-
-
-def _test_path_reason(path: str) -> str:
-    base = path.rsplit("/", 1)[-1]
-    if base == "conftest.py":
-        return 'basename "conftest.py" is reserved for pytest configuration'
-    if base == "tests.py":
-        return 'basename "tests.py" is a test module'
-    if base.startswith("test_"):
-        return f'basename "{base}" starts with forbidden prefix "test_"'
-    if base.endswith("_test.py"):
-        return f'basename "{base}" ends with forbidden suffix "_test.py"'
-    if "tests" in PurePosixPath(path).parts:
-        return 'path component "tests" marks a test tree'
-    return ""
-
-
-def _is_test_file(path: str) -> bool:
-    return bool(_test_path_reason(path))
-
-
-def _artifact_placement_contract(
-    files: dict[str, str], planned: list[PlannedFile],
-) -> dict[str, list[str]]:
-    """Derive the prompt and validator's path rules from the repository layout."""
-    roots: set[str] = set()
-    for item in planned:
-        if _is_test_file(item.path):
-            continue
-        parent = PurePosixPath(item.path).parent
-        if str(parent) == ".":
-            roots.add(".")
-            continue
-        parts = parent.parts
-        package_root = next((
-            "/".join(parts[:end])
-            for end in range(1, len(parts) + 1)
-            if f"{'/'.join(parts[:end])}/__init__.py" in files
-        ), str(parent))
-        roots.add(package_root)
-
-    parents = {str(PurePosixPath(path).parent) for path in files}
-    allowed = set(roots)
-    for root in roots - {"."}:
-        allowed.update(
-            parent for parent in parents
-            if parent == root or parent.startswith(f"{root}/")
-        )
-
-    test_roots = set()
-    for path in files:
-        if not _is_test_file(path):
-            continue
-        parts = PurePosixPath(path).parts
-        if "tests" in parts:
-            test_roots.add("/".join(parts[:parts.index("tests") + 1]))
-        else:
-            test_roots.add(str(PurePosixPath(path).parent))
-
-    basenames = set(_GENERAL_ARTIFACT_BASENAMES)
-    basenames.update(_ARTIFACT_BASENAME_BY_CAPABILITY.values())
-    allowed_paths = sorted(
-        candidate
-        for parent in allowed
-        for basename in basenames
-        for candidate in [basename if parent == "." else f"{parent}/{basename}"]
-        if candidate not in files and not _is_test_file(candidate)
-    )
-
-    return {
-        "application_roots": sorted(roots),
-        "test_roots": sorted(test_roots),
-        "allowed_new_artifact_parent_directories": sorted(allowed),
-        "allowed_new_artifact_paths": allowed_paths,
-        "forbidden_test_path_rules": [
-            'basename equals "conftest.py" or "tests.py"',
-            'basename starts with "test_"',
-            'basename ends with "_test.py"',
-            'a path component equals "tests"',
-        ],
-    }
-
-
-def _direct_test_context_imports(files: dict[str, str]) -> dict[str, list[dict]]:
-    """Find exact, single-line Flask context imports eligible for deterministic plumbing."""
-    found: dict[str, list[dict]] = {}
-    for path, source in files.items():
-        if not _is_test_file(path):
-            continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-        lines = source.splitlines()
-        for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.ImportFrom)
-                and node.module == "flask"
-                and node.level == 0
-                and node.lineno == node.end_lineno
-            ):
-                continue
-            selected = [
-                alias for alias in node.names
-                if alias.name in _DIRECT_TEST_CONTEXT_GLOBALS
-            ]
-            if not selected:
-                continue
-            before = lines[node.lineno - 1]
-            # Exact-line replacement intentionally declines comments and compound
-            # statements; those remain visible as unsupported rather than being reformatted.
-            if "#" in before or ";" in before:
-                continue
-            found.setdefault(path, []).append({
-                "line": node.lineno,
-                "before": before,
-                "selected": [
-                    {"name": alias.name, "asname": alias.asname} for alias in selected
-                ],
-                "remaining": [
-                    {"name": alias.name, "asname": alias.asname}
-                    for alias in node.names if alias not in selected
-                ],
-            })
-    return found
-
-
-def _render_alias(alias: dict) -> str:
-    return alias["name"] + (f" as {alias['asname']}" if alias.get("asname") else "")
-
-
-def _attribute_names(source: str) -> set[str]:
-    """Return statically visible attribute names without making survey parsing fatal."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return set()
-    return {
-        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
-    }
-
-
-def _detected_artifact_surfaces(files: dict[str, str]) -> dict[str, list[str]]:
-    patterns = {
-        "template_rendering": _TEMPLATES,
-        "session_and_flash": _SESSION_FLASH,
-        "authentication": _AUTH_RUNTIME,
-        "request_context": _G_CONTEXT,
-        "database_extension": _FLASK_SQLALCHEMY,
-        "direct_test_surface": _TEST_CLIENT,
-    }
-    surfaces = {
-        name: sorted(path for path, source in files.items() if pattern.search(source))
-        for name, pattern in patterns.items()
-    }
-    return {name: paths for name, paths in surfaces.items() if paths}
-
-
-def _artifact_capability_requirements(
-    files: dict[str, str], planned: list[PlannedFile],
-) -> dict[str, dict]:
-    """Derive the validator's exhaustive ownership checklist from source consumers."""
-    targets = {item.path for item in planned}
-    surfaces = _detected_artifact_surfaces(files)
-    requirements = {
-        capability: {
-            "owner_rule": "exactly_one",
-            "consumers": sorted(path for path in consumers if path in targets),
-            "required_exports": [],
-            "required_class_members": [],
-        }
-        for capability, consumers in surfaces.items()
-        if len({path for path in consumers if path in targets}) >= 2
-    }
-    test_attributes = {
-        path: _attribute_names(source)
-        for path, source in files.items()
-        if _is_test_file(path) and path.rsplit("/", 1)[-1] != "conftest.py"
-    }
-    direct_members = sorted({
-        member
-        for attributes in test_attributes.values()
-        for member in _DIRECT_TEST_MEMBERS
-        if member in attributes
-    })
-    if direct_members:
-        requirements["direct_test_surface"] = {
-            "owner_rule": "exactly_one",
-            "consumers": sorted(
-                item.path for item in planned if item.role == "app_factory"
-            ),
-            "required_exports": [],
-            "required_class_members": direct_members,
-        }
-    direct_context_imports = _direct_test_context_imports(files)
-    direct_context_imports = {
-        path: imports for path, imports in direct_context_imports.items()
-        if path in targets
-    }
-    if direct_context_imports:
-        requirements["test_context_surface"] = {
-            "owner_rule": "exactly_one",
-            "consumers": sorted(direct_context_imports),
-            "required_exports": sorted({
-                alias["name"]
-                for imports in direct_context_imports.values()
-                for entry in imports for alias in entry["selected"]
-            }),
-            "required_export_kinds": {
-                name: "variable"
-                for name in sorted({
-                    alias["name"]
-                    for imports in direct_context_imports.values()
-                    for entry in imports for alias in entry["selected"]
-                })
-            },
-            "required_class_members": [],
-        }
-    return dict(sorted(requirements.items()))
 
 
 class FlaskToFastAPIRecipe:
@@ -1650,13 +118,31 @@ class FlaskToFastAPIRecipe:
     def normalize_generated(
         path: str, content: str, seam_plan: dict | None = None,
     ) -> str:
+        content = _normalize_session_middleware_import(content)
         content = _normalize_template_response(content)
+        content = _normalize_exception_handler_status(content)
         content = _normalize_redirect_urls(content)
         content = _normalize_werkzeug_abort(content)
+        content = _normalize_mutated_fetchone_rows(content)
+        content = _realize_ambient_request_binding(path, content, seam_plan)
+        content = _realize_template_consumers(path, content, seam_plan)
+        content = _realize_authentication_consumers(path, content, seam_plan)
+        content = _realize_template_provider_globals(path, content, seam_plan)
+        content = _realize_error_handler_ownership(path, content, seam_plan)
+        content = _realize_blueprint_error_handlers(path, content, seam_plan)
         content = _realize_view_decorator_contracts(path, content, seam_plan)
         content = _realize_route_contracts(path, content, seam_plan)
+        content = _realize_request_hook_names(path, content, seam_plan)
+        content = _realize_resource_consumers(path, content, seam_plan)
         content = _realize_resource_contracts(path, content, seam_plan)
-        return _realize_factory_contracts(path, content, seam_plan)
+        content = _realize_factory_contracts(path, content, seam_plan)
+        content = _realize_template_context_processors(path, content, seam_plan)
+        content = _realize_implicit_sqlalchemy_tables(path, content, seam_plan)
+        content = _realize_extension_provider_facade(path, content, seam_plan)
+        content = _realize_dynamic_instance_exports(path, content, seam_plan)
+        content = _realize_decorated_provider_protocols(path, content, seam_plan)
+        content = _realize_extension_provider_order(path, content, seam_plan)
+        return _realize_cli_factory(path, content, seam_plan)
 
     @staticmethod
     def render_created_artifact(file: PlannedFile, worktree: str) -> str | None:
@@ -1672,13 +158,190 @@ class FlaskToFastAPIRecipe:
         classes = [item for item in exports if item.get("kind") == "class"]
         functions = [item for item in exports if item.get("kind") == "function"]
 
-        if capabilities & {"request_context", "session_and_flash"}:
+        if capabilities == {"direct_test_surface"} and len(classes) == 1:
+            members = set(classes[0].get("members", []))
+            supported = {"app_context", "test_client", "test_cli_runner", "testing"}
+            dependencies = contract.get("depends_on", [])
+            if members and members <= supported and len(dependencies) == 1:
+                class_name = classes[0]["name"]
+                if not class_name.isidentifier():
+                    return None
+                runtime_module = dependencies[0].removesuffix(".py").replace("/", ".")
+                registrars = _click_registrar_contracts(iter_py_files(worktree))
+                registrar_imports = "\n".join(
+                    f"from {item['module'].removesuffix('.py').replace('/', '.')} "
+                    f"import {item['function']} as _register_cli_{index}"
+                    for index, item in enumerate(registrars)
+                )
+                registrar_calls = "\n".join(
+                    f"        _register_cli_{index}(self._cli)"
+                    for index in range(len(registrars))
+                )
+                return textwrap.dedent(f'''\
+                    from __future__ import annotations
+
+                    from contextlib import contextmanager
+
+                    import click
+                    from click.testing import CliRunner
+                    from fastapi import FastAPI
+                    from fastapi.testclient import TestClient
+
+                    from {runtime_module} import _pop_context, _push_context
+                    {registrar_imports}
+
+
+                    class _Response:
+                        def __init__(self, response):
+                            self._response = response
+
+                        def __getattr__(self, name):
+                            return getattr(self._response, name)
+
+                        @property
+                        def data(self):
+                            return self._response.content
+
+                        def get_json(self):
+                            return self._response.json()
+
+                        def get_data(self, as_text=False):
+                            return self._response.text if as_text else self._response.content
+
+
+                    class _Client:
+                        def __init__(self, app):
+                            self._client = TestClient(app, follow_redirects=False)
+
+                        def __enter__(self):
+                            self._client.__enter__()
+                            return self
+
+                        def __exit__(self, *args):
+                            return self._client.__exit__(*args)
+
+                        def __getattr__(self, name):
+                            return getattr(self._client, name)
+
+                        def request(self, *args, **kwargs):
+                            return _Response(self._client.request(*args, **kwargs))
+
+                        def get(self, *args, **kwargs):
+                            return _Response(self._client.get(*args, **kwargs))
+
+                        def post(self, *args, **kwargs):
+                            return _Response(self._client.post(*args, **kwargs))
+
+                        def put(self, *args, **kwargs):
+                            return _Response(self._client.put(*args, **kwargs))
+
+                        def patch(self, *args, **kwargs):
+                            return _Response(self._client.patch(*args, **kwargs))
+
+                        def delete(self, *args, **kwargs):
+                            return _Response(self._client.delete(*args, **kwargs))
+
+
+                    class _CliRegistry:
+                        def __init__(self):
+                            self.cli = self
+                            self.commands = {{}}
+
+                        def command(self, name=None, *args, **kwargs):
+                            def decorate(function):
+                                command = click.command(name, *args, **kwargs)(function)
+                                self.commands[command.name] = command
+                                return command
+                            return decorate
+
+                        def add_command(self, command, name=None):
+                            self.commands[name or command.name] = command
+
+
+                    class _CliRunner:
+                        def __init__(self, commands):
+                            self._commands = commands
+
+                        def invoke(self, cli=None, args=None, **kwargs):
+                            values = list(args or [])
+                            command = cli
+                            if command is None:
+                                command = self._commands[values.pop(0)]
+                            return CliRunner().invoke(command, args=values, **kwargs)
+
+
+                    class _AppContext:
+                        def __init__(self, app):
+                            self._app = app
+                            self._token = None
+
+                        def push(self):
+                            self._token = _push_context({{"app": self._app, "session": {{}}}})
+                            return self._app
+
+                        def pop(self):
+                            if self._token is not None:
+                                for callback in self._app._cleanup_callbacks:
+                                    callback()
+                                _pop_context(self._token)
+                                self._token = None
+
+                        def __enter__(self):
+                            return self.push()
+
+                        def __exit__(self, exc_type, exc, traceback):
+                            self.pop()
+                            return False
+
+
+                    class {class_name}(FastAPI):
+                        def __init__(
+                            self, *args, testing=False, config=None,
+                            cleanup_callbacks=(), **kwargs
+                        ):
+                            super().__init__(*args, **kwargs)
+                            self.state.config = {{}}
+                            if config is not None:
+                                self.state.config.update({{
+                                    name: getattr(config, name) for name in dir(config)
+                                    if name.isupper()
+                                }})
+                            if testing:
+                                self.state.config["TESTING"] = True
+                            self._cleanup_callbacks = tuple(cleanup_callbacks)
+                            self._cli = _CliRegistry()
+                    {registrar_calls}
+
+                        @property
+                        def config(self):
+                            return self.state.config
+
+                        @property
+                        def testing(self):
+                            return bool(self.config.get("TESTING", False))
+
+                        def app_context(self):
+                            return _AppContext(self)
+
+                        def test_client(self):
+                            return _Client(self)
+
+                        def test_cli_runner(self):
+                            return _CliRunner(self._cli.commands)
+                    ''')
+
+        if (
+            capabilities & {"request_context", "session_and_flash"}
+            and capabilities <= {
+                "request_context", "session_and_flash", "authentication",
+            }
+        ):
             if len(classes) != 1 or set(classes[0].get("members", [])) - {
                 "dispatch", "get_request_context", "manage_session",
             }:
                 return None
             class_name = classes[0]["name"]
-            return textwrap.dedent(f'''\
+            runtime = textwrap.dedent(f'''\
                 from __future__ import annotations
 
                 from collections.abc import Iterator, MutableMapping
@@ -1760,6 +423,14 @@ class FlaskToFastAPIRecipe:
                     return session.pop("_flashes", [])
 
 
+                def get_request_context() -> dict[str, Any]:
+                    return _current()
+
+
+                def manage_session(request: Request) -> dict:
+                    return request.session
+
+
                 class {class_name}(BaseHTTPMiddleware):
                     async def dispatch(self, request: Request, call_next):
                         state = {{"request": request, "session": request.session}}
@@ -1773,17 +444,268 @@ class FlaskToFastAPIRecipe:
 
                     @staticmethod
                     def get_request_context() -> dict[str, Any]:
-                        return _current()
+                        return get_request_context()
 
                     @staticmethod
                     def manage_session(request: Request) -> dict:
-                        return request.session
+                        return manage_session(request)
+                ''')
+            if "authentication" not in capabilities:
+                return runtime
+            auth_contract = {
+                **contract,
+                "capabilities": ["authentication"],
+                "depends_on": [file.path],
+                "exports": [
+                    item for item in exports if item.get("name") in _FLASK_LOGIN_NAMES
+                ],
+            }
+            auth = FlaskToFastAPIRecipe.render_created_artifact(
+                PlannedFile(
+                    path=file.path, role=file.role, action="create",
+                    artifact_contract=auth_contract,
+                ),
+                worktree,
+            )
+            if auth is None:
+                return None
+            own_module = file.path.removesuffix(".py").replace("/", ".")
+            omitted = {
+                "from __future__ import annotations",
+                f"from {own_module} import g, session",
+            }
+            auth = "\n".join(
+                line for line in auth.splitlines() if line not in omitted
+            ).strip()
+            return runtime + "\n" + auth + "\n"
+
+        if capabilities == {"authentication"}:
+            names = {item["name"] for item in exports}
+            if not names or names - _FLASK_LOGIN_NAMES:
+                return None
+            dependencies = contract.get("depends_on", [])
+            protocols = [
+                protocol for protocol in _decorated_provider_protocols(
+                    iter_py_files(worktree)
+                )
+                if "user_loader" in protocol.get("decorator_members", [])
+            ]
+            if len(dependencies) != 1 or len(protocols) != 1:
+                return None
+            runtime_module = dependencies[0].removesuffix(".py").replace("/", ".")
+            manager_module = protocols[0]["provider"].removesuffix(".py").replace(
+                "/", "."
+            )
+            manager_symbol = protocols[0]["symbol"]
+            return textwrap.dedent(f'''\
+                from __future__ import annotations
+
+                import inspect
+                from functools import wraps
+
+                from fastapi.responses import RedirectResponse
+
+                from {runtime_module} import g, session
+                from {manager_module} import {manager_symbol} as _login_manager
+
+
+                class _AnonymousUser:
+                    is_authenticated = False
+                    is_active = False
+                    is_anonymous = True
+
+                    @staticmethod
+                    def get_id():
+                        return None
+
+                    def __bool__(self):
+                        return False
+
+
+                class _AuthenticatedUser:
+                    is_authenticated = True
+                    is_active = True
+                    is_anonymous = False
+
+                    def __init__(self, user):
+                        self._user = user
+
+                    def __getattr__(self, name):
+                        return getattr(self._user, name)
+
+                    def get_id(self):
+                        getter = getattr(self._user, "get_id", None)
+                        return getter() if callable(getter) else getattr(self._user, "id", None)
+
+                    def __bool__(self):
+                        return True
+
+
+                _anonymous_user = _AnonymousUser()
+
+
+                def _load_current_user():
+                    user_id = session.get("_user_id")
+                    loader = getattr(_login_manager, "load_user", None)
+                    if user_id is None or not callable(loader):
+                        return _anonymous_user
+                    user = loader(user_id)
+                    return _AuthenticatedUser(user) if user is not None else _anonymous_user
+
+
+                class _CurrentUserProxy:
+                    def __getattr__(self, name):
+                        return getattr(_load_current_user(), name)
+
+                    def __bool__(self):
+                        return bool(_load_current_user())
+
+
+                current_user = _CurrentUserProxy()
+
+
+                def login_user(user, remember=False, duration=None, force=False, fresh=True):
+                    getter = getattr(user, "get_id", None)
+                    user_id = getter() if callable(getter) else getattr(user, "id", None)
+                    if user_id is None:
+                        return False
+                    session["_user_id"] = str(user_id)
+                    session["_fresh"] = bool(fresh)
+                    if remember:
+                        session["_remember"] = "set"
+                    return True
+
+
+                def logout_user():
+                    for key in ("_user_id", "_fresh", "_remember"):
+                        session.pop(key, None)
+                    return True
+
+
+                def _login_location():
+                    request = g.request
+                    endpoint = getattr(_login_manager, "login_view", None)
+                    if endpoint:
+                        names = [
+                            route.name for route in request.app.router.routes
+                            if route.name == endpoint or route.name.endswith(f".{{endpoint}}")
+                        ]
+                        if len(names) == 1:
+                            endpoint = names[0]
+                        try:
+                            return request.url_for(endpoint).path
+                        except Exception:
+                            pass
+                    return "/"
+
+
+                def login_required(view):
+                    @wraps(view)
+                    async def wrapped_view(**kwargs):
+                        if not current_user.is_authenticated:
+                            return RedirectResponse(_login_location(), status_code=302)
+                        result = view(**kwargs)
+                        return await result if inspect.isawaitable(result) else result
+                    return wrapped_view
                 ''')
 
-        if {"direct_test_surface", "test_context_surface"} <= capabilities:
+        if capabilities == {"direct_test_surface"} and len(classes) == 1:
+            class_members = set(classes[0].get("members", []))
+            lifecycle_contracts = [
+                item for item in _returned_lifecycle_contracts(
+                    iter_py_files(worktree), contract.get("consumers", []),
+                )
+                if item["factory_member"] in class_members
+            ]
+            if len(lifecycle_contracts) == 1 and class_members <= {
+                lifecycle_contracts[0]["factory_member"], "testing",
+            }:
+                dependencies = contract.get("depends_on", [])
+                if len(dependencies) != 1:
+                    return None
+                lifecycle = lifecycle_contracts[0]
+                module = dependencies[0].removesuffix(".py").replace("/", ".")
+                class_name = classes[0]["name"]
+                factory_member = lifecycle["factory_member"]
+                entry_member = lifecycle["entry_member"]
+                exit_member = lifecycle["exit_member"]
+                testing_parameter = ", testing=False" if "testing" in class_members else ""
+                testing_assignment = (
+                    "        self.testing = bool(testing)\n"
+                    if "testing" in class_members else ""
+                )
+                return textwrap.dedent(f'''\
+                    from __future__ import annotations
+
+                    from fastapi import FastAPI
+
+                    from {module} import _pop_context, _push_context
+
+
+                    class _PortageReturnedLifecycle:
+                        def __init__(self, app, cleanup_callbacks=()):
+                            self._app = app
+                            self._cleanup_callbacks = tuple(cleanup_callbacks)
+                            self._tokens = []
+
+                        def {entry_member}(self):
+                            self._tokens.append(_push_context())
+                            return self._app
+
+                        def {exit_member}(self):
+                            if not self._tokens:
+                                raise RuntimeError("lifecycle exit without matching entry")
+                            for callback in self._cleanup_callbacks:
+                                callback()
+                            _pop_context(self._tokens.pop())
+
+                        def __enter__(self):
+                            return self.{entry_member}()
+
+                        def __exit__(self, exc_type, exc, traceback):
+                            self.{exit_member}()
+                            return False
+
+
+                    class {class_name}(FastAPI):
+                        def __init__(
+                            self, *args{testing_parameter}, cleanup_callbacks=(), **kwargs
+                        ):
+                            super().__init__(*args, **kwargs)
+                    {testing_assignment}        self._cleanup_callbacks = tuple(cleanup_callbacks)
+
+                        def {factory_member}(self):
+                            return _PortageReturnedLifecycle(
+                                self, self._cleanup_callbacks
+                            )
+                    ''')
+
+        if capabilities == {"direct_test_surface"}:
+            if (
+                len(classes) != 1
+                or set(classes[0].get("members", [])) != {"test_client"}
+            ):
+                return None
+            class_name = classes[0]["name"]
+            return textwrap.dedent(f'''\
+                from fastapi import FastAPI
+                from fastapi.testclient import TestClient as _FastAPITestClient
+
+
+                class {class_name}(FastAPI):
+                    def test_client(self):
+                        return _FastAPITestClient(self)
+                ''')
+
+        if capabilities == {"direct_test_surface", "test_context_surface"}:
             if len(classes) != 1 or set(classes[0].get("members", [])) - {
                 "app_context", "testing",
             }:
+                return None
+            variables = {
+                item["name"] for item in exports if item.get("kind") == "variable"
+            }
+            if variables - {"g", "session"}:
                 return None
             dependencies = contract.get("depends_on", [])
             if len(dependencies) != 1:
@@ -1819,7 +741,12 @@ class FlaskToFastAPIRecipe:
                             _pop_context(token)
                 ''')
 
-        if capabilities == {"template_rendering"} and len(functions) == 1:
+        function_names = {item["name"] for item in functions}
+        if (
+            capabilities == {"template_rendering"}
+            and "render_template" in function_names
+            and function_names <= _TEMPLATE_FUNCTIONS
+        ):
             template_dir = Path(worktree, file.path).parent / "templates"
             if not template_dir.is_dir():
                 return None
@@ -1834,7 +761,14 @@ class FlaskToFastAPIRecipe:
                 runtime_context = (
                     '"g": g, "get_flashed_messages": get_flashed_messages, '
                 )
-            function_name = functions[0]["name"]
+            if "url_for" in function_names and not runtime_import:
+                return None
+            url_for_function = (
+                "\n\n                def url_for(name: str, **path_params):\n"
+                "                    return _TemplateRequest(g.request).url_for("
+                "name, **path_params)\n"
+                if "url_for" in function_names else ""
+            )
             return textwrap.dedent(f'''\
                 from __future__ import annotations
 
@@ -1866,9 +800,13 @@ class FlaskToFastAPIRecipe:
                         return getattr(self._request, name)
 
 
-                def {function_name}(request: Request, template_name: str, **context):
-                    values = {{{runtime_context}"request": _TemplateRequest(request), **context}}
+                def render_template(request: Request, template_name: str, **context):
+                    values = {{
+                        **vars(request.state).get("_state", {{}}),
+                        {runtime_context}"request": _TemplateRequest(request), **context,
+                    }}
                     return templates.TemplateResponse(request, template_name, values)
+                {url_for_function}
                 ''')
         return None
 
@@ -1910,11 +848,13 @@ class FlaskToFastAPIRecipe:
         sessions/auth/extensions, or direct test-client use without conftest are the
         measured cases where in-place rewriting has proved insufficient.
         """
-        del planned
         complex_surface = any(
             pattern.search(source)
             for source in files.values()
             for pattern in (_TEMPLATES, _SESSION_FLASH, _FLASK_LOGIN, _FLASK_SQLALCHEMY)
+        )
+        complex_surface = complex_surface or bool(
+            _exercised_flask_template_functions(files, set(files))
         )
         direct_test_client = any(
             _is_test_file(path) and path.rsplit("/", 1)[-1] != "conftest.py"
@@ -1985,6 +925,9 @@ class FlaskToFastAPIRecipe:
             "combine it only with capabilities that the same app runtime can coherently "
             "own. Direct context exports "
             "must be real runtime-backed proxies, never constants or test-only fakes.\n\n"
+            "When unchanged templates consume an authentication global, keep the template "
+            "provider standalone so its dependency on authentication cannot create a cycle "
+            "with the request/session runtime.\n\n"
             "REPOSITORY PLACEMENT CONTRACT — authoritative and mechanically validated. "
             "Every proposed `path` must be copied EXACTLY from "
             "`allowed_new_artifact_paths`; do not invent, prefix, suffix, or alter a path. "
@@ -2048,6 +991,15 @@ class FlaskToFastAPIRecipe:
                     item for item in owner.get("exports", [])
                     if item.get("kind") == "class"
                 ]
+                if not classes and capability == "direct_test_surface":
+                    target = {
+                        "name": "FastAPIApp", "kind": "class", "signature": "",
+                        "members": sorted(required_members),
+                    }
+                    owner["exports"].append(target)
+                    classes = [target]
+                    exports[target["name"]] = target
+                    added_exports.append({"name": target["name"], "kind": "class"})
                 touching = [
                     item for item in classes
                     if required_members & set(item.get("members", []))
@@ -2091,24 +1043,80 @@ class FlaskToFastAPIRecipe:
             item for item in completed
             if "test_context_surface" in item.get("capabilities", [])
         ]
+        direct_owners = [
+            item for item in completed
+            if "direct_test_surface" in item.get("capabilities", [])
+        ]
+        auth_owners = [
+            item for item in completed
+            if "authentication" in item.get("capabilities", [])
+        ]
+        template_globals = _template_framework_globals(files)
+        returned_lifecycles = _returned_lifecycle_contracts(files, factory_paths)
         template_owners = [
             item for item in completed
             if "template_rendering" in item.get("capabilities", [])
         ]
+        if len(auth_owners) == 1:
+            auth_owner = auth_owners[0]
+            bindings = _flask_login_consumer_contracts(files)
+            consumers = sorted(bindings)
+            previous_consumers = set(auth_owner.get("consumers", []))
+            auth_owner["consumers"] = sorted({*previous_consumers, *consumers})
+            exports = {item["name"] for item in auth_owner.get("exports", [])}
+            additions = [
+                {
+                    "name": name,
+                    "kind": "variable" if name == "current_user" else "function",
+                    "signature": "",
+                    "members": [],
+                }
+                for name in sorted({
+                    item["symbol"] for entries in bindings.values() for item in entries
+                } - exports)
+            ]
+            if additions or previous_consumers != set(auth_owner["consumers"]):
+                auth_owner["exports"].extend(additions)
+                audit = audit_by_path.setdefault(auth_owner["path"], {
+                    "path": auth_owner["path"],
+                    "capabilities": [],
+                    "added_consumers": [],
+                    "added_exports": [],
+                    "added_class_members": [],
+                })
+                audit["added_consumers"] = sorted(
+                    set(auth_owner["consumers"]) - previous_consumers
+                )
+                audit["added_exports"].extend(
+                    {"name": item["name"], "kind": item["kind"]}
+                    for item in additions
+                )
         if len(template_owners) == 1:
             template_owner = template_owners[0]
-            template_export = {
-                "name": "render_template", "kind": "function", "signature": "",
-                "members": [],
+            template_names = sorted({
+                "render_template",
+                *_exercised_flask_template_functions(
+                    files, set(template_owner.get("consumers", [])),
+                ),
+            })
+            template_exports = [
+                {
+                    "name": name, "kind": "function", "signature": "",
+                    "members": [],
+                }
+                for name in template_names
+            ]
+            previous = template_owner.get("exports", [])
+            standalone_template = set(template_owner.get("capabilities", [])) == {
+                "template_rendering",
             }
-            if (
-                set(template_owner.get("capabilities", [])) == {"template_rendering"}
-                and template_owner.get("exports") != [template_export]
-            ):
-                previous_exports = [
-                    export.get("name") for export in template_owner.get("exports", [])
-                ]
-                template_owner["exports"] = [template_export]
+            existing = {export.get("name") for export in previous}
+            completed_exports = template_exports if standalone_template else [
+                *previous,
+                *(export for export in template_exports if export["name"] not in existing),
+            ]
+            if previous != completed_exports:
+                template_owner["exports"] = completed_exports
                 audit = audit_by_path.setdefault(template_owner["path"], {
                     "path": template_owner["path"],
                     "capabilities": [],
@@ -2116,10 +1124,30 @@ class FlaskToFastAPIRecipe:
                     "added_exports": [],
                     "added_class_members": [],
                 })
-                audit["added_exports"].append({
-                    "name": "render_template", "kind": "function",
-                })
-                audit["removed_exports"] = previous_exports
+                previous_functions = {
+                    export.get("name") for export in previous
+                    if export.get("kind") == "function"
+                }
+                audit["added_exports"].extend(
+                    {"name": name, "kind": "function"}
+                    for name in template_names if name not in previous_functions
+                )
+                removed = [
+                    export for export in previous
+                    if standalone_template and (
+                        export.get("name") not in template_names
+                        or export.get("kind") != "function"
+                    )
+                ]
+                if removed:
+                    audit["removed_exports"] = [
+                        {"name": export["name"], "kind": export["kind"]}
+                        for export in removed
+                    ]
+                if standalone_template and any(
+                    export.get("signature") for export in previous
+                ):
+                    audit["normalized_signatures"] = template_names
         if len(runtime_owners) == 1:
             runtime_owner = runtime_owners[0]
             combined_test_owner = (
@@ -2131,24 +1159,12 @@ class FlaskToFastAPIRecipe:
                 export for export in runtime_owner.get("exports", [])
                 if export.get("kind") == "class"
             ]
-            removed_exports = []
             if len(runtime_classes) <= 1:
-                removed_exports = [
-                    export["name"] for export in runtime_owner.get("exports", [])
-                    if export.get("kind") == "function"
-                    and export.get("name") in runtime_members
-                ]
-                runtime_owner["exports"] = [
-                    export for export in runtime_owner.get("exports", [])
-                    if export.get("name") not in removed_exports
-                ]
                 if runtime_classes:
                     runtime_class = runtime_classes[0]
                     if not combined_test_owner:
-                        runtime_class["members"] = sorted(
-                            runtime_members
-                            | (set(runtime_class.get("members", [])) & {"dispatch"})
-                        )
+                        previous_members = set(runtime_class.get("members", []))
+                        runtime_class["members"] = sorted(runtime_members)
                     added_runtime_export = []
                 else:
                     names = {
@@ -2166,7 +1182,7 @@ class FlaskToFastAPIRecipe:
                     }
                     runtime_owner["exports"].append(runtime_class)
                     added_runtime_export = [{"name": class_name, "kind": "class"}]
-                if removed_exports or added_runtime_export:
+                if added_runtime_export:
                     audit = audit_by_path.setdefault(runtime_owner["path"], {
                         "path": runtime_owner["path"],
                         "capabilities": [],
@@ -2175,7 +1191,119 @@ class FlaskToFastAPIRecipe:
                         "added_class_members": [],
                     })
                     audit["added_exports"].extend(added_runtime_export)
-                    audit["removed_exports"] = removed_exports
+                elif not combined_test_owner:
+                    removed_members = sorted(previous_members - runtime_members)
+                    if removed_members:
+                        audit = audit_by_path.setdefault(runtime_owner["path"], {
+                            "path": runtime_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        audit["removed_class_members"] = [{
+                            "export": runtime_class["name"],
+                            "members": removed_members,
+                        }]
+
+            runtime_support = {
+                "get_request_context": "function", "manage_session": "function",
+                **(
+                    {"g": "variable"}
+                    if "request_context" in runtime_owner.get("capabilities", []) else {}
+                ),
+                **(
+                    {
+                        "session": "variable", "flash": "function",
+                        "get_flashed_messages": "function",
+                    }
+                    if "session_and_flash" in runtime_owner.get("capabilities", []) else {}
+                ),
+            }
+            if len(template_owners) == 1 and (
+                runtime_owner["path"] != template_owners[0]["path"]
+            ):
+                runtime_support.update({
+                    "g": "variable", "get_flashed_messages": "function",
+                })
+            if len(auth_owners) == 1 and _flask_login_consumer_contracts(files):
+                runtime_support.update({"g": "variable", "session": "variable"})
+            if len(direct_owners) == 1 and runtime_owner["path"] != direct_owners[0]["path"]:
+                runtime_support.update({
+                    "_push_context": "function", "_pop_context": "function",
+                })
+            runtime_signatures = {
+                "_push_context": "def _push_context(state=None)",
+                "_pop_context": "def _pop_context(token)",
+                "flash": "def flash(message)",
+                "get_flashed_messages": "def get_flashed_messages()",
+                "get_request_context": "def get_request_context()",
+                "manage_session": "def manage_session(request)",
+            }
+            runtime_names = {
+                export.get("name") for export in runtime_owner.get("exports", [])
+            }
+            added_runtime_support = []
+            normalized_runtime_signatures = []
+            for name, kind in sorted(runtime_support.items()):
+                if name in runtime_names:
+                    existing = next(
+                        export for export in runtime_owner["exports"]
+                        if export.get("name") == name
+                    )
+                    if (
+                        name in runtime_signatures
+                        and existing.get("signature") != runtime_signatures[name]
+                    ):
+                        existing["signature"] = runtime_signatures[name]
+                        normalized_runtime_signatures.append(name)
+                    continue
+                runtime_owner["exports"].append({
+                    "name": name, "kind": kind,
+                    "signature": runtime_signatures.get(name, ""), "members": [],
+                })
+                added_runtime_support.append({"name": name, "kind": kind})
+            if added_runtime_support or normalized_runtime_signatures:
+                audit = audit_by_path.setdefault(runtime_owner["path"], {
+                    "path": runtime_owner["path"],
+                    "capabilities": [],
+                    "added_consumers": [],
+                    "added_exports": [],
+                    "added_class_members": [],
+                })
+                audit["added_exports"].extend(added_runtime_support)
+                if normalized_runtime_signatures:
+                    audit["normalized_signatures"] = sorted({
+                        *audit.get("normalized_signatures", []),
+                        *normalized_runtime_signatures,
+                    })
+            runtime_capabilities = set(runtime_owner.get("capabilities", []))
+            if (
+                runtime_capabilities <= {"request_context", "session_and_flash"}
+                and len(runtime_classes) <= 1
+            ):
+                allowed = {*runtime_support, runtime_class["name"]}
+                removed = [
+                    export for export in runtime_owner["exports"]
+                    if export.get("name") not in allowed
+                ]
+                if removed:
+                    runtime_owner["exports"] = [
+                        export for export in runtime_owner["exports"]
+                        if export.get("name") in allowed
+                    ]
+                    audit = audit_by_path.setdefault(runtime_owner["path"], {
+                        "path": runtime_owner["path"],
+                        "capabilities": [],
+                        "added_consumers": [],
+                        "added_exports": [],
+                        "added_class_members": [],
+                    })
+                    audit["removed_exports"] = [
+                        {"name": export["name"], "kind": export["kind"]}
+                        for export in removed
+                    ]
+
             added_factory_consumers = sorted(
                 set(factory_paths) - set(runtime_owner.get("consumers", []))
             )
@@ -2210,8 +1338,74 @@ class FlaskToFastAPIRecipe:
                 })
                 audit["instruction_completed"] = True
 
+            if len(direct_owners) == 1 and returned_lifecycles:
+                direct_owner = direct_owners[0]
+                if runtime_owner["path"] != direct_owner["path"]:
+                    dependencies = set(direct_owner.get("depends_on", []))
+                    if runtime_owner["path"] not in dependencies:
+                        direct_owner["depends_on"] = sorted({
+                            *dependencies, runtime_owner["path"],
+                        })
+                        audit = audit_by_path.setdefault(direct_owner["path"], {
+                            "path": direct_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        audit["added_dependencies"] = [runtime_owner["path"]]
+                lifecycle_note = (
+                    " Implement these source-observed returned-object lifecycle "
+                    f"contracts on the app facade: {returned_lifecycles}. Each factory "
+                    "member returns a real object exposing the listed entry and exit "
+                    "members as well as context-manager entry/exit; both paths bind and "
+                    "reset the shared runtime context exactly once."
+                )
+                if lifecycle_note.strip() not in direct_owner["instructions"]:
+                    direct_owner["instructions"] += lifecycle_note
+                    audit = audit_by_path.setdefault(direct_owner["path"], {
+                        "path": direct_owner["path"],
+                        "capabilities": [],
+                        "added_consumers": [],
+                        "added_exports": [],
+                        "added_class_members": [],
+                    })
+                    audit["instruction_completed"] = True
+
             if len(test_owners) == 1:
                 test_owner = test_owners[0]
+                test_capabilities = set(test_owner.get("capabilities", []))
+                previous_exports = test_owner.get("exports", [])
+                if (
+                    test_capabilities
+                    and test_capabilities <= {
+                        "direct_test_surface", "test_context_surface",
+                    }
+                    and any(
+                        export.get("kind") == "class"
+                        for export in previous_exports
+                    )
+                ):
+                    removed = [
+                        export for export in previous_exports
+                        if export.get("kind") == "function"
+                    ]
+                    if removed:
+                        test_owner["exports"] = [
+                            export for export in previous_exports
+                            if export.get("kind") != "function"
+                        ]
+                        audit = audit_by_path.setdefault(test_owner["path"], {
+                            "path": test_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        audit["removed_exports"] = [
+                            {"name": export["name"], "kind": export["kind"]}
+                            for export in removed
+                        ]
                 required_test_members = set(
                     requirements.get("direct_test_surface", {}).get(
                         "required_class_members", []
@@ -2221,14 +1415,27 @@ class FlaskToFastAPIRecipe:
                     export for export in test_owner.get("exports", [])
                     if export.get("kind") == "class"
                 ]
-                if (
-                    "direct_test_surface" in test_owner.get("capabilities", [])
-                    and len(test_classes) == 1 and required_test_members
-                ):
-                    previous_members = set(test_classes[0].get("members", []))
-                    test_classes[0]["members"] = sorted(required_test_members)
-                    removed_members = sorted(previous_members - required_test_members)
-                    if removed_members:
+                if {
+                    "direct_test_surface", "test_context_surface",
+                } <= test_capabilities and test_capabilities <= {
+                    "direct_test_surface", "test_context_surface",
+                } and len(test_classes) == 1:
+                    proxy_exports = requirements.get("test_context_surface", {}).get(
+                        "required_export_kinds", {},
+                    )
+                    previous_exports = test_owner.get("exports", [])
+                    existing = {
+                        export.get("name"): export.get("kind")
+                        for export in previous_exports
+                    }
+                    completed_exports = [
+                        *test_classes,
+                        *({
+                            "name": name, "kind": kind, "signature": "", "members": [],
+                        } for name, kind in sorted(proxy_exports.items())),
+                    ]
+                    if previous_exports != completed_exports:
+                        test_owner["exports"] = completed_exports
                         audit = audit_by_path.setdefault(test_owner["path"], {
                             "path": test_owner["path"],
                             "capabilities": [],
@@ -2236,10 +1443,47 @@ class FlaskToFastAPIRecipe:
                             "added_exports": [],
                             "added_class_members": [],
                         })
-                        audit["removed_class_members"] = [{
-                            "export": test_classes[0]["name"],
-                            "members": removed_members,
-                        }]
+                        audit["added_exports"].extend(
+                            {"name": name, "kind": kind}
+                            for name, kind in sorted(proxy_exports.items())
+                            if existing.get(name) != kind
+                        )
+                        removed = [
+                            export for export in previous_exports
+                            if export.get("kind") != "class"
+                            and proxy_exports.get(export.get("name"))
+                            != export.get("kind")
+                        ]
+                        audit.setdefault("removed_exports", []).extend(
+                            {"name": export["name"], "kind": export["kind"]}
+                            for export in removed
+                        )
+                if (
+                    "direct_test_surface" in test_owner.get("capabilities", [])
+                    and len(test_classes) == 1 and required_test_members
+                ):
+                    previous_members = set(test_classes[0].get("members", []))
+                    missing_members = sorted(required_test_members - previous_members)
+                    removed_members = sorted(previous_members - required_test_members)
+                    test_classes[0]["members"] = sorted(required_test_members)
+                    if missing_members or removed_members:
+                        audit = audit_by_path.setdefault(test_owner["path"], {
+                            "path": test_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        if missing_members:
+                            audit["added_class_members"].append({
+                                "export": test_classes[0]["name"],
+                                "members": missing_members,
+                            })
+                        if removed_members:
+                            audit["removed_class_members"] = [{
+                                "export": test_classes[0]["name"],
+                                "members": removed_members,
+                            }]
                 if runtime_owner["path"] != test_owner["path"]:
                     dependencies = set(test_owner.get("depends_on", []))
                     if runtime_owner["path"] not in dependencies:
@@ -2290,6 +1534,42 @@ class FlaskToFastAPIRecipe:
                         })
                         audit["added_dependencies"] = [runtime_owner["path"]]
 
+            if len(auth_owners) == 1:
+                auth_owner = auth_owners[0]
+                if runtime_owner["path"] != auth_owner["path"]:
+                    dependencies = set(auth_owner.get("depends_on", []))
+                    if runtime_owner["path"] not in dependencies:
+                        auth_owner["depends_on"] = sorted({
+                            *dependencies, runtime_owner["path"],
+                        })
+                        audit = audit_by_path.setdefault(auth_owner["path"], {
+                            "path": auth_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        audit.setdefault("added_dependencies", []).append(
+                            runtime_owner["path"]
+                        )
+                if len(template_owners) == 1 and "current_user" in template_globals:
+                    template_owner = template_owners[0]
+                    dependencies = set(template_owner.get("depends_on", []))
+                    if auth_owner["path"] not in dependencies:
+                        template_owner["depends_on"] = sorted({
+                            *dependencies, auth_owner["path"],
+                        })
+                        audit = audit_by_path.setdefault(template_owner["path"], {
+                            "path": template_owner["path"],
+                            "capabilities": [],
+                            "added_consumers": [],
+                            "added_exports": [],
+                            "added_class_members": [],
+                        })
+                        audit.setdefault("added_dependencies", []).append(
+                            auth_owner["path"]
+                        )
+
         return completed, [audit_by_path[path] for path in sorted(audit_by_path)]
 
     @staticmethod
@@ -2309,6 +1589,22 @@ class FlaskToFastAPIRecipe:
                     "application-module name and preserve all other decisions"
                 )
                 continue
+            capabilities = set(item.get("capabilities", []))
+            if (
+                "template_rendering" in capabilities
+                and len(capabilities) > 1
+                and (
+                    _template_framework_globals(files)
+                    or _template_context_processor_contracts(files)
+                )
+            ):
+                out.append(
+                    f"artifact {path} combines template rendering with "
+                    f"{sorted(capabilities - {'template_rendering'})}, but source "
+                    "templates require shared globals/context processors; keep the "
+                    "template provider standalone so its request-first contract has "
+                    "one deterministic realization"
+                )
             if path not in allowed_paths:
                 out.append(
                     f"artifact {path} is invalid: path must be selected exactly from "
@@ -2418,14 +1714,21 @@ class FlaskToFastAPIRecipe:
             if set(item.get("capabilities", [])) == {"template_rendering"}
         ):
             exports = owner.get("exports", [])
-            if not (
-                len(exports) == 1
-                and exports[0].get("name") == "render_template"
-                and exports[0].get("kind") == "function"
-            ):
+            required = {
+                name: "function" for name in sorted({
+                    "render_template",
+                    *_exercised_flask_template_functions(
+                        files, set(owner.get("consumers", [])),
+                    ),
+                })
+            }
+            actual = {
+                export.get("name"): export.get("kind") for export in exports
+            }
+            if any(actual.get(name) != kind for name, kind in required.items()):
                 out.append(
-                    f"standalone template owner {owner['path']} requires exactly the "
-                    "render_template function export"
+                    f"standalone template owner {owner['path']} requires the "
+                    f"template function exports {sorted(required)}"
                 )
         return out
 
@@ -2545,6 +1848,20 @@ class FlaskToFastAPIRecipe:
 
     def plan_files(self, files: dict[str, str]) -> list[PlannedFile]:
         planned = [pf for path, src in files.items() if (pf := self._classify(path, src))]
+        by_path = {item.path: item for item in planned}
+        for path in sorted({
+            item["handler_path"] for item in _blueprint_error_handler_facts(files)
+        }):
+            if path in by_path:
+                if not any(task.type == "error_handler" for task in by_path[path].subtasks):
+                    by_path[path].subtasks.append(_SUBTASKS["error_handler"])
+                continue
+            item = PlannedFile(
+                path=path, role="support", order=15,
+                subtasks=[_SUBTASKS["error_handler"]],
+            )
+            planned.append(item)
+            by_path[path] = item
         planned.sort(key=lambda pf: (pf.order, pf.path))
         return planned
 
@@ -2583,6 +1900,119 @@ class FlaskToFastAPIRecipe:
             ) & {"direct_test_surface", "request_context", "test_context_surface"}
         }
 
+        provider_protocols = _decorated_provider_protocols(files)
+        for protocol in provider_protocols:
+            provider = protocol["provider"]
+            symbol = protocol["symbol"]
+            members = protocol["decorator_members"]
+            decisions[f"provider_protocol:{provider}:{symbol}"] = {
+                "kind": "provider_protocol",
+                **protocol,
+                "files": sorted({provider, *protocol["consumers"]}),
+                "instruction": (
+                    f"Source constructs `{symbol}` in `{provider}` and consumes its "
+                    f"direct protocol {protocol}. Preserve that module-level "
+                    "provider instance and make every listed member a callable decorator "
+                    "or ordinary callable/attribute with the same source shape; do not replace the "
+                    "provider with a class object or an unrelated framework primitive "
+                    "that lacks those members."
+                ),
+            }
+
+        auth_owners = [
+            pf for pf in planned
+            if pf.action == "create" and "authentication" in (
+                pf.artifact_contract or {}
+            ).get("capabilities", [])
+        ]
+        auth_consumers = _flask_login_consumer_contracts(files)
+        login_managers = [
+            protocol for protocol in provider_protocols
+            if "user_loader" in protocol.get("decorator_members", [])
+        ]
+        if len(auth_owners) == 1 and auth_consumers:
+            owner = auth_owners[0]
+            manager = login_managers[0] if len(login_managers) == 1 else {}
+            template_globals = _template_framework_globals(files)
+            template_providers = sorted(
+                pf.path for pf in planned
+                if pf.action == "create" and "template_rendering" in (
+                    pf.artifact_contract or {}
+                ).get("capabilities", [])
+            )
+            decisions["authentication_runtime"] = {
+                "kind": "authentication_runtime",
+                "provider": owner.path,
+                "exports": sorted(
+                    export["name"]
+                    for export in (owner.artifact_contract or {}).get("exports", [])
+                ),
+                "runtime_providers": list((owner.artifact_contract or {}).get(
+                    "depends_on", []
+                )),
+                "manager_provider": manager.get("provider", ""),
+                "manager_symbol": manager.get("symbol", ""),
+                "consumer_bindings": auth_consumers,
+                "template_globals": template_globals,
+                "template_providers": template_providers,
+                "files": sorted({
+                    owner.path,
+                    *auth_consumers,
+                    *template_providers,
+                    *(
+                        [manager["provider"]]
+                        if manager.get("provider") else []
+                    ),
+                    *(owner.artifact_contract or {}).get("depends_on", []),
+                }),
+                "instruction": (
+                    "Preserve the source-imported Flask-Login surface on one session-backed "
+                    f"provider: {auth_consumers}. Consumers import those exact names from "
+                    f"`{owner.path}` instead of defining local substitutes. Preserve each "
+                    "source call shape. `current_user` is an attribute proxy loaded through "
+                    "the source user-loader provider; `login_required` wraps the original "
+                    "view with a kwargs-only async wrapper. Template globals "
+                    f"{template_globals} consume that same proxy."
+                ),
+            }
+
+        returned_lifecycles = _returned_lifecycle_contracts(files, factory_paths)
+        for pf in planned:
+            contract = pf.artifact_contract or {}
+            if pf.action != "create" or "direct_test_surface" not in contract.get(
+                "capabilities", []
+            ):
+                continue
+            classes = [
+                export for export in contract.get("exports", [])
+                if export.get("kind") == "class"
+            ]
+            if len(classes) != 1:
+                continue
+            members = set(classes[0].get("members", []))
+            protocols = [
+                item for item in returned_lifecycles
+                if item["factory_member"] in members
+            ]
+            if protocols:
+                decisions[f"returned_lifecycle:{pf.path}"] = {
+                    "kind": "returned_lifecycle",
+                    "provider": pf.path,
+                    "class": classes[0]["name"],
+                    "contracts": protocols,
+                    "files": sorted({
+                        pf.path, *contract.get("consumers", []),
+                        *(item["consumer"] for item in protocols),
+                    }),
+                    "instruction": (
+                        "The app facade has these source-observed returned-object "
+                        f"protocols: {protocols}. Each factory member returns an object "
+                        "with its exact entry/exit methods; that same object also supports "
+                        "`with`. Entry binds the shared runtime context, exit invokes "
+                        "cleanup callbacks and resets it exactly once."
+                    ),
+                }
+
         for pf in planned:
             if pf.role != "app_factory":
                 continue
@@ -2619,7 +2049,16 @@ class FlaskToFastAPIRecipe:
                     f"configuration values. Original literal configuration keys are "
                     f"{config['keys']}; populate their defaults and apply overrides from "
                     f"{config['override_parameters']} before calling these original "
-                    f"provider initializers: {initializers}. A planned app-facade class "
+                    f"provider initializers: {initializers}. "
+                    + (
+                        "Flask config.from_object loads inherited uppercase attributes. "
+                        f"Preserve that behavior for {config['from_objects']} by reading "
+                        "uppercase names through dir()/getattr() or an equivalent MRO-aware "
+                        "copy; vars() and __dict__ are forbidden because they drop inherited "
+                        "settings. "
+                        if config["from_objects"] else ""
+                    )
+                    + "A planned app-facade class "
                     "that subclasses FastAPI must be constructed as the application "
                     "itself; do not build a separate FastAPI and pass it as an arbitrary "
                     "positional constructor argument. Pass these original resource cleanup "
@@ -2639,10 +2078,101 @@ class FlaskToFastAPIRecipe:
                 "config_keys": config["keys"],
                 "override_parameters": config["override_parameters"],
                 "optional_parameters": config["optional_parameters"],
+                "config_from_objects": config["from_objects"],
+                "instance_exports": _instance_export_contracts(manifest, pf.path),
+                "local_imports": _factory_local_imports(files.get(pf.path, ""), pf.path),
                 "initializers": initializers,
                 "cleanup_callbacks": cleanup_callbacks,
                 "endpoint_aliases": endpoint_aliases,
                 "static_mount": static_mount,
+            }
+
+            handlers = _exception_handler_contracts(files.get(pf.path, ""))
+            if handlers:
+                names = {item["exception_name"] for item in handlers}
+                imported_routes = [
+                    candidate.path for candidate in planned
+                    if candidate.role == "router" and any(
+                        binding.importer == pf.path
+                        for binding in imported_bindings_from_sources(
+                            files, candidate.path,
+                        )
+                    )
+                ]
+                route_functions = {
+                    path: functions
+                    for path in [pf.path, *imported_routes]
+                    if (functions := _route_functions_without_local_handlers(
+                        files.get(path, ""), names,
+                    ))
+                }
+                # Ambiguous terminal exception names cannot be safely matched across
+                # differently imported provider modules, so keep those model-owned.
+                if len(names) != len(handlers):
+                    route_functions = {}
+                decisions[f"error_handler_ownership:{pf.path}"] = {
+                    "kind": "error_handler_ownership",
+                    "owner": pf.path,
+                    "files": sorted({pf.path, *route_functions}),
+                    "handlers": handlers,
+                    "route_functions": route_functions,
+                    "instruction": (
+                        "These source exception handlers own the HTTP status and top-level "
+                        f"JSON envelope: {handlers}. Registered route functions "
+                        f"{route_functions} must let those exceptions propagate; do not "
+                        "catch them and replace the response with FastAPI's detail envelope."
+                    ),
+                }
+
+        blueprint_handlers = _blueprint_error_handler_facts(files)
+        for handler_path in sorted({item["handler_path"] for item in blueprint_handlers}):
+            handlers = [
+                item for item in blueprint_handlers if item["handler_path"] == handler_path
+            ]
+            factories = sorted({
+                factory
+                for item in handlers
+                for factory in _blueprint_factories(
+                    files, item["blueprint_provider"], item["blueprint_symbol"],
+                    set(factory_paths),
+                )
+            })
+            decisions[f"blueprint_error_handlers:{handler_path}"] = {
+                "kind": "blueprint_error_handlers",
+                "handler_path": handler_path,
+                "factory_files": factories,
+                "files": sorted({handler_path, *factories}),
+                "handlers": handlers,
+                "instruction": (
+                    "Flask Blueprint error handlers have no APIRouter equivalent. Keep "
+                    "each named handler as an undecorated exported function, preserving "
+                    "its frozen exception/status registration, response helper calls, "
+                    f"status constants, and payload keys: {handlers}. Register it on "
+                    f"the application factories {factories} with add_exception_handler. "
+                    "Do not turn handlers into routes or attach errorhandler/"
+                    "exception_handler attributes to an APIRouter."
+                ),
+            }
+
+        for contract in _sqlalchemy_provider_contracts(files, planned):
+            provider = contract["provider"]
+            symbol = contract["symbol"]
+            decisions[f"extension_provider:{provider}:{symbol}"] = {
+                "kind": "extension_provider",
+                "files": sorted({provider, *contract["consumers"]}),
+                **contract,
+                "instruction": (
+                    f"`{provider}` owns the module-level SQLAlchemy provider `{symbol}`. "
+                    f"Its source-exercised public members are {contract['members']}; the "
+                    "plain-SQLAlchemy replacement must realize each one on that exact "
+                    "export. Assign that export at module scope before every consumer "
+                    "import; never create or rebind it inside the application factory. "
+                    "The factory may configure the already-existing provider. The "
+                    f"provider may import declared consumers {contract['consumers']} only "
+                    "after the module-level provider exists. Configure it from "
+                    "SQLALCHEMY_DATABASE_URI only "
+                    "after the factory has loaded the original configuration."
+                ),
             }
 
         for pf in planned:
@@ -2742,6 +2272,7 @@ class FlaskToFastAPIRecipe:
             decisions[f"planned_test_surface:{pf.path}"] = {
                 "kind": "planned_test_surface",
                 "provider": pf.path,
+                "classes": classes,
                 "files": sorted({pf.path, *consumers}),
                 "instruction": (
                     f"The application-owned test surface is `{pf.path}`: {owned}. Its "
@@ -2831,11 +2362,28 @@ class FlaskToFastAPIRecipe:
         )
         test_context_providers = sorted(
             pf.path for pf in planned
-            if pf.action == "create" and "test_context_surface" in (
-                pf.artifact_contract or {}
-            ).get("capabilities", [])
+            if pf.action == "create" and (
+                "test_context_surface" in (pf.artifact_contract or {}).get(
+                    "capabilities", []
+                )
+                or "direct_test_surface" in (pf.artifact_contract or {}).get(
+                    "capabilities", []
+                ) and any(
+                    export.get("kind") == "class"
+                    and "app_context" in export.get("members", [])
+                    for export in (pf.artifact_contract or {}).get("exports", [])
+                )
+            )
         )
         if runtime_context_providers and test_context_providers:
+            runtime_classes = {
+                pf.path: sorted(
+                    export["name"]
+                    for export in (pf.artifact_contract or {}).get("exports", [])
+                    if export.get("kind") == "class"
+                )
+                for pf in planned if pf.path in runtime_context_providers
+            }
             decisions["ambient_context_runtime"] = {
                 "kind": "ambient_context_runtime",
                 "files": sorted({
@@ -2843,6 +2391,7 @@ class FlaskToFastAPIRecipe:
                     *session_paths,
                 }),
                 "runtime_providers": runtime_context_providers,
+                "runtime_classes": runtime_classes,
                 "test_providers": test_context_providers,
                 "factory_files": sorted(factory_paths),
                 "instruction": (
@@ -2887,6 +2436,10 @@ class FlaskToFastAPIRecipe:
                 "files": template_files,
                 "provider_files": template_provider_paths,
                 "provider_functions": template_functions,
+                "context_globals": _template_framework_globals(files),
+                "authentication_provider": (
+                    auth_owners[0].path if len(auth_owners) == 1 else ""
+                ),
                 "instruction": (
                     "Use the current request-first Starlette/FastAPI template API: "
                     "`templates.TemplateResponse(request, name, context)`. A shared "
@@ -2895,6 +2448,27 @@ class FlaskToFastAPIRecipe:
                     "a render with no extra context remains valid. The deprecated "
                     "two-positional-argument form emits a warning and fails suites that "
                     "correctly treat framework deprecations as errors."
+                ),
+            }
+
+        context_processors = _template_context_processor_contracts(files)
+        if context_processors and template_provider_paths:
+            factory_files = sorted({item["provider"] for item in context_processors})
+            context_keys = sorted({
+                key for item in context_processors for key in item["keys"]
+            })
+            decisions["template_context_processors"] = {
+                "kind": "template_context_processors",
+                "processors": context_processors,
+                "factory_files": factory_files,
+                "template_provider_files": template_provider_paths,
+                "files": sorted({*factory_files, *template_provider_paths}),
+                "instruction": (
+                    "Preserve every source @app.context_processor as a request-time "
+                    "template context provider. Register the source callbacks on the "
+                    "target app and merge their returned mappings into every render; "
+                    "do not expose processors as HTTP routes. The source-observed "
+                    f"returned keys are {context_keys}."
                 ),
             }
 
@@ -2917,8 +2491,10 @@ class FlaskToFastAPIRecipe:
                     "callers drive a generator manually. The factory must first build "
                     "`app.state.config` (including test overrides); the existing same-shape "
                     "`init_app(app)` may then copy required values into private module-owned "
-                    "configuration used by the direct helper. The helper must not read a free "
-                    "global app/request, `current_app`, or invented app attributes. "
+                    "configuration used by the direct helper. Context-cached resources may "
+                    "instead use the exact `g` proxy imported from the frozen ambient-runtime "
+                    "provider; never use Flask's `g`, a free global app/request, "
+                    "`current_app`, or invented app attributes. "
                     f"Original resource facts are frozen: config keys "
                     f"{contract['config_keys']}, context-cache members "
                     f"{contract['context_cache_members']}, package-relative resources "
@@ -2957,20 +2533,27 @@ class FlaskToFastAPIRecipe:
             members = unit_for.get(pf.path, {}).get("paths", [pf.path])
             decisions[f"test_harness:{pf.path}"] = {
                 "kind": "test_harness",
+                "path": pf.path,
                 "files": list(members),
+                "direct_json_return_functions": _direct_json_return_functions(
+                    files.get(pf.path, ""),
+                ),
                 "instruction": (
                     "Use `fastapi.testclient.TestClient(app)` for HTTP plumbing. Remove "
                     "Flask application-context blocks and call real exported setup helpers "
                     "directly with their pinned signatures. Do not invent methods or state "
                     "attributes on FastAPI to imitate Flask (`app.container`, resource "
                     "openers, `test_client`, `test_cli_runner`, or similar). Preserve every "
-                    "assertion and its meaning."
+                    "assertion and its meaning. A source helper that directly returns "
+                    "response JSON may change only get_json() to json(); never unwrap or "
+                    "reshape an application response envelope in the test harness."
                 ),
             }
 
         cli_paths = [p for p, src in files.items() if p in by_path and _CLI_SEAM.search(src)]
         if cli_paths:
             command_bindings = _click_command_contracts(files)
+            registrars = _click_registrar_contracts(files)
             commands = {
                 item["function"]: item["name"] for item in command_bindings
             }
@@ -2984,6 +2567,7 @@ class FlaskToFastAPIRecipe:
                 for path in cli_paths
                 for member in unit_for.get(path, {}).get("paths", [path])
             } | {item["module"] for item in command_bindings}
+              | {item["module"] for item in registrars}
               | set(harness_files) | set(factory_files))
             decisions["standalone_cli"] = {
                 "kind": "standalone_cli",
@@ -3008,6 +2592,7 @@ class FlaskToFastAPIRecipe:
                 ),
                 "commands": commands,
                 "command_bindings": command_bindings,
+                "registrars": registrars,
                 "harness_files": harness_files,
                 "factory_files": factory_files,
             }

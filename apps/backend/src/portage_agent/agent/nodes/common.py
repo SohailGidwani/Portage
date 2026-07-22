@@ -146,8 +146,10 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def load_cut_checkpoint(worktree: str) -> dict:
-    manifest = Path(worktree, ".portage-cut-checkpoint", "manifest.json")
+def load_cut_checkpoint(
+    worktree: str, directory: str = ".portage-cut-checkpoint",
+) -> dict:
+    manifest = Path(worktree, directory, "manifest.json")
     try:
         value = json.loads(manifest.read_text())
     except (OSError, json.JSONDecodeError):
@@ -157,13 +159,14 @@ def load_cut_checkpoint(worktree: str) -> dict:
 
 def create_cut_checkpoint(
     worktree: str, paths: list[str], baseline: dict[str, dict],
+    directory: str = ".portage-cut-checkpoint",
 ) -> dict:
     """Snapshot a cut before generation; the on-disk copy survives worker resumes."""
-    existing = load_cut_checkpoint(worktree)
+    existing = load_cut_checkpoint(worktree, directory)
     if existing and set(paths) <= set(existing.get("paths", [])):
         return existing
 
-    root = Path(worktree, ".portage-cut-checkpoint")
+    root = Path(worktree, directory)
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir()
     files: dict[str, dict] = {}
@@ -329,11 +332,9 @@ def imported_bindings_from_sources(
                 if node.module is None:
                     # `from . import db` / `from .pkg import db` — names ARE modules.
                     for a in node.names:
-                        if f"{mod}.{a.name}".lstrip(".") in wanted or a.name in {
-                            w.split(".")[-1] for w in wanted
-                        }:
+                        if f"{mod}.{a.name}".lstrip(".") in wanted:
                             out.append(ModuleBinding(rel, None, a.asname or a.name))
-                elif mod in wanted or mod.split(".")[-1] in {w.split(".")[-1] for w in wanted}:
+                elif mod in wanted:
                     for a in node.names:
                         if a.name != "*":
                             out.append(ModuleBinding(rel, a.name, a.asname or a.name))
@@ -349,9 +350,7 @@ def imported_bindings_from_sources(
                             out.append(ModuleBinding(rel, None, a.asname or a.name))
             elif isinstance(node, ast.Import):
                 for a in node.names:
-                    if a.name in wanted or a.name.split(".")[-1] in {
-                        w.split(".")[-1] for w in wanted
-                    }:
+                    if a.name in wanted:
                         # Unaliased `import a.b` binds the name `a` in Python, but the
                         # source text accesses attributes on the full dotted path `a.b`
                         # (`a.b.symbol()`) — keep the whole path so _module_attrs_used
@@ -550,7 +549,9 @@ def interface_contract(root: str, target: str) -> list[SymbolContract]:
     ]
 
 
-def _planned_imports(files: dict[str, str], planned_paths: list[str]) -> dict[str, set[str]]:
+def _planned_imports(
+    files: dict[str, str], planned_paths: list[str], *, module_level_only: bool = False,
+) -> dict[str, set[str]]:
     """path -> other planned paths it imports (edges for ordering). Handles ImportFrom
     (incl. `from . import mod`), plain Import, and aliases — resolution via _module_names.
     Takes an ordered LIST and builds insertion-ordered structures (determinism)."""
@@ -565,7 +566,24 @@ def _planned_imports(files: dict[str, str], planned_paths: list[str]) -> dict[st
         except SyntaxError:
             continue
         mods: list[str] = []
-        for node in ast.walk(tree):
+
+        def runtime_nodes(node: ast.AST):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return
+            if isinstance(node, ast.If) and (
+                isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+                or isinstance(node.test, ast.Attribute)
+                and node.test.attr == "TYPE_CHECKING"
+            ):
+                for child in node.orelse:
+                    yield from runtime_nodes(child)
+                return
+            yield node
+            for child in ast.iter_child_nodes(node):
+                yield from runtime_nodes(child)
+
+        nodes = runtime_nodes(tree) if module_level_only else ast.walk(tree)
+        for node in nodes:
             if isinstance(node, ast.ImportFrom):
                 base = _resolve_module(node.module, node.level, path)
                 if node.module is None:
@@ -635,6 +653,38 @@ def planned_artifact_topology_violations(
                 f"consumer {consumer}; keep shared state in the provider or a declared "
                 "lower-level dependency"
             )
+    return out
+
+
+def new_import_cycle_violations(
+    original_files: dict[str, str], migrated_files: dict[str, str],
+) -> list[str]:
+    """Report runtime import SCCs introduced by the migration."""
+    original_scc = {
+        path: frozenset(component)
+        for component in _tarjan_sccs(
+            _planned_imports(
+                original_files, sorted(original_files), module_level_only=True,
+            )
+        )
+        if len(component) > 1
+        for path in component
+    }
+    out = []
+    for component in _tarjan_sccs(
+        _planned_imports(
+            migrated_files, sorted(migrated_files), module_level_only=True,
+        )
+    ):
+        if len(component) < 2:
+            continue
+        prior = {original_scc.get(path) for path in component}
+        if None not in prior and len(prior) == 1:
+            continue
+        cycle = sorted(component)
+        out.append(
+            "new runtime import cycle introduced: " + " -> ".join([*cycle, cycle[0]])
+        )
     return out
 
 
@@ -847,6 +897,17 @@ def build_manifest(root: str, planned: list, rules: list) -> dict[str, dict]:
                 key = f"{pf.path}::{export['name']}"
                 if key in manifest:
                     raise ValueError(f"duplicate planned artifact export: {key}")
+                shape = {}
+                signature = export.get("signature", "").strip()
+                if export.get("kind") == "function" and signature.startswith((
+                    "def ", "async def ",
+                )):
+                    try:
+                        declaration = signature if signature.endswith(":") else signature + ":"
+                        node = ast.parse(declaration + "\n    pass\n").body[0]
+                        shape = _shape_facts(node)
+                    except SyntaxError:
+                        pass
                 manifest[key] = {
                     "module": pf.path,
                     "symbol": export["name"],
@@ -862,8 +923,8 @@ def build_manifest(root: str, planned: list, rules: list) -> dict[str, dict]:
                         {"module": path, "local": export["name"], "binding": "planned"}
                         for path in contract.get("consumers", [])
                     ],
-                    "shape": {},
-                    "preserve_shape": False,
+                    "shape": shape,
+                    "preserve_shape": bool(shape),
                     "target_kind": export["kind"],
                     "additional_exports": [],
                     "members": list(export.get("members", [])),
