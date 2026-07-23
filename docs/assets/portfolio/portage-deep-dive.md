@@ -15,8 +15,9 @@
 | Sections | 13 + quick reference |
 | Interfaces | CLI · MCP · Dashboard (proof) |
 | v1 recipe | Flask → FastAPI |
-| Eval corpus | 7 pinned repos · 4 tiers · K=3 |
-| Latest autonomous grid | **13/21 strict green (61.9%)** · oracle integrity 1.0 · $6.92 |
+| Eval corpus | 7 pinned repos · 4 tiers · K=3–5 |
+| Reliability gate (current) | **Flaskr + Watchlist 10/10 at K=5** · full-corpus confirmation **6/7** at K=1 · oracle integrity 1.0 |
+| Prior milestone grid | 13/21 strict green (61.9%), i.e. 38.1% red/errored — see §08 for exactly what that was |
 | Headline capability | Plans and creates **new** target-architecture modules, not just rewrites |
 | Green definition | Full suite ∧ all tasks done ∧ zero skips ∧ oracle integrity 1.0 |
 
@@ -512,7 +513,9 @@ Results land in `runs`/`metrics` and render on the dashboard `/eval` page.
 
 Ordered easy → hard. Each entry names status and fix direction.
 
-### Headline grid (`eval-full-corpus-k3-20260714`, K=3, fully autonomous)
+### Historical milestone grid (`eval-full-corpus-k3-20260714`, K=3, fully autonomous)
+
+This is the grid that first activated the artifact-planning capability across the whole corpus. Kept here in full, unedited, because it's the baseline every later number is measured against.
 
 21 autonomous runs, 7 pinned repos, GPT-4o driver+escalation, 252 model calls, **$6.92**, ~18 min aggregate worker time.
 
@@ -530,18 +533,65 @@ Ordered easy → hard. Each entry names status and fix direction.
 
 Reading the reds honestly: three of the eight non-greens are one repo (microblog) failing the same way three times, and it consumed **77% of the grid's cost** — a systematic root cause, not variance. The two engine errors were deterministic-renderer defects that escaped without a report; both have since been made recoverable and reportable.
 
+### What the 38.1% (8/21) actually was
+
+Every red and engine error in that grid was root-caused off its own checkpoint — none were rerun quietly. This is the complete list; each row also states what closed it and when:
+
+| # | class | repo(s) | exact failure | closed by |
+|---|---|---|---|---|
+| 1 | test-harness semantic drift | items fixture (1 run) | migrated test helper did `resp.json().get("detail", resp.json())` to unwrap FastAPI's error envelope — worked for error responses, crashed on a valid JSON *list* response | harness rule now separates plumbing translation (`get_json()`→`json()`) from response-shape edits; the oracle census rejects a helper that changes assertion-relevant behavior |
+| 2 | engine/reporting defect | flaskr (1 run) | deterministic file renderer silently omitted a frozen `testing` export; the job died with **no report at all** | renderer made exception-safe: a rejected result now falls back to ordinary LLM generation instead of aborting, and always produces a report |
+| 3 | engine/reporting defect | watchlist (1 run) | same renderer bug, different frozen export (`render_template_with_context`) | same fix as #2 |
+| 4 | extension-surface gaps | watchlist (2 runs) | Flask-SQLAlchemy's `db.Model`/session surface only partly realized; an invalid FastAPI-shaped session-middleware import slipped past generation; inherited uppercase config was dropped → `KeyError: 'SECRET_KEY'` | SQLAlchemy extension providers now realize their full frozen surface (`Model`, `metadata`, `event`, `case`, `session`, `first_or_404`, `get_or_404`, `init_app`, `paginate`) for both class and mapping facades; invalid middleware imports normalized to the real Starlette class; `config.from_object` completion merges in every missing uppercase default |
+| 5 | import-cycle collection failure | microblog (3 runs, identical) | `app/__init__.py` imports `app.main.routes.before_request`; `app/main/routes.py` imports `db` from the still-initializing `app` package — a cycle the source never had | new import cycles are now rejected twice: once at generation time (provider files may not import their declared consumers) and once at Verify (source vs. migrated import graph compared before any sandbox starts) |
+
+All five classes are closed on the current engine, and every fix is source-derived (AST facts, frozen contracts, import-graph comparison) — none select a repository, file path, or test name.
+
 ### Movement, in one line per repo
 
-| Repo | Then (2026-07-08) | Now (2026-07-14) |
-|---|---|---|
-| flaskr | 0/3, avg test-pass 0.67 | **2 green** at 24/24, zero recovery |
-| flask-restx-api | 1/3 | **3/3** |
-| minimal-flask-api | 2/3 | **3/3** |
-| watchlist | 0/3, suite failed to complete | 0/3, but the migrated suite now **collects and executes all 15 tests** |
-| microblog | 0/3, 0.00 test-pass | 0/3, migrations reach test execution; one named runtime semantic remains |
+| Repo | 2026-07-08 | 2026-07-14 | 2026-07-23 |
+|---|---|---|---|
+| flaskr | 0/3, avg test-pass 0.67 | 2 green at 24/24, zero recovery | **5/5 at K=5**, plus 24/24 in the full-corpus confirmation |
+| watchlist | 0/3, suite failed to complete | 0/3, but the suite collects and executes all 15 tests | **5/5 at K=5**, plus 15/15 in the full-corpus confirmation |
+| flask-restx-api | 1/3 | 3/3 | 3/3 (K=3 gate holds) |
+| minimal-flask-api | 2/3 | 3/3 | 3/3 (K=3 gate holds) |
+| microblog | 0/3, 0.00 test-pass | 0/3, migrations reach test execution | accepted-plan replay 26/26 tasks, 4/4 tests, zero recovery — autonomous run still shows architect-proposal variance (below) |
 
 ### Fault recovery
 Standing scenarios (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) are green on the current engine, verified after each scheduler change. The full fault matrix is deliberately deferred until the baseline improves — running it against a moving baseline would produce numbers that can't be compared to anything. Recovery quality is always reported as **(fault green − baseline green)** per repo; a single averaged “recovery rate” flatters easy repos and slanders hard ones.
+
+### Where it stands now (2026-07-23) — the 38% is gone, replaced by one named residual
+
+The engine that produced the 61.9%/38.1% grid above is not the engine running today. The batch that closed it (**coherent-cut preservation**) attacked the *mechanism*, not the five failure classes individually: before this, a single bad file inside a multi-file verification cut triggered a full rollback of every file in that cut, so one local mistake could sink an otherwise-correct ten-file migration. Recover now checkpoints the last coherent state before attempting a targeted repair and restores *that* — not the original sources — when a repair fails; a shared gate (caller bindings, capability ownership, import direction, cycle rejection, contract shape) runs identically across every generation path — first draft, contract repair, and targeted repair — instead of four separately-maintained checks that could silently drift apart.
+
+**Reliability-gate history, disclosed in full** (this is every generation the gate went through, not just the passing one — shown specifically so a 5/5 doesn't read as rerun-until-green):
+
+| gate generation | Flaskr (K=5) | Watchlist (K=5) |
+|---|---:|---:|
+| v1 | 2/5 | 5/5 |
+| v2 | 3/5 | 3/5 |
+| v3 | 3/5 | 5/5 |
+| **v4** (current code) | **5/5** | **5/5** |
+
+Items, RESTX, Structural, and Minimal each independently hold their own **3/3** K=3 gate on the same code.
+
+**Full-corpus confirmation** — one fresh autonomous sample per repo, all seven in the same sitting, suite `r4-final-external-k1-20260723`:
+
+| Repo | Result | Tasks | Cost |
+|---|---|---:|---:|
+| flask-items-fixture | green | 4/4 | $0.0234 |
+| flask-structural-fixture | green | 6/6 | $0.0658 |
+| minimal-flask-api | green | 6/6 | $0.0348 |
+| flaskr | **green**, 24/24 tests | 12/12 | $0.2277 |
+| watchlist | **green**, 15/15 tests | 13/13 | $0.2234 |
+| flask-restx-api | green | 6/6 | $0.0835 |
+| microblog | red | 1/23 | $1.3093 |
+
+**6/7 green.** The sole red is qualitatively different from anything in the 38.1% table above — it is not a capability gap, it's a *planning*-stage variance:
+
+> Microblog's bounded architecture call occasionally proposes a malformed relationship graph (a duplicate provider/consumer entry between two artifacts). Strict validation catches this and rejects the proposal; the run falls back to an ordinary rewrite-only plan; four rewrite files then correctly fail the exact same contract gates that closed failure-class #5 above; the worktree is restored to a coherent state. **Oracle integrity stayed 1.0 and the run was never mislabeled green.**
+
+The underlying migration capability is proven separately from this variance: replaying microblog's own *accepted* architecture (removing the architect call from the loop entirely) reaches **26/26 tasks, 4/4 tests, zero recovery** — repeatably. So the honest framing is: Portage can migrate microblog; its one-shot architecture proposal for microblog doesn't yet converge every time. That is now the single open item standing between the current engine and a clean sweep of the development corpus. It has not yet been formally K-gridded on its own (a $1.31/run repo makes that an expensive dial to turn), and — same discipline as everywhere else in this doc — a fresh 21-sample grid replicating the original design hasn't been re-run at that scale, so the table above is a confirmation, not a final statistic. The next required steps before any launch claim: re-run the fault-injection matrix against this recovery machinery (it's changed enough to warrant it), and run the frozen recipe once against held-out repositories never used during any of this tuning — the number that actually tests whether ~9,400 lines of source-derived rules generalize or just memorized this corpus.
 
 ### Ten categories
 
@@ -559,13 +609,15 @@ Standing scenarios (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) are 
 
 7. **Cross-file call-shape drift** — **SOLVED structurally**; formerly the dominant residual (19/24 failures in one probe, `get_db()` drifting between plain function / needs-request / context manager across files). Three mechanisms closed it: SCC-condensation dependency ordering so providers migrate first; a frozen interface manifest carrying signatures, lifecycle facts and use-site-derived member shapes; and pre-sandbox AST enforcement of both the DEFINES and CALLS sides.
 
-8. **Flask-coupled extensions** — **SPLIT**. `flask_restx` is now **SOLVED** (3/3 green at K=3, from 1/3), which is the strongest generality evidence in the corpus: none of the contract machinery was built against it. `flask_sqlalchemy` is **PARTIAL** — provider/consumer topology, config inheritance, model-base surface and implicit table names are frozen from source, so the migrated app now collects and executes its full suite; runtime behavior is the remaining work.
+8. **Flask-coupled extensions** — **SOLVED**. `flask_restx` was the first to close (3/3 green at K=3, from 1/3) — the strongest generality evidence in the corpus, since none of the contract machinery was built against it. `flask_sqlalchemy` (watchlist) followed once extension providers realized their complete frozen surface for both class and mapping facades (`Model`, `metadata`, `event`, `case`, `session`, `first_or_404`, `get_or_404`, `init_app`, `paginate`, with real pagination — not a stub): watchlist now reaches autonomous **15/15** and holds a **5/5 K=5 gate**.
 
 9. **Framework-inspecting tests** — **SOLVED via ownership, not exemption**. Tests asserting on `flask.session` / `g` / `app.testing` internals can now pass because the plan *owns real implementations* of those surfaces and the engine performs an audited line-level import swap to them; the assertion census proves nothing else changed. `flaskr`'s `test_factory.py::test_config`, `test_db.py`, and the CLI-runner test — the three hardest framework-inspecting tests in the corpus — all pass in the autonomous green runs.
 
-10. **Provider initialization / import cycles in multi-package apps** — **OPEN, the current frontier**. Generated code can close a new import cycle (`app/__init__` ← `app.main.routes` ← partially-initialized `app`) that the source graph never had. Mechanisms landed: cycle rejection against the source import graph, provider-before-consumer ordering, extension-binding contracts. Remaining on the heaviest repo: one runtime error-handler semantic after a five-step diagnostic peel.
+10. **Provider initialization / import cycles in multi-package apps** — **SOLVED for generation and runtime; one planning-stage residual remains**. New import cycles are now rejected twice — once at generation time (a provider file may not import a file declared as its consumer) and once at Verify, by comparing the source and migrated import graphs before any sandbox starts. Microblog's accepted architecture now replays to **26/26 tasks, 4/4 tests, zero recovery**, repeatably. What's left is upstream of generation entirely: the one-shot architecture proposal for this repo occasionally produces a malformed relationship graph, which strict validation correctly rejects — see "Where it stands now" above.
 
 ### Recovery & integrity findings (summary)
+- Coherent-cut preservation — a failed targeted repair restores the last-known-good checkpoint, not the original sources; this closed most of the 38.1% grid above and is the single highest-leverage fix in the project's history.
+- One shared generation gate — caller/capability/import-direction/cycle/contract checks run identically across first-draft, contract-repair, and targeted-repair paths instead of four checks that could drift apart.
 - Targeted contract repair — one owner, one bounded ledger, whole cut re-verified.
 - Attribution beats budget — regeneration against unattributed bugs measured as a paid no-op.
 - Deepest-frame blame + widen-on-repeat — measured rescue path.
@@ -780,10 +832,10 @@ After Phase 6, external review made the call that shapes everything since: the s
 | R1 | Cross-file interface consistency: SCC ordering, frozen interface manifest, DEFINES/CALLS contracts, mechanical contract checks | ✅ implemented |
 | R2 | Recovery completeness: Integrate→Recover routing, per-cut verification batches, failure fingerprints | ✅ implemented |
 | R3 | Oracle protection: assertion census, deterministic test-compat facade, explicit `success/failed/unsupported` outcomes | ✅ gate closed |
-| R4 | Artifact-producing plans + idiom profiles ([§06b](#06b--artifact-producing-plans)) | ✅ core shipped; extension surfaces in progress |
-| R5 | **Held-out validation** — 3–5 fresh pinned repos never touched during development; freeze the recipe; publish dev vs held-out side by side | pending |
+| R4 | Artifact-producing plans + idiom profiles ([§06b](#06b--artifact-producing-plans)) | ✅ shipped, incl. extension surfaces (`flask_restx`, `flask_sqlalchemy`) |
+| R5 | **Held-out validation** — 3–5 fresh pinned repos never touched during development; freeze the recipe; publish dev vs held-out side by side | pending — the last gate before launch |
 
-**Readiness bar (exit criteria, set before the work):** JSON-API tier ≥90% green · template/session tier 70–80% · extension tier supported or honestly rejected · no fault-scenario degradation · no false greens or weakened tests · **reproduced on held-out repositories**. Current structural tier is ~56% strict green — the bar is **not met yet**, and that is stated plainly rather than met by redefinition.
+**Readiness bar (exit criteria, set before the work):** JSON-API tier ≥90% green · template/session tier 70–80% · extension tier supported or honestly rejected · no fault-scenario degradation · no false greens or weakened tests · **reproduced on held-out repositories**. The development-corpus side is now largely met — Flaskr and Watchlist each hold a 5/5 K=5 gate, Items/RESTX/Structural/Minimal each hold 3/3, and a fresh full-corpus sweep went 6/7 (see §08) — but **the bar as written requires held-out reproduction, and R5 hasn't run.** A recipe with ~9,400 lines of source-derived rules (spread across `_flask_analysis.py`, `_flask_runtime.py`, `_flask_web.py`, and the `flask_to_fastapi.py` orchestrator) that only proves itself on the repos that shaped those rules hasn't proven itself yet; that's what R5 is for, and until it runs the bar is not met.
 
 ---
 
@@ -814,17 +866,20 @@ green ⇔ full_suite_pass ∧ all_tasks_done ∧ skipped_tasks == 0
 | `drop_task` | Replan |
 
 ### Reliability boundary (one sentence)
-JSON APIs, RESTX-style APIs, and the canonical template/factory/auth/CLI application migrate green autonomously for ~$0.02–0.15; **extension-heavy applications are the honest frontier**, where the residual is provider initialization and extension-surface realization.
+Every repo in the development corpus now migrates green repeatably — JSON APIs, RESTX-style APIs, and both hard structural/extension apps (Flaskr, Watchlist) — except microblog, whose migration *capability* is proven (26/26 tasks on its accepted plan) but whose one-shot architecture proposal doesn't converge every time; **held-out validation (R5), not corpus difficulty, is the honest frontier now.**
 
-### Headline numbers (current)
+### Headline numbers (current, 2026-07-23)
 | Metric | Value |
 |---|---|
-| Autonomous K=3 grid | 13/21 strict green (61.9%) · 7 repos · $6.92 |
-| Previous grid, same corpus | 6/21 (28.6%) |
-| External repos | 8/15 (was 0/15) |
-| flaskr (acceptance benchmark) | 24/24 tests · 12/12 tasks · 0 recovery · $0.154 · repeated ×3 |
-| Oracle integrity | 1.0 on every report-bearing run |
-| Backend test suite | 237 passing |
+| Reliability gate | **Flaskr 5/5 · Watchlist 5/5 at K=5**; Items/RESTX/Structural/Minimal 3/3 at K=3 |
+| Full-corpus confirmation | **6/7 green**, one sample each, `r4-final-external-k1-20260723` |
+| flaskr (acceptance benchmark) | 24/24 tests · 12/12 tasks · 0 recovery · $0.15–0.23 across every measured sample |
+| watchlist | 15/15 tests · 13/13 tasks · 0–1 recovery · $0.22 |
+| microblog | accepted-plan replay 26/26 tasks, 4/4 tests, 0 recovery; autonomous proposal variance is the one open item |
+| Historical milestone grid | 13/21 strict green (61.9%) on 2026-07-14 — see §08 for the full breakdown of that 38.1% |
+| Oracle integrity | 1.0 on every report-bearing run, then and now |
+| Backend test suite | 292 passing |
+| Still pending before launch | fault-injection matrix re-run · R5 held-out validation · `runs`-table reconciliation for harness-death cases |
 
 ### Asset index (copy with this folder)
 ```

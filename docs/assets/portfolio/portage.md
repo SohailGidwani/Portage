@@ -16,7 +16,7 @@
 |---|---|
 | Autonomous migration agent | End-to-end Flask → FastAPI without a human in the loop |
 | Designs target architecture | Plans, owns, creates and wires **new** modules the migration needs — not just file rewrites |
-| Eval-proven | K=3 autonomous grid · 7 pinned repos · 4 difficulty tiers · **61.9% strict green** |
+| Eval-proven | Reliability gate: **Flaskr + Watchlist 10/10 at K=5** · final sweep **6/7** autonomous |
 | CLI + MCP | One engine, two interfaces |
 | Checkpoint resume | Kill the worker mid-run; it continues from Postgres |
 | Honest green bar | Full suite + every task done + zero skips + zero weakened tests — or red |
@@ -32,7 +32,9 @@ Portage is an autonomous code-migration agent. Given a repository and a migratio
 
 v1 ships one recipe: **Flask → FastAPI**. That target is deliberate. Routing decorators, request/response handling, blueprints→routers, error handlers, app factories, ambient request context (`g`, `session`), Click CLIs, and test-client seams need *understanding*, not mechanical rewriting. Deterministic codemods cannot do this reliably. The architecture is recipe-pluggable; the evidence is recipe-specific by design (*narrow + measured*).
 
-**The capability that unlocked the hard repos:** some migrations are unreachable by rewriting existing files. Flask's `g`/`session` have no FastAPI equivalent — a correct port needs a *new* request-context module, a test-compatibility surface, a rendering layer, and every consumer wired to them coherently. Portage now plans those artifacts (a bounded architecture call), freezes their contracts before generation, compiles the deterministic parts itself, and enforces that a framework-shaped capability is only valid when the plan **owns and implements it** — so a model can't reference a helper it wishes existed. That is what took the canonical Flask tutorial app from *never once green* to green autonomously, repeatably, for ~$0.15 a run.
+**The capability that unlocked the hard repos:** some migrations are unreachable by rewriting existing files. Flask's `g`/`session` have no FastAPI equivalent — a correct port needs a *new* request-context module, a test-compatibility surface, a rendering layer, and every consumer wired to them coherently. Portage now plans those artifacts (a bounded architecture call), freezes their contracts before generation, compiles the deterministic parts itself, and enforces that a framework-shaped capability is only valid when the plan **owns and implements it** — so a model can't reference a helper it wishes existed. That is what took the canonical Flask tutorial app from *never once green* to green autonomously, repeatably, for ~$0.15–0.23 a run.
+
+A second wave — **coherent-cut preservation** — closed the gap that first capability left open. Early on, one bad file inside an otherwise-correct migration triggered a full rollback of every file in its verification cut, so a single local mistake could sink a ten-file run. Recover now checkpoints the last coherent state before a targeted repair and restores *that* on failure instead of the whole migration, and one shared gate (caller, capability, import-direction, cycle, and contract checks) runs identically across every generation path — first draft, contract repair, and targeted repair alike. That change is what took **Watchlist** — a Flask-SQLAlchemy app that had never gone green — to autonomous **15/15**, and pushed Flaskr to a **5-for-5** reliability gate.
 
 One core engine, two interfaces:
 
@@ -235,27 +237,20 @@ Every LLM call’s tokens and USD (via LiteLLM pricing) are recorded per attempt
 
 ## 09 · Eval Headline
 
-Suite `eval-full-corpus-k3-20260714`, K=3, 7 pinned repos, GPT-4o driver (Azure), 21 fully autonomous runs — from the `runs`/`metrics` tables:
+### The current number: ~3% red, down from 38%
 
-| Repo | Tier | Green | Cost | Readout |
-|---|---|---|---|---|
-| flask-structural-fixture | baseline | **3/3** | $0.18 | stable structural seam coverage |
-| minimal-flask-api | baseline | **3/3** | $0.13 | stable external baseline |
-| flask-restx-api | framework | **3/3** | $0.21 | was the extension wall — now stable |
-| flaskr (Pallets tutorial) | structural | **2 green** / 1 engine error | $0.31 | both completed runs 24/24, **zero recovery** |
-| flask-items-fixture | baseline | 2/3 | $0.12 | one test-harness semantic miss (5/6) |
-| watchlist | structural | 0/3 | $0.58 | Flask-SQLAlchemy surface realization |
-| microblog | heavy | 0/3 | $5.34 | one stable import-cycle root cause |
+| | red rate | sample |
+|---|---:|---|
+| 2026-07-14 grid | **38.1%** (8/21) | one K=3 grid, 7 repos, single sitting |
+| **2026-07-23, current engine** | **≈3.4%** (1/29) | rollup of 4 gate suites since the coherent-cut-preservation fix landed |
 
-**Strict autonomous score: 13/21 green (61.9%)** — engine errors counted against the score, not excused. Two grids earlier the same corpus scored **6/21 (28.6%)** with external repos at 0/15; they are now **8/15**. Oracle integrity was **1.0 on every report-bearing run**, and every red restored and re-verified the repo's original suite — no false greens, no weakened tests.
+The 29-run rollup: Flaskr and Watchlist each **5/5 at K=5**, Items/RESTX/Structural/Minimal each **3/3 at K=3**, plus one fresh single-sample sweep across all seven repos (**6/7 green**) with zero reruns. The one red, in the sweep, is microblog — and it's not a capability failure: its architecture proposal occasionally produces a malformed relationship graph, strict validation correctly rejects it, the run falls back to a plain rewrite plan, and the tree is restored coherently with **oracle integrity 1.0** throughout. Microblog's own migration capability is proven separately — its accepted, frozen plan replays to **26/26 tasks, 4/4 tests, zero recovery**, repeatably.
 
-**The headline result:** `flaskr` — the canonical Flask tutorial app (templates + factory + auth + SQLite + Click CLI) — went from *never green in any grid* to **24/24 tests, 12/12 tasks, zero recovery, $0.154, five model calls**, then repeated it in two more independent autonomous samples. It needed four new modules to exist; the engine designed and wired them.
+Caveat, stated plainly: this 29-run figure is a rollup of four separate gate suites at different K, not one re-run of the original 21-sample grid design — that formal re-run, plus held-out validation on repos never used during development, is still on the list before any launch claim. Full per-suite numbers, and exactly what the old 38% consisted of, are in the [Technical Deep Dive](./portage-deep-dive.md#08--failure-taxonomy).
 
-**Reliability boundary is idiom, not size.** JSON APIs and RESTX-style APIs migrate green for ~$0.02–0.07. The remaining reds are no longer spread across every external repo — they are concentrated in extension-heavy applications, and both are now past their structural blockers (watchlist's migrated suite *collects and executes* all 15 tests; microblog's peel ends at a single runtime error-handler semantic).
+**Reliability boundary moved from idiom to a single named residual.** JSON APIs, RESTX-style APIs, and now both hard structural apps (Flaskr, Watchlist) migrate green repeatably. Microblog is the last unresolved case, and it fails safely rather than falsely.
 
-Fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) is a standing part of the eval and green on the current engine. Recovery quality is reported as a delta against baseline, never a single averaged “recovery rate.”
-
-Full methodology, non-claims, and the failure taxonomy: [Technical Deep Dive](./portage-deep-dive.md).
+Fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) is a standing part of the eval and green on the current engine, though the full fault-matrix re-run against this newer recovery machinery is still pending. Recovery quality is reported as a delta against baseline, never a single averaged “recovery rate.”
 
 ---
 
@@ -268,6 +263,7 @@ Full methodology, non-claims, and the failure taxonomy: [Technical Deep Dive](./
 - **Some migrations are unreachable by rewriting files.** Proven by migrating flaskr *by hand* under the same sandbox oracle: 24/24, but only after creating four new modules. That manual run became the acceptance spec — and the engine's missing capability had a name.
 - **A model told us what was missing:** on one repo GPT-4o imported a compatibility module that didn't exist. It wanted the right architecture; the engine had no way to let it own one. Artifact-producing plans exist because of that log line.
 - **Whole-file regeneration is a near-no-op against an unattributed bug** — two measured cases reproduced identical failures across paid regeneration rounds. Attribution, not retry budget, was the bottleneck.
+- **One bad file used to sink the whole cut.** Before coherent-cut checkpointing, a single local mistake inside a ten-file verification batch triggered a full rollback of everything in it — the exact mechanism behind most of the 38% above. Checkpointing the last-known-coherent state before a targeted repair, and restoring *that* (not the original) on failure, is what converted Watchlist and Flaskr from occasional to repeatable greens.
 - Reds are cheapest to debug when reconstructed byte-exact from LangGraph checkpoints and peeled fix-by-fix; several “how far are we really?” questions were answered for ~$0.20 instead of a full grid.
 - LLM nondeterminism means single runs are anecdotes — K-run mean±variance is mandatory, and organic flake is a finding (not noise to hide).
 
