@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from portage_agent.config import settings
 from portage_agent.db.models import EvalMetric, EvalRun, Job, Task, TaskStatus
@@ -36,6 +37,7 @@ from .corpus import CorpusRepo
 
 log = logging.getLogger("portage.eval")
 REPLAY_SUITE_MARKER = "-replay-"
+EVAL_CONFIG_KEY = "_portage_eval"
 
 # Scenario name -> job config. The faults are deterministic (see agent/nodes/execute.py
 # and plan.py); kill/resume stays in scripts/dod_check.sh — the harness can't SIGKILL the
@@ -219,7 +221,7 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
     r.no_progress_retries = int(rec.get("no_progress_retries") or 0)
     r.migration_outcome = str(report.get("migration_outcome") or "failed")
     r.tree_state = str(report.get("tree_state") or ts.get("tree_state") or "")
-    if r.tree_state in {"hybrid", "restored_coherent"}:
+    if not plan_only and r.tree_state != "migrated":
         # A non-migrated suite is forensic evidence, not a migration score.
         r.tests_passed = 0
 
@@ -249,7 +251,10 @@ def _harvest(repo: CorpusRepo, scenario: str, k_index: int,
         suite_ok = r.tests_total > 0 and r.tests_passed == r.tests_total
         fully_migrated = r.tasks_total > 0 and r.tasks_done == r.tasks_total
         r.status = "green" if (
-            suite_ok and fully_migrated and r.migration_outcome == "success"
+            suite_ok
+            and fully_migrated
+            and r.migration_outcome == "success"
+            and r.tree_state == "migrated"
         ) else "red"
     return r
 
@@ -260,22 +265,123 @@ def _labels() -> tuple[str, str]:
     return driver, escalation
 
 
-async def _persist_run(cfg: HarnessConfig, repo: CorpusRepo, r: RunResult) -> None:
+def _eval_metadata(
+    cfg: HarnessConfig, repo: CorpusRepo, scenario: str, k_index: int,
+) -> dict:
     driver, escalation = _labels()
+    return {
+        "suite": cfg.suite,
+        "corpus_name": repo.name,
+        "scenario": scenario,
+        "k_index": k_index,
+        "driver_model": driver,
+        "escalation_model": escalation,
+        "plan_only": cfg.plan_only,
+    }
+
+
+async def _upsert_run(metadata: dict, repo_url: str, recipe: str, r: RunResult) -> None:
+    values = {
+        "id": uuid.uuid4(),
+        "suite": metadata["suite"],
+        "corpus_name": metadata["corpus_name"],
+        "repo_url": repo_url,
+        "recipe": recipe,
+        "scenario": metadata["scenario"],
+        "k_index": metadata["k_index"],
+        "job_id": r.job_id,
+        "driver_model": metadata["driver_model"],
+        "escalation_model": metadata["escalation_model"],
+        "status": r.status,
+        "tree_state": r.tree_state or "unknown",
+        "tests_total": r.tests_total,
+        "tests_passed": r.tests_passed,
+        "tasks_total": r.tasks_total,
+        "tasks_done": r.tasks_done,
+        "tasks_skipped": r.tasks_skipped,
+        "recover_visits": r.recover_visits,
+        "escalation_attempted": r.escalation_attempted,
+        "escalation_rescued": r.escalation_rescued,
+        "llm_calls": r.llm_calls,
+        "prompt_tokens": r.prompt_tokens,
+        "completion_tokens": r.completion_tokens,
+        "cost_usd": r.cost_usd,
+        "wall_seconds": r.wall_seconds,
+    }
+    stmt = pg_insert(EvalRun).values(**values)
+    updates = {
+        key: getattr(stmt.excluded, key)
+        for key in values
+        if key not in {"id", "job_id"}
+    }
     async with AsyncSessionLocal() as session, session.begin():
-        session.add(EvalRun(
-            id=uuid.uuid4(), suite=cfg.suite, corpus_name=r.corpus_name,
-            repo_url=repo.repo_url, recipe=repo.recipe, scenario=r.scenario,
-            k_index=r.k_index, job_id=r.job_id, driver_model=driver,
-            escalation_model=escalation, status=r.status,
-            tests_total=r.tests_total, tests_passed=r.tests_passed,
-            tasks_total=r.tasks_total, tasks_done=r.tasks_done,
-            tasks_skipped=r.tasks_skipped, recover_visits=r.recover_visits,
-            escalation_attempted=r.escalation_attempted,
-            escalation_rescued=r.escalation_rescued, llm_calls=r.llm_calls,
-            prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
-            cost_usd=r.cost_usd, wall_seconds=r.wall_seconds,
-        ))
+        await session.execute(
+            stmt.on_conflict_do_update(index_elements=["job_id"], set_=updates)
+        )
+
+
+async def _persist_run(cfg: HarnessConfig, repo: CorpusRepo, r: RunResult) -> None:
+    await _upsert_run(
+        _eval_metadata(cfg, repo, r.scenario, r.k_index), repo.repo_url, repo.recipe, r,
+    )
+
+
+async def persist_completed_eval_job(job_id: uuid.UUID) -> bool:
+    """Persist one terminal eval job from its durable config and report.
+
+    The worker calls this after finishing a job, while the harness also upserts the same
+    row. The unique job_id index makes either order safe and lets a late completion replace
+    an earlier timeout row.
+    """
+    async with AsyncSessionLocal() as session:
+        job = (
+            await session.execute(select(Job).where(Job.id == job_id))
+        ).scalar_one_or_none()
+    if job is None or job.status not in {"done", "failed"}:
+        return False
+    metadata = (job.config or {}).get(EVAL_CONFIG_KEY)
+    if not isinstance(metadata, dict):
+        return False
+    required = {
+        "suite", "corpus_name", "scenario", "k_index",
+        "driver_model", "escalation_model",
+    }
+    if missing := sorted(required - metadata.keys()):
+        raise ValueError(f"eval metadata for job {job_id} missing {missing}")
+    repo = CorpusRepo(
+        name=str(metadata["corpus_name"]),
+        repo_url=job.repo_url,
+        recipe=job.migration_recipe,
+    )
+    result = _harvest(
+        repo,
+        str(metadata["scenario"]),
+        int(metadata["k_index"]),
+        job,
+        job.id,
+        plan_only=bool(metadata.get("plan_only")),
+    )
+    await _upsert_run(metadata, job.repo_url, job.migration_recipe, result)
+    return True
+
+
+async def reconcile_completed_eval_runs() -> int:
+    """Backfill terminal eval jobs whose harness died before writing `runs`."""
+    async with AsyncSessionLocal() as session:
+        job_ids = (
+            await session.execute(
+                select(Job.id)
+                .outerjoin(EvalRun, EvalRun.job_id == Job.id)
+                .where(
+                    Job.status.in_(("done", "failed")),
+                    Job.config.op("?")(EVAL_CONFIG_KEY),
+                    EvalRun.id.is_(None),
+                )
+            )
+        ).scalars().all()
+    for job_id in job_ids:
+        await persist_completed_eval_job(job_id)
+    return len(job_ids)
 
 
 async def _persist_metrics(cfg: HarnessConfig, corpus_name: str, scenario: str,
@@ -333,6 +439,9 @@ async def run_suite(repos: list[CorpusRepo], cfg: HarnessConfig) -> list[EvalMet
                     repo_url=repo.repo_url, migration_recipe=repo.recipe,
                     config=repo.job_config({
                         **SCENARIOS[scenario],
+                        EVAL_CONFIG_KEY: _eval_metadata(
+                            cfg, repo, scenario, k_index,
+                        ),
                         **({"plan_only": True} if cfg.plan_only else {}),
                         **({
                             "frozen_artifact_plan": cfg.replay_plan,

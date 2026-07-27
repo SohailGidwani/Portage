@@ -203,7 +203,7 @@ async def test_syntax_error_targets_only_the_named_generated_file(
 ):
     tasks = [
         SimpleNamespace(
-            id=uuid.uuid4(), target_path=path, type=role, status="done", attempts=3,
+            id=uuid.uuid4(), target_path=path, type=role, status="done", attempts=1,
             attempts_log=[], verify_spec={"action": "rewrite"},
         )
         for path, role in (
@@ -241,6 +241,26 @@ async def test_syntax_error_targets_only_the_named_generated_file(
     assert result["contract_repair_owner"] == "pkg/factory.py"
     assert result["recovery_actions"][0]["targets"] == ["pkg/factory.py"]
     assert result["recover_budget_used"] == 0
+
+    update.reset_mock()
+    injected = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "worktree": str(tmp_path),
+        "config": {"inject_fault": "bad_patch"},
+        "last_verify_errors": output,
+        "last_failure_fingerprint": "injected-syntax",
+        "current_batch_paths": [task.target_path for task in tasks],
+        "interface_manifest": {},
+        "seam_plan": {},
+        "recovery_actions": [],
+    })
+
+    assert injected["contract_repair_owner"] == ""
+    assert injected["recovery_actions"][0]["classification"] == "crash_batch"
+    assert set(injected["recovery_actions"][0]["targets"]) == {
+        "pkg/factory.py", "pkg/routes.py",
+    }
+    assert injected["recover_budget_used"] == 1
 
 
 @pytest.mark.asyncio
@@ -504,6 +524,75 @@ async def test_verify_rejects_a_new_import_cycle_before_starting_the_sandbox(
     assert result["verify_passed"] is False
     assert "new runtime import cycle introduced" in result["last_verify_errors"]
     run_tests.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_rejects_recipe_residue_missing_from_the_plan(
+    tmp_path, monkeypatch,
+):
+    original = tmp_path / "original"
+    migrated = tmp_path / "migrated"
+    for root in (original, migrated):
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg" / "api.py").write_text(
+            "from flask_restx import Namespace\napi = Namespace('api')\n"
+        )
+    run_tests = AsyncMock()
+    monkeypatch.setattr(verify_module, "_run_tests", run_tests)
+    monkeypatch.setattr(verify_module, "worktree_diff", AsyncMock(return_value="diff"))
+
+    result = await verify_module.verify_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "migrate": True,
+        "migration_recipe": "flask_to_fastapi",
+        "workspace": str(original),
+        "worktree": str(migrated),
+        "plan": [],
+        "graph_summary": {},
+        "config": {"verify_delay_seconds": 0},
+    })
+
+    assert result["verify_passed"] is False
+    assert "pkg/api.py" in result["last_verify_errors"]
+    run_tests.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unplanned_residue_restores_generated_consumers_before_replan(
+    tmp_path, monkeypatch,
+):
+    app = tmp_path / "pkg" / "app.py"
+    omitted = tmp_path / "pkg" / "api.py"
+    app.parent.mkdir()
+    app.write_text("from flask import Flask\n")
+    omitted.write_text("from flask_restx import Namespace\n")
+    task = SimpleNamespace(id=uuid.uuid4(), target_path="pkg/app.py")
+    checkpoint = create_cut_checkpoint(
+        str(tmp_path), ["pkg/app.py"],
+        {"pkg/app.py": {"status": "pending", "action": "rewrite"}},
+    )
+    app.write_text("from fastapi import FastAPI\n")
+    update = AsyncMock()
+    monkeypatch.setattr(
+        recover_module.task_store, "load_tasks", AsyncMock(return_value=[task]),
+    )
+    monkeypatch.setattr(recover_module.task_store, "update_task", update)
+
+    result = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "migration_recipe": "flask_to_fastapi",
+        "worktree": str(tmp_path),
+        "last_verify_errors": "recipe residue",
+        "last_failure_fingerprint": "residue",
+        "current_batch_checkpoint": checkpoint,
+        "recovery_actions": [],
+    })
+
+    assert result["recover_route"] == "plan"
+    assert result["replan_requested"] is True
+    assert result["recovery_actions"][0]["targets"] == ["pkg/api.py"]
+    assert app.read_text() == "from flask import Flask\n"
+    assert update.await_args.kwargs["status"] == "pending"
 
 
 def test_implemented_provider_moves_member_repair_to_unique_consumer(tmp_path):

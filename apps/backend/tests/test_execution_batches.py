@@ -12,6 +12,7 @@ from portage_agent.agent.nodes.executable_cut import build_executable_cut_analys
 from portage_agent.agent.nodes.execute import (
     _restore_rejected_batch,
     expand_to_verifiable_batch,
+    first_fault_eligible_path,
     is_initial_cluster,
     runtime_contract_repair_attempt,
     select_execution_batch,
@@ -63,6 +64,17 @@ def test_deterministic_adapter_remains_its_own_foundation_batch():
         _task("app.py", 10, tests=["test_app.py"]),
     ]
     assert expand_to_verifiable_batch(tasks, [], ["compat.py"]) == ["compat.py"]
+
+
+def test_fault_target_skips_deterministic_artifacts():
+    tasks = [
+        _task("pkg/runtime.py", 0),
+        _task("pkg/routes.py", 10),
+        _task("tests/conftest.py", 20, role="test_harness"),
+    ]
+    assert first_fault_eligible_path(
+        tasks, {}, {"pkg/runtime.py"},
+    ) == "pkg/routes.py"
 
 
 @pytest.mark.asyncio

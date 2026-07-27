@@ -50,6 +50,19 @@ def iter_py_files(root: str) -> dict[str, str]:
     return out
 
 
+def unplanned_recipe_paths(
+    worktree: str, recipe, planned_paths: set[str],
+) -> list[str]:
+    """Recipe-recognized source files that have no persisted migration task."""
+    if recipe is None:
+        return []
+    files = iter_py_files(worktree)
+    return sorted({
+        item.path for item in recipe.plan_files(files)
+        if item.path not in planned_paths
+    })
+
+
 def non_python_listing(root: str, *, limit: int = 80) -> str:
     """Relative paths of the repo's non-Python files (templates, static, config).
 

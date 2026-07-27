@@ -151,6 +151,20 @@ def _should_corrupt(fault: str | None, *, path: str, first_path: str | None,
     return False
 
 
+def first_fault_eligible_path(
+    file_tasks: list, strategies: dict[str, str], deterministic_paths: set[str],
+) -> str | None:
+    """Select a generated file that the fault injector can actually corrupt."""
+    return next((
+        task.target_path for task in file_tasks
+        if task.target_path
+        and task.type != "test_compat"
+        and task.verify_spec.get("origin", "recipe") != "infrastructure"
+        and strategies.get(task.target_path) not in NON_REWRITE_TEST_STRATEGIES
+        and task.target_path not in deterministic_paths
+    ), None)
+
+
 def _gather_context(
     worktree: str, *, current: str, target_paths: set[str], done_paths: set[str]
 ) -> dict[str, str]:
@@ -4396,9 +4410,16 @@ async def _execute_initial_cluster(
                 )
             return call_cost
 
-        if _should_corrupt(fault, path=paths[0], first_path=first_path,
-                           attempt=attempt, tier=tier):
-            contents[paths[0]] += _FAULT_PAYLOAD
+        if first_path in contents and _should_corrupt(
+            fault, path=first_path, first_path=first_path,
+            attempt=attempt, tier=tier,
+        ):
+            log.warning(
+                "  FAULT %s | corrupting cluster member %s "
+                "(attempt=%s tier=%s)",
+                fault, first_path, attempt, tier,
+            )
+            contents[first_path] += _FAULT_PAYLOAD
         for index, (task, path, planned_file) in enumerate(zip(
             members, paths, planned_files, strict=True,
         )):
@@ -4440,11 +4461,6 @@ async def execute_node(state: GraphState) -> GraphState:
     file_tasks = [t for t in tasks if t.target_path]
     target_paths = {t.target_path for t in file_tasks}
     strategies = state.get("test_strategy") or {}
-    first_path = next((
-        task.target_path for task in file_tasks
-        if task.type != "test_compat"
-        and strategies.get(task.target_path) not in NON_REWRITE_TEST_STRATEGIES
-    ), None)
     log.info("EXECUTE node | job=%s tasks=%s pending=%s fault=%s", job_id, len(file_tasks),
              sum(t.status == TaskStatus.pending.value for t in file_tasks), fault or "-")
 
@@ -4475,6 +4491,9 @@ async def execute_node(state: GraphState) -> GraphState:
             original_planned, artifact_renderer, worktree, manifest, seam_plan,
             oracle_manifest, getattr(recipe, "normalize_generated", None),
         )
+    )
+    first_path = first_fault_eligible_path(
+        file_tasks, strategies, set(deterministic_artifacts),
     )
     compat_module = (state.get("test_compat_path") or "_portage_fastapi_test_compat.py")
     compat_module = compat_module.removesuffix(".py").replace("/", ".")

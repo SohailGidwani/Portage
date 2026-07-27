@@ -28,6 +28,7 @@ from pathlib import Path
 from portage_agent.config import settings
 from portage_agent.db import task_store
 from portage_agent.db.models import TaskStatus
+from portage_agent.recipes import get_recipe
 
 from ..state import GraphState
 from .common import (
@@ -36,12 +37,12 @@ from .common import (
     create_cut_checkpoint,
     discard_cut_checkpoint,
     file_diff,
-    iter_py_files,
     load_cut_checkpoint,
     planned_artifact_topology_violations,
     read_file,
     restore_cut_checkpoint,
     run_git,
+    unplanned_recipe_paths,
 )
 
 log = logging.getLogger("portage.agent")
@@ -57,20 +58,35 @@ _CRASH_MARKERS = (
     "errors during collection",
 )
 
-_FLASK_IMPORT = re.compile(r"^\s*(from\s+flask\b|import\s+flask\b)", re.MULTILINE)
-
-
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _find_unplanned_residue(worktree: str, planned_paths: set[str]) -> list[str]:
-    """Source files still importing the source framework that the plan doesn't cover."""
-    return sorted(
-        rel
-        for rel, src in iter_py_files(worktree).items()
-        if rel not in planned_paths and _FLASK_IMPORT.search(src)
-    )
+async def _restore_batch_for_replan(
+    worktree: str, checkpoint: dict, file_tasks: list,
+) -> list[str]:
+    """Return generated consumers to their pre-batch state before the plan grows."""
+    if not checkpoint:
+        return []
+    records = checkpoint.get("files", {})
+    restored = restore_cut_checkpoint(worktree, checkpoint)
+    tasks = {task.target_path: task for task in file_tasks}
+    for path in restored:
+        record = records[path]
+        task = tasks.get(path)
+        if task is None:
+            continue
+        if not record.get("existed"):
+            await run_git("reset", "--", path, cwd=worktree)
+        source = read_file(worktree, path) or ""
+        await task_store.update_task(
+            task.id,
+            status=record.get("status", TaskStatus.pending.value),
+            content_hash=content_hash(source) if record.get("existed") else None,
+            cascade_subtasks=True,
+            append_attempt={"action": "replan_checkpoint_restore", "at": _now()},
+        )
+    return restored
 
 
 def missing_unplanned_test_compat(
@@ -437,11 +453,19 @@ async def recover_node(state: GraphState) -> GraphState:
             "step_log": ["recover"],
         }
 
-    residue = [] if integration_failure else _find_unplanned_residue(worktree, planned_paths)
+    residue = (
+        []
+        if integration_failure
+        else unplanned_recipe_paths(
+            worktree, get_recipe(state.get("migration_recipe", "")), planned_paths,
+        )
+    )
     if residue:
         budget_used += 1
         if budget_used > settings.max_recover_visits:
             return stop_for_budget()
+        checkpoint = state.get("current_batch_checkpoint") or load_cut_checkpoint(worktree)
+        restored = await _restore_batch_for_replan(worktree, checkpoint, file_tasks)
         log.info("RECOVER classify=unplanned_residue -> REPLAN | job=%s files=%s",
                  job_id, residue)
         return {
@@ -449,9 +473,14 @@ async def recover_node(state: GraphState) -> GraphState:
             "recover_budget_used": budget_used,
             "recover_route": "plan",
             "replan_requested": True,
+            "current_batch_checkpoint": {},
+            "targeted_repair_checkpoint": {},
+            "current_batch_paths": [],
+            "current_batch_tests": [],
             "recovery_actions": [
                 {"visit": visits, "classification": "unplanned_residue",
                  "action": "replan", "targets": residue,
+                 "restored": restored,
                  "budget_charged": True, "budget_used": budget_used, "at": _now()}
             ],
             "step_log": ["recover"],
@@ -473,14 +502,20 @@ async def recover_node(state: GraphState) -> GraphState:
         and (not current_batch or task.target_path in current_batch)
     }
     seam_plan = state.get("seam_plan") or {}
-    contract_owner = None if integration_failure else (
+    injected_generation_fault = (
+        (state.get("config") or {}).get("inject_fault")
+        in {"bad_patch", "bad_patch_until_escalation"}
+    )
+    contract_owner = None if integration_failure or injected_generation_fault else (
         syntax_error_target(trace_region, eligible_leaf_paths)
         or circular_import_target(output, manifest, current_batch, worktree)
         or contract_failure_target(output, manifest, current_batch, worktree)
         or seam_failure_owner(output, seam_plan, current_batch)
     )
-    leaf_owner = None if integration_failure or contract_owner else (
-        unique_traceback_leaf_target(trace_region, eligible_leaf_paths)
+    leaf_owner = (
+        None
+        if integration_failure or injected_generation_fault or contract_owner
+        else unique_traceback_leaf_target(trace_region, eligible_leaf_paths)
     )
     owner = contract_owner or leaf_owner
     if owner:

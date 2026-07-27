@@ -121,17 +121,42 @@ def _validate_artifact_plan(
     return frozen, completion
 
 
-def drop_first_recipe_task(planned: list[PlannedFile]) -> PlannedFile | None:
-    """Remove and return the first fault-eligible, recipe-planned file.
+def drop_recipe_task(
+    planned: list[PlannedFile], excluded_paths: set[str] | None = None,
+) -> PlannedFile | None:
+    """Remove and return a downstream fault-eligible recipe rewrite.
 
     Deterministic infrastructure is part of the execution substrate, not a simulated
     planner decision. Explicit provenance keeps this correct as new infrastructure roles
-    are added; positional removal would exercise Portage itself instead of a planner miss.
+    are added. Dependency ordering puts consumers last, so reversing avoids turning a
+    deliberate planner miss into an unrelated missing-provider generation rejection.
     """
-    for index, file in enumerate(planned):
-        if file.origin == "recipe":
+    for index in range(len(planned) - 1, -1, -1):
+        file = planned[index]
+        if (
+            file.origin == "recipe"
+            and file.action == "rewrite"
+            and file.path not in (excluded_paths or set())
+        ):
             return planned.pop(index)
     return None
+
+
+def merge_replan_decisions(new: dict, old: dict) -> dict:
+    """Keep frozen decisions while allowing their derived topology to grow."""
+    merged = {**new, **old}
+    for key in new.keys() & old.keys():
+        for field in ("files", "factory_files"):
+            if field not in new[key] and field not in old[key]:
+                continue
+            merged[key] = {
+                **merged[key],
+                field: sorted({
+                    *new[key].get(field, []),
+                    *old[key].get(field, []),
+                }),
+            }
+    return merged
 
 
 def complete_unit_dependencies(
@@ -545,7 +570,7 @@ async def plan_node(state: GraphState) -> GraphState:
     # path repairs it.
     fault = (state.get("config") or {}).get("inject_fault")
     if fault == "drop_task" and not replan:
-        dropped = drop_first_recipe_task(planned)
+        dropped = drop_recipe_task(planned, set(test_strategy))
         if dropped is None:
             raise RuntimeError(
                 "fault=drop_task requires at least one recipe-planned file"
@@ -634,9 +659,11 @@ async def plan_node(state: GraphState) -> GraphState:
     })
     if replan and state.get("seam_plan"):
         old = state["seam_plan"]
-        seam_plan["decisions"] = {
-            **seam_plan.get("decisions", {}), **old.get("decisions", {}),
-        }
+        new_decisions = seam_plan.get("decisions", {})
+        old_decisions = old.get("decisions", {})
+        seam_plan["decisions"] = merge_replan_decisions(
+            new_decisions, old_decisions,
+        )
         # Replan may append a missed provider that connects two previously independent
         # members. The framework-decision graph is append-monotonic, while its derived
         # connected cut must be allowed to grow. Keep an old unit only when it does not

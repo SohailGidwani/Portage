@@ -788,6 +788,18 @@ def _realize_extension_provider_facade(
                 call.args[0] = deepcopy(uri)
                 call.keywords = []
                 changed = True
+        module_engine = next((
+            target.id
+            for statement in tree.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and "engine" in ast.unparse(statement.value.func).lower()
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name)
+        ), "")
         existing_definitions = {
             node.name for node in tree.body
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1055,6 +1067,10 @@ def _realize_extension_provider_facade(
                 ))
                 members[name] = value
 
+            if database_config and "engine" not in values and module_engine:
+                add_class_member(
+                    "engine", ast.Name(id=module_engine, ctx=ast.Load()),
+                )
             if "Model" in required and "Model" not in values:
                 model = values.get("Base") or (
                     ast.Name(id=fallback_model, ctx=ast.Load()) if fallback_model else None
@@ -1068,7 +1084,8 @@ def _realize_extension_provider_facade(
                         ast.Name(id=imported_name("sqlalchemy", member), ctx=ast.Load()),
                     )
             if (
-                "metadata" in required and "metadata" not in values
+                required & {"metadata", "create_all", "drop_all"}
+                and "metadata" not in values
                 and values.get("Model")
             ):
                 add_class_member("metadata", ast.Attribute(
@@ -1148,9 +1165,17 @@ def _realize_extension_provider_facade(
                 facade.body.append(ast.parse(facade_methods[member]).body[0])
                 defined.add(member)
                 changed = True
-            for member in sorted(required & {"create_all", "drop_all"} - defined):
+            for member in sorted(required & {"create_all", "drop_all"}):
                 if not (values.get("metadata") and values.get("engine")):
                     continue
+                if member in defined:
+                    if not database_config:
+                        continue
+                    facade.body = [
+                        node for node in facade.body
+                        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        or node.name != member
+                    ]
                 method = ast.parse(
                     f"def {member}(self, *args, **kwargs):\n"
                     "    kwargs.pop('bind_key', None)\n"

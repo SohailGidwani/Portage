@@ -66,7 +66,9 @@ def test_plan_only_acceptance_metric_is_independent_of_test_counts():
     assert result.metric("architect_acceptance_rate") == 1.0
 
 
-@pytest.mark.parametrize("tree_state", ["hybrid", "restored_coherent"])
+@pytest.mark.parametrize(
+    "tree_state", ["hybrid", "restored_coherent", "original", "unknown"],
+)
 def test_non_migrated_tree_cannot_inflate_the_test_pass_metric(
     tmp_path, tree_state,
 ):
@@ -91,6 +93,30 @@ def test_non_migrated_tree_cannot_inflate_the_test_pass_metric(
     assert result.tree_state == tree_state
     assert result.tests_passed == 0
     assert result.metric("test_pass_rate") == 0.0
+
+
+def test_only_a_migrated_tree_can_score_green(tmp_path):
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "tasks_total": 2, "tasks_done": 2, "tasks": [],
+        "recovery": {}, "llm_usage": {}, "oracle_integrity": {},
+        "migration_outcome": "success", "tree_state": "migrated",
+    }))
+    now = datetime.now(UTC)
+    job = SimpleNamespace(
+        status="done", test_summary={"passed": 2, "total": 2},
+        report_path=str(report), created_at=now, updated_at=now,
+    )
+    repo = CorpusRepo(
+        name="sample", repo_url="/sample", recipe="flask_to_fastapi",
+        tier="structural", stresses=[], source="bundled",
+    )
+
+    result = _harvest(repo, "baseline", 1, job, uuid.uuid4())
+
+    assert result.status == "green"
+    assert result.tree_state == "migrated"
+    assert result.tests_passed == 2
 
 
 @pytest.mark.asyncio

@@ -520,6 +520,22 @@ class FlaskToFastAPIRecipe:
                 "/", "."
             )
             manager_symbol = protocols[0]["symbol"]
+            user_loader = next((
+                callback["function"]
+                for callback in protocols[0].get("callbacks", [])
+                if callback.get("member") == "user_loader"
+            ), "")
+            loader_import = (
+                f"from {manager_module} import {user_loader} as _load_user_callback"
+                if user_loader else ""
+            )
+            loader_expression = (
+                "_load_user_callback"
+                if user_loader else
+                'getattr(_login_manager, "load_user", None) or '
+                'getattr(_login_manager, "user_loader_callback", None) or '
+                'getattr(_login_manager, "_user_callback", None)'
+            )
             return textwrap.dedent(f'''\
                 from __future__ import annotations
 
@@ -530,6 +546,7 @@ class FlaskToFastAPIRecipe:
 
                 from {runtime_module} import g, session
                 from {manager_module} import {manager_symbol} as _login_manager
+                {loader_import}
 
 
                 class _AnonymousUser:
@@ -569,7 +586,7 @@ class FlaskToFastAPIRecipe:
 
                 def _load_current_user():
                     user_id = session.get("_user_id")
-                    loader = getattr(_login_manager, "load_user", None)
+                    loader = {loader_expression}
                     if user_id is None or not callable(loader):
                         return _anonymous_user
                     user = loader(user_id)

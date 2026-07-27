@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from portage_agent.config import settings
+from portage_agent.recipes import get_recipe
 from portage_agent.sandbox import DockerSandbox, parse_junit_xml
 
 from ..state import GraphState
@@ -27,6 +28,7 @@ from .common import (
     iter_py_files,
     new_import_cycle_violations,
     read_file,
+    unplanned_recipe_paths,
     worktree_diff,
     write_file,
 )
@@ -139,13 +141,38 @@ async def verify_node(state: GraphState) -> GraphState:
     test_args = [str(a) for a in (cfg.get("test_args") or [])]
     affected = state.get("current_batch_tests", []) if migrate else []
     targets = _scoped_targets(affected, test_args)
+    planned_paths = {
+        task.get("target_path") for task in state.get("plan", [])
+        if task.get("target_path")
+    }
+    residue = (
+        unplanned_recipe_paths(
+            workdir, get_recipe(state.get("migration_recipe", "")), planned_paths,
+        )
+        if migrate else []
+    )
     topology_errors = (
         new_import_cycle_violations(
             iter_py_files(state.get("workspace") or workdir), iter_py_files(workdir),
         )
         if migrate else []
     )
-    if topology_errors:
+    if residue:
+        details = "recipe-recognized source files missing from the plan: " + ", ".join(
+            residue
+        )
+        summary = {
+            "total": 1, "passed": 0, "failed": 1, "errors": 0, "skipped": 0,
+            "duration_seconds": 0.0,
+            "cases": [{
+                "classname": "portage.static_plan",
+                "name": "test_no_unplanned_recipe_residue",
+                "outcome": "failed",
+                "details": details,
+            }],
+        }
+        result = SimpleNamespace(stdout=details, stderr="", exit_code=1)
+    elif topology_errors:
         details = "\n".join(topology_errors)
         summary = {
             "total": 1, "passed": 0, "failed": 1, "errors": 0, "skipped": 0,

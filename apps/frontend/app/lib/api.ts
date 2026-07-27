@@ -285,6 +285,7 @@ export type EvalRun = {
   k_index: number;
   job_id: string | null;
   status: "green" | "red" | "error" | "timeout";
+  tree_state: "migrated" | "restored_coherent" | "hybrid" | "original" | "unknown";
   tests_passed: number;
   tests_total: number;
   tasks_total?: number;
@@ -308,6 +309,7 @@ export type LeaderboardRow = {
   tier: string;
   scenario: string;
   runs: number;
+  migrated_runs: number;
   green: number;
   green_rate: number;
   test_pass_mean: number;

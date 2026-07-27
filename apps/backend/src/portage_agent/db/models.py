@@ -228,6 +228,7 @@ class EvalRun(Base):
     # Outcome. status: green (job done + full suite passed) | red (finished, suite not
     # green) | error (job failed) | timeout (harness gave up waiting).
     status: Mapped[str] = mapped_column(String(16), nullable=False)
+    tree_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     tests_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tests_passed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tasks_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

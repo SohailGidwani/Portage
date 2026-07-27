@@ -17,7 +17,7 @@ from portage_agent.agent.nodes.execute import (
     planned_capability_consumer_violations,
     seam_sections,
 )
-from portage_agent.agent.nodes.plan import complete_unit_dependencies, drop_first_recipe_task
+from portage_agent.agent.nodes.plan import complete_unit_dependencies, drop_recipe_task
 from portage_agent.recipes.base import PlannedFile, Subtask
 from portage_agent.recipes.flask_to_fastapi import recipe
 
@@ -39,8 +39,29 @@ def test_drop_task_skips_deterministic_execution_infrastructure():
     factory = _pf("pkg/__init__.py", "app_factory", "app_factory")
     planned = [adapter, router, factory]
 
-    assert drop_first_recipe_task(planned) is router
-    assert planned == [adapter, factory]
+    assert drop_recipe_task(planned) is factory
+    assert planned == [adapter, router]
+
+
+def test_drop_task_skips_created_artifacts_and_drops_original_source():
+    provider = PlannedFile(
+        path="pkg/runtime.py", role="support", subtasks=[],
+        origin="recipe", action="create",
+    )
+    router = _pf("pkg/views.py", "router", "blueprint_to_router")
+    planned = [provider, router]
+
+    assert drop_recipe_task(planned) is router
+    assert planned == [provider]
+
+
+def test_drop_task_never_removes_the_behavioral_oracle():
+    router = _pf("pkg/views.py", "router", "blueprint_to_router")
+    test = _pf("tests/test_views.py", "test_harness", "test_adapter_wiring")
+    planned = [router, test]
+
+    assert drop_recipe_task(planned, {"tests/test_views.py"}) is router
+    assert planned == [test]
 
 
 def test_drop_task_fails_closed_when_only_infrastructure_exists():
@@ -50,7 +71,7 @@ def test_drop_task_fails_closed_when_only_infrastructure_exists():
     )
     planned = [adapter]
 
-    assert drop_first_recipe_task(planned) is None
+    assert drop_recipe_task(planned) is None
     assert planned == [adapter]
 
 
@@ -2932,6 +2953,12 @@ def test_extension_provider_uses_source_factory_database_config():
             "from flask_sqlalchemy import SQLAlchemy\n"
             "db = SQLAlchemy()\n"
         ),
+        "tests/test_app.py": (
+            "from pkg.extensions import db\n"
+            "def test_database_lifecycle():\n"
+            "    db.create_all()\n"
+            "    db.drop_all()\n"
+        ),
     }
     planned = recipe.plan_files(files)
     plan = recipe.build_seam_plan(files, planned, {}, [])
@@ -2953,6 +2980,8 @@ def test_extension_provider_uses_source_factory_database_config():
         "    engine = engine\n"
         "    Model = Model\n"
         "    session = scoped_session(SessionLocal)\n"
+        "    def create_all(self): Model.metadata.create_all(bind=engine)\n"
+        "    def drop_all(self): Model.metadata.drop_all(bind=engine)\n"
         "    def init_app(self, app): pass\n"
         "db = DB()\n"
     )
@@ -2971,6 +3000,9 @@ def test_extension_provider_uses_source_factory_database_config():
     )
     assert "uri = app.state.config.get('SQLALCHEMY_DATABASE_URI')" in normalized
     assert "provider.session.configure(bind=provider.engine)" in normalized
+    assert "kwargs.setdefault('bind', self.engine)" in normalized
+    assert "return self.metadata.create_all(*args, **kwargs)" in normalized
+    assert "return self.metadata.drop_all(*args, **kwargs)" in normalized
 
 
 def test_dynamic_class_lambda_methods_receive_the_bound_instance():
@@ -3149,6 +3181,8 @@ def test_flask_login_surface_is_compiled_rendered_and_wired_from_source(tmp_path
     assert rendered_auth is not None
     assert "current_user = _CurrentUserProxy()" in rendered_auth
     assert "async def wrapped_view(**kwargs)" in rendered_auth
+    assert "from pkg.extensions import load_user as _load_user_callback" in rendered_auth
+    assert "loader = _load_user_callback" in rendered_auth
 
     combined = PlannedFile(
         path="pkg/combined_auth.py", role="support", action="create",
