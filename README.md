@@ -13,7 +13,7 @@ honest patch and evidence trail.
 [![Postgres 16](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](docker-compose.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-52D69A.svg)](LICENSE)
 
-**Platform phases 0–7 complete · Artifact-contract recipe phase active · Deployment intentionally parked**
+**Platform phases 0–7 complete · Development recipe gates reached · R5 held-out: 0/9 · Deployment parked**
 
 [Quickstart](#quickstart) · [How it works](#how-it-works) · [Results](#measured-results) ·
 [CLI](#cli) · [MCP](#mcp-for-coding-agents) · [Roadmap](#roadmap)
@@ -52,10 +52,10 @@ is recipe-specific by design.
 | Durable execution | Checkpoints every graph node to Postgres and reclaims expired worker leases after a crash. |
 | Structural planning | Builds a code graph, extracts bindings and capabilities, plans owned target artifacts—including new modules—and freezes their contracts before generation. |
 | Incremental proof | Executes coupled migration batches and runs blast-radius tests before proceeding to the next cut. |
-| Honest recovery | Regenerates or rolls back implicated work under fixed budgets; repeated failure fingerprints stop no-progress loops. |
+| Honest recovery | Repairs attributed owners under fixed budgets; failed local repair restores the last coherent cut, and repeated fingerprints stop no-progress loops. |
 | Protected oracle | Freezes test names, assertions, fixtures, parametrization, lifecycle, and skip state; mechanically rejects weakened tests. |
 | Honest outcome | `success` requires full task completion, an intact oracle, and a green full suite. Passing after rollback remains `failed`. |
-| Measured behavior | Persists K-run completion, test pass, recovery, tokens, cost, wall time, and model labels in the evaluation ledger. |
+| Measured behavior | Persists K-run completion, tree lineage, test pass, recovery, tokens, cost, wall time, and model labels in an idempotent evaluation ledger. |
 
 ## How it works
 
@@ -115,7 +115,8 @@ A migration is green only when all of these are true:
 1. every planned task completed;
 2. no task was rolled back or skipped;
 3. protected tests retained their meaning; and
-4. the full repository test suite passed.
+4. the full repository test suite passed; and
+5. the measured tree is the migrated tree—not an original, restored, or hybrid tree.
 
 This rule is structural, not cosmetic. Portage previously caught a real false-green mode:
 recovery could roll all generated work back, after which the original application passed
@@ -303,63 +304,82 @@ for the stdio MCP server.
 
 ## Measured results
 
-The latest full baseline is suite **`eval-full-corpus-k3-20260714`**: seven pinned
-development-corpus entries × K=3, 21 autonomous jobs with a GPT-4o driver. It is the first
-full grid after planned artifact creation, contract compilation, executable cuts, and
-targeted transactional repair landed.
+Evidence below is current through **2026-07-27**. Development-corpus convergence and
+held-out generalization are reported separately: success on repositories used to improve
+the recipe is not presented as unseen-repository performance.
 
-### Headline
+### Development-corpus convergence
 
-| Metric | Latest result |
+These are the strongest latest reliability gates, not cherry-picked rows from one common
+suite. Replay results are labeled and excluded from autonomous rates.
+
+| Corpus entry | Latest gate | Evidence |
+|---|---:|---|
+| `flask-items-fixture` | **3/3 autonomous green** | 6/6 tests per run |
+| `flask-structural-fixture` | **3/3 autonomous green** | 2/2 tests per run |
+| `minimal-flask-api` | **3/3 autonomous green** | 2/2 tests per run |
+| `flaskr` | **5/5 autonomous green** | 24/24 per run; disclosed gate ladder: 2/5 → 3/5 → 3/5 → 5/5 |
+| `watchlist` | **5/5 autonomous green** | 15/15 per run; first simultaneous Flaskr/Watchlist gate |
+| `microblog` | **one autonomous green; replay 4/4** | autonomous 27/27 tasks; accepted-plan replay 26/26 executable tasks; latest fresh K=1 was red on architect variance |
+| `flask-restx-api` | **3/3 autonomous green** | 4/4 tests per run |
+
+The decisive change was not another repository-specific prompt rule. Portage gained
+purposeful artifact creation, frozen ownership/contracts, one validation aggregator across
+every generation path, and durable cut checkpoints. After the July 22 grid diagnosed that
+one failed local repair discarded an otherwise coherent migration, preserving that cut
+moved both Flaskr and Watchlist from 0/3 to 5/5.
+
+The current engine can also:
+
+- compile source-exercised app, context, testing, template, extension, and database
+  surfaces into owned target contracts;
+- reject new import cycles before sandbox execution;
+- repair an attributed artifact without rerolling the whole cut;
+- restore and re-verify the last coherent cut when local repair fails; and
+- persist `tree_state` and reconcile completed eval jobs even if the harness process dies.
+
+### R5 held-out generalization
+
+R5 v1 used three repositories that Portage had never migrated during development. Inputs
+were frozen at commit `3b25ee9`, manifest [`corpus/heldout.toml`](corpus/heldout.toml),
+an offline sandbox image, Azure GPT-4o for both tiers, scenario `baseline`, and K=3. Suite
+**`r5-heldout-k3-v1`** ran exactly once; no red was renamed, replaced, or rerun.
+
+| Held-out repository | Untouched source baseline | Portage K=3 | Dominant failure |
+|---|---:|---:|---|
+| `ws-example` | 42/42 | **0/3 green** | generated test-client facade shadowed route decorators; oracle guard also caught test-function loss |
+| `silicon` | 34/34 | **0/3 green** | invalid generated signatures and failure to construct the frozen app facade |
+| `flask-email-login` | 18/18 | **0/3 green** | architect contract miss followed by unrealized CSRF/mail providers |
+
+| R5 v1 metric | Result |
 |---|---:|
-| Strict green migrations | **13/21 (61.9%)** |
-| Pinned GitHub repositories | **8/15 strict green (53.3%)** |
-| Report-bearing migration attempts | **13/19 green (68.4%)** |
-| Oracle integrity | **100% across all 19 report-bearing runs** |
-| Reconstructed GPT-4o cost | **$6.9195 total** |
-| Worker execution time | **1,088.0 seconds total** |
+| Strict autonomous green | **0/9** |
+| Architect acceptance | **6/9** |
+| Migrated / restored-coherent / hybrid trees | **4 / 5 / 0** |
+| LLM calls / recovery visits | **119 / 19** |
+| GPT-4o cost | **$3.8643** |
+| Terminal jobs with reports | **9/9** |
+| Terminal eval jobs missing a run row | **0** |
 
-| Corpus entry | Tier | Strict result | Migrated evidence | Total cost |
-|---|---|---:|---|---:|
-| `flask-items-fixture` | baseline | **2 green / 1 red** | red stopped at 5/6 | $0.1190 |
-| `flask-structural-fixture` | structural | **3/3 green** | 2/2 each | $0.1833 |
-| `minimal-flask-api` | baseline | **3/3 green** | 2/2 each | $0.1307 |
-| `flaskr` | structural | **2 green / 1 engine error** | both completed runs 24/24, zero recovery | $0.3410 reconstructed |
-| `watchlist` | structural | **2 red / 1 engine error** | original 15/15 restored on both reds | $0.5994 reconstructed |
-| `microblog` | heavy | **0/3 green** | collection blocked; original 4/4 restored | $5.3377 |
-| `flask-restx-api` | framework | **3/3 green** | 4/4 each | $0.2084 |
+This fails the held-out readiness bar. It is also useful evidence: the infrastructure,
+accounting, rollback, and false-green protections held while new application shapes exposed
+real generalization gaps. In particular, `ws-example` attempted to reduce the protected
+test-function set; oracle integrity fell to 0.75 and Portage refused to call the run green.
 
-The strict denominator includes two deterministic-renderer errors. Both stopped before a
-report existed, so oracle integrity is unknown—not zero—and both count against the result.
-The run table recorded $6.8629; the reconstructed total adds four paid architect calls
-preserved on task rows but omitted when those jobs failed before Report.
+If these three repositories drive production changes, they permanently become development
+corpus members. A later held-out claim must retain R5 v1, keep the untouched ClipBin reserve,
+and add at least two newly scouted repositories.
 
-### The artifact-contract breakthrough
+### Recovery and durability proof
 
-The July 12 grid was 6/21 overall and 0/15 across pinned GitHub repositories. The new
-engine can now survey a repository, propose purposeful support modules, freeze their
-exports and consumers, compile source-derived framework surfaces, wire sanctioned test
-normalizations, and repair one attributed artifact without rerolling a coherent cut.
+The modern fault diagnostics exercised bad patches, escalation, task omission, replan, and
+checkpoint restoration. Effective samples recovered across the small development entries;
+Flaskr's isolated frozen-plan drop-task diagnostic passed 3/3. Earlier invalid fault samples
+remain in the ledger rather than being relabeled.
 
-That changed the observed capability boundary:
-
-1. **Flaskr is autonomously expressible.** Two independent K=3 samples planned four owned
-   support modules, completed all 12 tasks, and passed 24/24 with no recovery. A separate
-   frozen-plan replay also passed 24/24, proving generation given an accepted architecture.
-2. **The gains transfer.** Minimal and the structural fixture are 3/3; RESTX moved from
-   0/3 to 3/3. Production rules use capabilities, AST shape, contracts, and
-   provider/consumer topology—never corpus identity.
-3. **Recovery is now local and transactional.** Distinct attributed failures can repair one
-   owner without charging the global no-progress budget; a failed repair restores and
-   re-verifies the last coherent cut.
-4. **The next blocker is narrower.** Watchlist needs a realized Flask-SQLAlchemy/config
-   surface. All three Microblog samples introduced the same `db` provider import cycle
-   before test collection. Two additional jobs exposed deterministic materializer/reporting
-   defects rather than migration-semantic failures.
-
-The next gate is therefore not another broad K=3. It is to get Watchlist and Microblog into
-actual test execution under frozen-plan replay with zero reportless failures and no new
-import cycles, while keeping the stable repositories green.
+The final pre-R5 implementation check was **303 backend tests passed**, Ruff clean, and
+`git diff --check` clean. The R5 audit found exactly nine unique jobs, 33 metric rows, zero
+hybrids, and zero missing durable run rows.
 
 The methodology, historical grids, fault-injection results, escalation experiment, and
 failure taxonomy are documented in:
@@ -370,21 +390,22 @@ failure taxonomy are documented in:
   accepted R2/R3 baseline.
 - [`corpus/corpus.toml`](corpus/corpus.toml) — pinned repositories and test configuration.
 
-### Reproduce the latest grid
+### Run a development grid
 
-This command launches 21 paid model runs. With the measured GPT-4o configuration it cost
-approximately $7; inspect `.env` limits before running it.
+This launches 21 paid model runs against the development corpus. Cost varies by model and
+failure path; inspect `.env` limits first.
 
 ```bash
 docker compose run --rm worker python -m portage_agent.eval \
   --corpus /corpus/corpus.toml \
   --k 3 \
   --scenarios baseline \
-  --suite repro-artifact-contracts-$(date +%s)
+  --suite repro-development-$(date +%s)
 ```
 
 Results persist to Postgres and appear under the suite selector at
-<http://localhost:3000/eval>.
+<http://localhost:3000/eval>. Rerunning `corpus/heldout.toml` can reproduce or diagnose R5
+v1, but it cannot improve the published 0/9 one-shot held-out result.
 
 ## Recovery, integrity, and security
 
@@ -466,7 +487,7 @@ apps/backend/
     worker/      leased Postgres queue consumer
 apps/frontend/   Next.js run, diff, evaluation, and review workbench
 corpus/          pinned development corpus, curation log, failure taxonomy
-docs/            usage, methodology, design plans, and visual evidence
+docs/            usage, methodology, and visual evidence
 scripts/         definition-of-done and corpus-vetting commands
 infra/           deployment infrastructure
 ```
@@ -494,23 +515,26 @@ infra/           deployment infrastructure
 | R1 | Frozen binding-aware interface manifest, dependency/SCC order, caller/contract checks | ✅ |
 | R2 | Executable cuts, targeted transactional recovery, Integrate repair, no-progress diagnosis | ✅ |
 | R3 | Mechanical oracle protection and deterministic compatibility facade | ✅ gate closed |
-| R4 | Planned artifact creation, contract compiler, capability ownership, repo-aware prompt packs | **Active; Flaskr gate proven** |
-| R4.1 | Extension-provider initialization, import-cycle gate, renderer completeness | **Next** |
-| R5 | Frozen held-out evaluation on 3–5 unseen repositories | Planned |
+| R4 | Planned artifact creation, contract compiler, capability ownership, repo-aware prompt packs | ✅ development gates reached |
+| R4.1 | Extension-provider realization, import-cycle gates, coherent-cut preservation, durable eval rows | ✅ |
+| R5 | Frozen one-shot evaluation on three unseen repositories | ⚠️ measured: 0/9 green |
+| R5.1 | Generalize from R5 failures, preserve existing gates, then freeze a fresh held-out set | **Next** |
 
-After R5: harden the public repository-execution boundary → unpark Phase 8 → launch →
-only then consider recipe #2. The governing principle remains **depth before breadth**:
-one difficult migration, measured honestly, before a catalog of shallow recipes.
+Next, the R5 repositories become development inputs if their failures change the recipe.
+Fix the general capability classes while preserving every existing gate, then evaluate on
+ClipBin plus at least two newly frozen untouched repositories. Only after that: harden the
+public execution boundary → unpark Phase 8 → launch → consider recipe #2. The governing
+principle remains **depth before breadth**.
 
 ## Known limitations
 
 - Only Flask → FastAPI is implemented and evaluated.
-- The seven-entry corpus is a development corpus; several rules were learned from it.
-  Held-out generalization has not been measured yet.
-- The latest pinned-GitHub result is 8/15 strict green. Flask-SQLAlchemy/config realization
-  and extension-provider initialization still block Watchlist and Microblog.
-- Two K=3 jobs failed before Report because deterministic artifact rendering omitted frozen
-  exports; their cost had to be reconstructed from task ledgers.
+- R5 v1 measured **0/9** strict green on three unseen structural Flask repositories. The
+  current recipe is not yet supported as generally reliable outside its development corpus.
+- Microblog has an autonomous green and a green accepted-plan replay, but autonomous
+  architect convergence is not yet a stable reliability gate.
+- The held-out failures expose test-adapter integrity, generated-signature validity, target
+  facade construction, architect completion, and extension-provider realization gaps.
 - A shared sandbox image cannot satisfy every legacy Flask dependency combination;
   per-repository images are the documented corpus-breadth unlock.
 - Thousand-file repositories, untrusted public inputs, and production multi-tenant sandbox
@@ -522,9 +546,7 @@ one difficult migration, measured honestly, before a catalog of shallow recipes.
 - [Evaluation methodology](docs/METHODOLOGY.md)
 - [Corpus curation](corpus/README.md)
 - [Failure taxonomy and measured findings](corpus/FINDINGS.md)
-- [Recipe Excellence plan](portage-recipe-excellence-plan.md)
-- [Architecture and build plan](code-migration-agent-planV2.md)
-- [Hosted deployment runbook](portage-p8-deployment-runbook.md)
+- [Frozen R5 held-out manifest](corpus/heldout.toml)
 
 ## License
 
