@@ -15,11 +15,11 @@
 | Sections | 13 + quick reference |
 | Interfaces | CLI · MCP · Dashboard (proof) |
 | v1 recipe | Flask → FastAPI |
-| Eval corpus | 7 pinned repos · 4 tiers · K=3–5 |
-| Reliability gate (current) | **Flaskr + Watchlist 10/10 at K=5** · full-corpus confirmation **6/7** at K=1 · oracle integrity 1.0 |
-| Prior milestone grid | 13/21 strict green (61.9%), i.e. 38.1% red/errored — see §08 for exactly what that was |
+| Eval evidence | 7-repo development corpus · 3-repo frozen held-out R5 · K=3–5 |
+| Development reliability | **Flaskr + Watchlist 10/10 at K=5** · smaller gates 12/12 · full-corpus confirmation 6/7 |
+| Held-out reliability | **R5 v1: 0/9 strict green** on three previously unseen repositories |
 | Headline capability | Plans and creates **new** target-architecture modules, not just rewrites |
-| Green definition | Full suite ∧ all tasks done ∧ zero skips ∧ oracle integrity 1.0 |
+| Green definition | Full suite ∧ all tasks done ∧ zero skips ∧ oracle integrity 1.0 ∧ migrated tree |
 
 **Stack chips:** FastAPI · LangGraph · Postgres 16 · pgvector · LiteLLM · Docker / gVisor · Next.js · FastMCP · SQLAlchemy async · Alembic · pytest
 
@@ -201,7 +201,7 @@ See [§05](#05--recovery-strategies). Routes back to Plan (replan), Execute (reg
 
 #### Report
 - Reload tasks from Postgres (source of truth), not from in-memory graph state alone.
-- Emit `report.json`: task tree, **artifact plan** (architect status/usage, created paths with their frozen exports/members/consumers, contract-completion audit), **oracle integrity census**, verified batches, executable-cut shapes, unsupported seams, recovery actions, `llm_usage` (calls, tokens, USD — including architect and repair calls), test summaries, `migration_outcome` ∈ `success | failed | unsupported`.
+- Emit `report.json`: task tree, **artifact plan** (architect status/usage, created paths with their frozen exports/members/consumers, contract-completion audit), **oracle integrity census**, verified batches, executable-cut shapes, unsupported seams, recovery actions, `llm_usage` (calls, tokens, USD — including architect and repair calls), test summaries, `tree_state`, and `migration_outcome` ∈ `success | failed | unsupported`.
 - Job status → `done` or `failed`; CLI/dashboard derive the honest green verdict from tasks + tests + outcome.
 
 ### Routing diagram (logical)
@@ -251,6 +251,15 @@ Durability is the core product edge — not “the LLM is smart,” but “the r
 ### Content-hash idempotency
 - Each Execute step is keyed by job + task + content hash of the written file.
 - Resume after mid-Execute crash skips tasks already applied instead of re-calling the model.
+
+### Durable evaluation rows
+- Eval identity travels in job config, so it survives the harness process that submitted it.
+- Worker and harness use one idempotent `runs` upsert keyed by unique `job_id`.
+- Worker startup reconciles terminal eval jobs that lack a run row.
+- `tree_state` is persisted as `migrated`, `restored_coherent`, `hybrid`, or legacy
+  `unknown`; green aggregation requires `migrated`.
+- The pre-R5 interrupted-harness proof produced exactly one terminal row, and the final
+  audit found zero terminal eval jobs missing from `runs`.
 
 ### Kill-and-resume demo
 
@@ -334,7 +343,7 @@ Rolled-back attempts keep their failing diff. Retries see it (“debug your own 
 Two autopsies reconstructed failing runs byte-exact from LangGraph checkpoints and peeled them by hand. Both found the same thing: **whole-file regeneration against an unattributed bug is a paid no-op.** One run spent 19 recover visits and never found a two-line middleware-ordering fix, because every failure surfaced as one identical `ExceptionGroup` whose deepest frames were in framework internals. Another reproduced three identical bugs across two full regeneration rounds. The engineering answer was better *attribution* — contract ownership, import-cycle edges, unique traceback leaves, known runtime assertion strings — not more retries.
 
 ### Integrity rule
-Skip-and-continue can make the *suite* green by restoring originals. That must never score as a successful migration. Green = suite green **and** every planned task done **and** none skipped **and** `migration_outcome = success` **and** oracle integrity 1.0.
+Skip-and-continue can make the *suite* green by restoring originals. That must never score as a successful migration. Green = suite green **and** every planned task done **and** none skipped **and** `migration_outcome = success` **and** oracle integrity 1.0 **and** `tree_state = migrated`.
 
 ### Fault-injection scenarios (standing eval cases)
 
@@ -453,6 +462,7 @@ A run scores **green** only if all of these hold:
 2. Every planned task completed, and `migration_outcome = success`  
 3. Zero tasks rolled back/skipped by recovery  
 4. **Oracle integrity 1.0** — no test deleted, renamed, skipped, or weakened  
+5. `tree_state = migrated` — restored/original/hybrid suites contribute no green or test-pass score
 
 CLI exit code 0 and the dashboard verdict use the same bar.
 
@@ -480,10 +490,10 @@ Every LLM call’s tokens and USD (LiteLLM pricing) recorded per attempt, summed
 
 | Non-claim | Why |
 |---|---|
-| Generality across migrations | One recipe, one language, six repos. Architecture is recipe-agnostic; evidence is recipe-specific. |
+| Generality across migrations | One recipe and one language. R5 v1 directly measured the remaining gap: 0/9 on three unseen Flask repositories. |
 | Stronger-model lift (when driver == escalation) | If both tiers resolve to the same deployment (e.g. GPT-4o), escalation-rescue measures the *retry-ladder machinery*, not a stronger model. Swap `LLM_ESCALATION_MODEL` to measure real lift (env-only). |
 | Big-repo behaviour | Corpus repos are small (≲ ~40 files). Thousand-file horizons unproven. |
-| Immunity to prompt-tuning bias | Several recipe rules were added after corpus failures; the grid partly measures a recipe tuned to this corpus. Disclosed, not pretended away — and this is exactly what the pending held-out validation (R5) exists to expose. |
+| Immunity to prompt-tuning bias | Several recipe rules were learned from the development corpus. R5 v1 exposed the consequence rather than disproving it: the known-corpus gates stayed strong while unseen performance was 0/9. |
 | Replay results as autonomous results | Frozen-plan replays isolate generation quality from architect variance. They are diagnostic, tagged as such, and never aggregated into headline green rates. |
 | “Recipe-neutral” as a proven claim | The engine contains no corpus identity (verified by literal search over production source), and the ordering/contract/cut machinery is framework-agnostic by construction — but neutrality is only *proven* by a second recipe, which is deliberately deferred. |
 
@@ -558,9 +568,17 @@ All five classes are closed on the current engine, and every fix is source-deriv
 | microblog | 0/3, 0.00 test-pass | 0/3, migrations reach test execution | accepted-plan replay 26/26 tasks, 4/4 tests, zero recovery — autonomous run still shows architect-proposal variance (below) |
 
 ### Fault recovery
-Standing scenarios (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) are green on the current engine, verified after each scheduler change. The full fault matrix is deliberately deferred until the baseline improves — running it against a moving baseline would produce numbers that can't be compared to anything. Recovery quality is always reported as **(fault green − baseline green)** per repo; a single averaged “recovery rate” flatters easy repos and slanders hard ones.
+The modern matrix exercised `bad_patch`, `bad_patch_until_escalation`, and `drop_task`
+after coherent-cut preservation landed. It exposed defects in the injectors and in replan
+topology, which were fixed generically: faults now select recipe-owned source files,
+unplanned recipe files trigger replan, and replan unions newly discovered topology without
+mutating frozen interface decisions. Effective samples recovered across the smaller
+development entries; Flaskr's frozen-plan drop-task diagnostic passed 3/3. Invalid earlier
+matrix generations remain in the ledger and are not counted as final recovery evidence.
+Recovery quality is still interpreted against a green baseline, never as one flattering
+cross-repository average.
 
-### Where it stands now (2026-07-23) — the 38% is gone, replaced by one named residual
+### Development-corpus standing (2026-07-23)
 
 The engine that produced the 61.9%/38.1% grid above is not the engine running today. The batch that closed it (**coherent-cut preservation**) attacked the *mechanism*, not the five failure classes individually: before this, a single bad file inside a multi-file verification cut triggered a full rollback of every file in that cut, so one local mistake could sink an otherwise-correct ten-file migration. Recover now checkpoints the last coherent state before attempting a targeted repair and restores *that* — not the original sources — when a repair fails; a shared gate (caller bindings, capability ownership, import direction, cycle rejection, contract shape) runs identically across every generation path — first draft, contract repair, and targeted repair — instead of four separately-maintained checks that could silently drift apart.
 
@@ -591,7 +609,43 @@ Items, RESTX, Structural, and Minimal each independently hold their own **3/3** 
 
 > Microblog's bounded architecture call occasionally proposes a malformed relationship graph (a duplicate provider/consumer entry between two artifacts). Strict validation catches this and rejects the proposal; the run falls back to an ordinary rewrite-only plan; four rewrite files then correctly fail the exact same contract gates that closed failure-class #5 above; the worktree is restored to a coherent state. **Oracle integrity stayed 1.0 and the run was never mislabeled green.**
 
-The underlying migration capability is proven separately from this variance: replaying microblog's own *accepted* architecture (removing the architect call from the loop entirely) reaches **26/26 tasks, 4/4 tests, zero recovery** — repeatably. So the honest framing is: Portage can migrate microblog; its one-shot architecture proposal for microblog doesn't yet converge every time. That is now the single open item standing between the current engine and a clean sweep of the development corpus. It has not yet been formally K-gridded on its own (a $1.31/run repo makes that an expensive dial to turn), and — same discipline as everywhere else in this doc — a fresh 21-sample grid replicating the original design hasn't been re-run at that scale, so the table above is a confirmation, not a final statistic. The next required steps before any launch claim: re-run the fault-injection matrix against this recovery machinery (it's changed enough to warrant it), and run the frozen recipe once against held-out repositories never used during any of this tuning — the number that actually tests whether ~9,400 lines of source-derived rules generalize or just memorized this corpus.
+The underlying migration capability is proven separately from this variance: replaying
+microblog's own *accepted* architecture (removing the architect call from the loop entirely)
+reaches **26/26 tasks, 4/4 tests, zero recovery**. The honest development-corpus framing is:
+Portage can generate a correct Microblog migration from an accepted plan, but its one-shot
+architecture proposal does not converge every time.
+
+### R5 held-out result (2026-07-27) — the generalization check failed
+
+R5 v1 froze commit `3b25ee9`, `corpus/heldout.toml`, one network-off sandbox image,
+Azure GPT-4o for both tiers, scenario `baseline`, and K=3. The suite ran once; no red was
+renamed, replaced, or rerun.
+
+| Repo | Original suite | Autonomous K=3 | Terminal shape | Dominant failure |
+|---|---:|---:|---|---|
+| `ws-example` | 42/42 | **0/3** | 2 migrated, 1 restored | generated test-client facade shadowed route decorators; test adapter also removed protected test functions |
+| `silicon` | 34/34 | **0/3** | 3 restored | invalid Python signatures; raw `FastAPI` constructed instead of the frozen facade |
+| `flask-email-login` | 18/18 | **0/3** | 2 migrated, 1 restored | architect missed the required context owner; fallback left CSRF/mail providers as `None` |
+
+| R5 measure | Result |
+|---|---:|
+| Strict green | **0/9** |
+| Architect acceptance | **6/9** |
+| Migrated / restored-coherent / hybrid | **4 / 5 / 0** |
+| LLM calls / recovery visits | **119 / 19** |
+| Cost | **$3.8643** |
+| Reports / missing durable run rows | **9 / 0** |
+
+`ws-example` is the sharpest integrity result: generation reduced the discovered test set
+from 26 functions to 17. The oracle score fell to **0.75**, mechanically poison-pilling all
+three samples. A partial 13/42 runtime result could not masquerade as progress. Restored
+trees likewise scored zero even though their original suites passed.
+
+R5 therefore rejects the public claim that the recipe is generally reliable today. It
+does not erase the development gates; it bounds them. If these failures drive production
+changes, the three R5 repositories become development inputs permanently. A later unseen
+claim must publish this 0/9 beside its result and use ClipBin plus at least two newly
+scouted untouched repositories.
 
 ### Ten categories
 
@@ -599,30 +653,36 @@ The underlying migration capability is proven separately from this variance: rep
 
 2. **Cross-file name contracts** — **SOLVED** structurally via export-contract AST pass. Before: ~50% flake on a 3-file app (dropped `router` export).
 
-3. **Deprecated / hallucinated APIs** — **SOLVED** by rules 11/12 after observation (`@app.on_event`; invented `fastapi_flash` / `fastapi_login`). Class remains open-ended; each instance is cheap to encode once seen.
+3. **Deprecated / hallucinated APIs** — **PARTIAL**. Known instances (`@app.on_event`, invented `fastapi_flash` / `fastapi_login`) are closed, but R5 produced a subtler collision: a generated test-client `.get` helper shadowed FastAPI's route decorator. The class is open-ended even when each observed instance is cheap to encode.
 
 4. **Environment gaps** — **SOLVED** case-by-case in the sandbox image (e.g. `python-multipart` for `Form()` — took watchlist from collection-crash to all 15 tests executing).
 
-5. **App factory & config** — **MOSTLY SOLVED**. `app.config`-as-plain-dict (model invented `State.update()`), instance-path, lifespan-not-on_event. Residual bugs cluster in rarely-exercised branches (test_config vs instance config).
+5. **App factory & config** — **PARTIAL**. Known `app.config`, instance-path, lifespan, and canonical test-config shapes are covered. R5 Silicon repeatedly failed to construct the frozen `TestApp` facade, showing that ownership contracts still need stronger realization across unseen factory shapes.
 
 6. **Templates / sessions / flash / auth** — **SOLVED for the canonical case**, and the reason is architectural rather than prompt-level: the app gets an owned request-context artifact (contextvars-backed `g`/`session` proxies), an owned rendering layer supplying the globals that untouched templates consume, and a session middleware installed in the correct order. `flaskr` — templates + factory + auth flows + SQLite + Click CLI — now migrates autonomously at 24/24 with zero recovery. Extension-heavy variants (below) are not yet at this level.
 
 7. **Cross-file call-shape drift** — **SOLVED structurally**; formerly the dominant residual (19/24 failures in one probe, `get_db()` drifting between plain function / needs-request / context manager across files). Three mechanisms closed it: SCC-condensation dependency ordering so providers migrate first; a frozen interface manifest carrying signatures, lifecycle facts and use-site-derived member shapes; and pre-sandbox AST enforcement of both the DEFINES and CALLS sides.
 
-8. **Flask-coupled extensions** — **SOLVED**. `flask_restx` was the first to close (3/3 green at K=3, from 1/3) — the strongest generality evidence in the corpus, since none of the contract machinery was built against it. `flask_sqlalchemy` (watchlist) followed once extension providers realized their complete frozen surface for both class and mapping facades (`Model`, `metadata`, `event`, `case`, `session`, `first_or_404`, `get_or_404`, `init_app`, `paginate`, with real pagination — not a stub): watchlist now reaches autonomous **15/15** and holds a **5/5 K=5 gate**.
+8. **Flask-coupled extensions** — **SOLVED for RESTX/SQLAlchemy development cases; OPEN generally**. `flask_restx` holds 3/3 and Watchlist's SQLAlchemy facade holds 5/5 with real pagination. R5 `flask-email-login` exposed the next boundary: CSRF and mail owners were retained as `None`, then crashed at `init_app`. Extension identity is not enough; every source-exercised provider must be materially realized.
 
-9. **Framework-inspecting tests** — **SOLVED via ownership, not exemption**. Tests asserting on `flask.session` / `g` / `app.testing` internals can now pass because the plan *owns real implementations* of those surfaces and the engine performs an audited line-level import swap to them; the assertion census proves nothing else changed. `flaskr`'s `test_factory.py::test_config`, `test_db.py`, and the CLI-runner test — the three hardest framework-inspecting tests in the corpus — all pass in the autonomous green runs.
+9. **Framework-inspecting tests** — **SOLVED for Flaskr; integrity guard proven generally**. Flaskr passes because the plan owns real `session` / `g` / `app.testing` surfaces and uses an audited import swap. R5 `ws-example` showed the remaining adapter risk by deleting test functions; the oracle caught it, so scoring stayed honest, but generation did not preserve the test harness.
 
-10. **Provider initialization / import cycles in multi-package apps** — **SOLVED for generation and runtime; one planning-stage residual remains**. New import cycles are now rejected twice — once at generation time (a provider file may not import a file declared as its consumer) and once at Verify, by comparing the source and migrated import graphs before any sandbox starts. Microblog's accepted architecture now replays to **26/26 tasks, 4/4 tests, zero recovery**, repeatably. What's left is upstream of generation entirely: the one-shot architecture proposal for this repo occasionally produces a malformed relationship graph, which strict validation correctly rejects — see "Where it stands now" above.
+10. **Provider initialization / import cycles in multi-package apps** — **PARTIAL**. Import cycles are rejected at generation and Verify, and Microblog's accepted plan replays to **26/26 tasks, 4/4 tests**. Remaining gaps exist on both sides: Microblog's autonomous proposal varies, while R5 email-login accepted fallback generations that never realized CSRF/mail providers.
 
 ### Recovery & integrity findings (summary)
 - Coherent-cut preservation — a failed targeted repair restores the last-known-good checkpoint, not the original sources; this closed most of the 38.1% grid above and is the single highest-leverage fix in the project's history.
+- Tree lineage is scored structurally — `runs.tree_state` distinguishes migrated,
+  restored-coherent, hybrid, and legacy results; only migrated trees may be green.
+- Eval durability is independent of the harness — worker-side idempotent upsert and startup
+  reconciliation closed the only missing-row path; R5 finished 9/9 reports with zero gaps.
 - One shared generation gate — caller/capability/import-direction/cycle/contract checks run identically across first-draft, contract-repair, and targeted-repair paths instead of four checks that could drift apart.
 - Targeted contract repair — one owner, one bounded ledger, whole cut re-verified.
 - Attribution beats budget — regeneration against unattributed bugs measured as a paid no-op.
 - Deepest-frame blame + widen-on-repeat — measured rescue path.
 - Retry-with-self-review — failing diff retained and shown to the next attempt.
 - False-green integrity — structural predicates, not policy text.
+- Held-out oracle proof — an R5 test adapter dropped nine discovered test functions; the
+  integrity score fell to 0.75 and the result remained red.
 - Skip-out false pass — `passed > 0` required; generalized into the Execute-time oracle census.
 - Stale-JUnit false green — the report file is deleted before every sandbox run.
 - Escalation measured even when driver == escalation model (machinery vs lift), with a controlled two-model experiment on record to separate them.
@@ -639,7 +699,7 @@ The underlying migration capability is proven separately from this variance: rep
 5. Licensed for reuse (MIT/BSD/Apache)
 6. Pinned SHA for remotes
 
-### Shipped corpus (7 repos / 4 tiers)
+### Development corpus (7 repos / 4 tiers)
 
 | Repo | Tier | Role |
 |---|---|---|
@@ -652,6 +712,23 @@ The underlying migration capability is proven separately from this variance: rep
 | microblog | heavy | Multi-extension / long recovery |
 
 Original ≥10 target was traded for a documented finding: **a single shared sandbox image cannot serve mutually incompatible dependency pins** (2017-era Flask 0.12 stacks, abandoned `flask_restplus`, `itsdangerous<2.1`, SQLAlchemy 1.x APIs). Four candidates dropped for that shared cause. Unlock if breadth becomes the goal: **per-repo sandbox images**.
+
+### Frozen R5 corpus
+
+Eight new candidates were inspected statically and baseline-vetted without running Portage.
+Three were admitted to `corpus/heldout.toml`; ClipBin was frozen as reserve. All temporary
+clones were deleted after admission.
+
+| Repo | Pinned source baseline | R5 v1 |
+|---|---:|---:|
+| `ws-example` | 42/42 | 0/3 green |
+| `silicon` | 34/34 | 0/3 green |
+| `flask-email-login` | 18/18 | 0/3 green |
+| `ClipBin` (reserve; Portage-unseen) | 232/232 | not run |
+
+The one-shot result is final evidence, not a tuning loop. Any selected R5 repository used
+to change the recipe moves permanently into the development corpus; a later held-out set
+must be newly frozen.
 
 ### Sandbox accommodations (honest-oracle preserving)
 These stand in for the repo’s *own documented dev setup*, never for test logic:
@@ -833,9 +910,17 @@ After Phase 6, external review made the call that shapes everything since: the s
 | R2 | Recovery completeness: Integrate→Recover routing, per-cut verification batches, failure fingerprints | ✅ implemented |
 | R3 | Oracle protection: assertion census, deterministic test-compat facade, explicit `success/failed/unsupported` outcomes | ✅ gate closed |
 | R4 | Artifact-producing plans + idiom profiles ([§06b](#06b--artifact-producing-plans)) | ✅ shipped, incl. extension surfaces (`flask_restx`, `flask_sqlalchemy`) |
-| R5 | **Held-out validation** — 3–5 fresh pinned repos never touched during development; freeze the recipe; publish dev vs held-out side by side | pending — the last gate before launch |
+| R4.1 | Coherent-cut preservation, one generation gate, import-cycle rejection, durable eval rows | ✅ shipped |
+| R5 | **Held-out validation** — freeze three unseen repos; publish dev vs held-out side by side | ⚠️ v1 measured **0/9 green** |
+| R5.1 | Generalize from R5 failure classes while preserving every development gate; freeze a fresh unseen set | next |
 
-**Readiness bar (exit criteria, set before the work):** JSON-API tier ≥90% green · template/session tier 70–80% · extension tier supported or honestly rejected · no fault-scenario degradation · no false greens or weakened tests · **reproduced on held-out repositories**. The development-corpus side is now largely met — Flaskr and Watchlist each hold a 5/5 K=5 gate, Items/RESTX/Structural/Minimal each hold 3/3, and a fresh full-corpus sweep went 6/7 (see §08) — but **the bar as written requires held-out reproduction, and R5 hasn't run.** A recipe with ~9,400 lines of source-derived rules (spread across `_flask_analysis.py`, `_flask_runtime.py`, `_flask_web.py`, and the `flask_to_fastapi.py` orchestrator) that only proves itself on the repos that shaped those rules hasn't proven itself yet; that's what R5 is for, and until it runs the bar is not met.
+**Readiness bar (set before the work):** JSON-API tier ≥90% green · template/session
+tier 70–80% · extension tier supported or honestly rejected · no fault-scenario
+degradation · no false greens or weakened tests · **reproduced on held-out
+repositories**. The development side is largely met, but R5 v1 failed the required final
+clause at 0/9. That result is now the governing constraint. If its repos shape fixes, they
+become development inputs; the next honest validation needs ClipBin plus at least two
+newly scouted untouched repositories and must publish v1 beside it.
 
 ---
 
@@ -845,7 +930,7 @@ After Phase 6, external review made the call that shapes everything since: the s
 ```
 green ⇔ full_suite_pass ∧ all_tasks_done ∧ skipped_tasks == 0
         ∧ passed > 0 ∧ migration_outcome == "success"
-        ∧ oracle_integrity == 1.0
+        ∧ oracle_integrity == 1.0 ∧ tree_state == "migrated"
 ```
 
 ### Budgets (defaults)
@@ -854,7 +939,7 @@ green ⇔ full_suite_pass ∧ all_tasks_done ∧ skipped_tasks == 0
 | `escalate_after_attempts` | 2 |
 | `max_task_attempts` | 3 |
 | `max_recover_visits` | 4 |
-| `max_targeted_contract_repairs` | 1 (separate ledger from ordinary attempts) |
+| `max_targeted_contract_repairs` | 2 (separate ledger from ordinary attempts; failed repair restores the cut checkpoint) |
 | architect calls | 1 + at most 2 strictly-improving repairs |
 | created artifacts per plan | ≤ 4 |
 
@@ -866,20 +951,21 @@ green ⇔ full_suite_pass ∧ all_tasks_done ∧ skipped_tasks == 0
 | `drop_task` | Replan |
 
 ### Reliability boundary (one sentence)
-Every repo in the development corpus now migrates green repeatably — JSON APIs, RESTX-style APIs, and both hard structural/extension apps (Flaskr, Watchlist) — except microblog, whose migration *capability* is proven (26/26 tasks on its accepted plan) but whose one-shot architecture proposal doesn't converge every time; **held-out validation (R5), not corpus difficulty, is the honest frontier now.**
+Portage converges strongly on the development corpus, but R5 v1 scored 0/9 on unseen repositories; **general capability realization—not another known-corpus grid—is the frontier now.**
 
-### Headline numbers (current, 2026-07-23)
+### Headline numbers (current through 2026-07-27)
 | Metric | Value |
 |---|---|
 | Reliability gate | **Flaskr 5/5 · Watchlist 5/5 at K=5**; Items/RESTX/Structural/Minimal 3/3 at K=3 |
 | Full-corpus confirmation | **6/7 green**, one sample each, `r4-final-external-k1-20260723` |
 | flaskr (acceptance benchmark) | 24/24 tests · 12/12 tasks · 0 recovery · $0.15–0.23 across every measured sample |
 | watchlist | 15/15 tests · 13/13 tasks · 0–1 recovery · $0.22 |
-| microblog | accepted-plan replay 26/26 tasks, 4/4 tests, 0 recovery; autonomous proposal variance is the one open item |
-| Historical milestone grid | 13/21 strict green (61.9%) on 2026-07-14 — see §08 for the full breakdown of that 38.1% |
-| Oracle integrity | 1.0 on every report-bearing run, then and now |
-| Backend test suite | 292 passing |
-| Still pending before launch | fault-injection matrix re-run · R5 held-out validation · `runs`-table reconciliation for harness-death cases |
+| microblog | accepted-plan replay 26/26 tasks, 4/4 tests, 0 recovery; autonomous proposal variance remains |
+| **R5 held-out v1** | **0/9 strict green** · architect 6/9 · trees 4 migrated / 5 restored / 0 hybrid |
+| R5 accounting | 119 LLM calls · 19 recovery visits · $3.8643 · 9/9 reports · 0 missing run rows |
+| Oracle integrity | R5 `ws-example` test loss detected at 0.75; no weakened result counted green |
+| Backend test suite | 303 passing |
+| Still pending before launch | generalize R5 failures · preserve development/fault gates · validate on a fresh unseen set |
 
 ### Asset index (copy with this folder)
 ```
@@ -912,8 +998,8 @@ docs/assets/
 | `docs/METHODOLOGY.md` | How numbers are produced / non-claims |
 | `corpus/FINDINGS.md` | Failure taxonomy with evidence |
 | `corpus/README.md` | Admission criteria + vetting log |
+| `corpus/heldout.toml` | Frozen R5 v1 repositories and SHAs |
 | `docs/USAGE.md` | Every CLI/MCP scenario |
-| `code-migration-agent-planV2.md` | Architecture source of truth |
 
 ---
 

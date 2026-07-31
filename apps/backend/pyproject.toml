@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Portage — autonomous code-migration agent (backend)."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = { text = "Source-available; proprietary. See repository LICENSE." }
 dependencies = [
     # Web / API
     "fastapi>=0.115",

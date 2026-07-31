@@ -16,10 +16,10 @@
 |---|---|
 | Autonomous migration agent | End-to-end Flask → FastAPI without a human in the loop |
 | Designs target architecture | Plans, owns, creates and wires **new** modules the migration needs — not just file rewrites |
-| Eval-proven | Reliability gate: **Flaskr + Watchlist 10/10 at K=5** · final sweep **6/7** autonomous |
+| Eval-proven | Development gates: **Flaskr + Watchlist 10/10 at K=5** · unseen R5: **0/9 green** |
 | CLI + MCP | One engine, two interfaces |
 | Checkpoint resume | Kill the worker mid-run; it continues from Postgres |
-| Honest green bar | Full suite + every task done + zero skips + zero weakened tests — or red |
+| Honest green bar | Full suite + every task done + intact oracle + `tree_state=migrated` — or red |
 | Network-off sandbox | Ephemeral Docker verification, no outbound network |
 
 **Stack tags:** Python · FastAPI · LangGraph · Postgres · pgvector · LiteLLM · Docker · Next.js · MCP · pytest
@@ -35,6 +35,13 @@ v1 ships one recipe: **Flask → FastAPI**. That target is deliberate. Routing d
 **The capability that unlocked the hard repos:** some migrations are unreachable by rewriting existing files. Flask's `g`/`session` have no FastAPI equivalent — a correct port needs a *new* request-context module, a test-compatibility surface, a rendering layer, and every consumer wired to them coherently. Portage now plans those artifacts (a bounded architecture call), freezes their contracts before generation, compiles the deterministic parts itself, and enforces that a framework-shaped capability is only valid when the plan **owns and implements it** — so a model can't reference a helper it wishes existed. That is what took the canonical Flask tutorial app from *never once green* to green autonomously, repeatably, for ~$0.15–0.23 a run.
 
 A second wave — **coherent-cut preservation** — closed the gap that first capability left open. Early on, one bad file inside an otherwise-correct migration triggered a full rollback of every file in its verification cut, so a single local mistake could sink a ten-file run. Recover now checkpoints the last coherent state before a targeted repair and restores *that* on failure instead of the whole migration, and one shared gate (caller, capability, import-direction, cycle, and contract checks) runs identically across every generation path — first draft, contract repair, and targeted repair alike. That change is what took **Watchlist** — a Flask-SQLAlchemy app that had never gone green — to autonomous **15/15**, and pushed Flaskr to a **5-for-5** reliability gate.
+
+The first frozen held-out evaluation then supplied the necessary correction. On three
+repositories never migrated during development, Portage scored **0/9 strict green**. The
+engine failed honestly—five trees restored coherently, four remained migrated-but-red,
+zero were hybrid, and an attempted test-set reduction was caught—but the recipe did not
+generalize. The project now has both halves of a credible result: strong development
+convergence and a measured unseen-repository gap.
 
 One core engine, two interfaces:
 
@@ -90,7 +97,7 @@ A submitted job runs this graph. Every node is checkpointed to Postgres (`thread
 | **Verify** | Per-cut tests in an ephemeral `--network none` Docker sandbox. JUnit-parsed. All-skipped suites are failures (`passed > 0`). |
 | **Recover** | Uniquely attributable failures (contract owner, import-cycle edge, traceback leaf) repair **one artifact** on a separate bounded ledger; otherwise replan / batch retry / skip-and-continue. Failure fingerprints stop no-progress loops; a failed repair returns to the last coherent cut. |
 | **Integrate** | Full suite as the final gate; always recomputes the migration diff from the worktree (never trusts a stale cached diff). An Integrate-only regression can route back through Recover once. |
-| **Report** | Reloads task truth from Postgres; emits the artifact plan, oracle census, per-call cost ledger, recovery actions, diffs, verdict. |
+| **Report** | Reloads task truth from Postgres; emits the artifact plan, oracle census, per-call cost ledger, recovery actions, diffs, tree lineage, and verdict. Eval rows are idempotently persisted/reconciled by job id. |
 
 **Honest green** requires all of:
 
@@ -98,6 +105,7 @@ A submitted job runs this graph. Every node is checkpointed to Postgres (`thread
 2. Every planned task completed; `migration_outcome = success`.
 3. Zero tasks rolled back / skipped by recovery.
 4. Oracle integrity 1.0 — no test deleted, renamed, skipped, or weakened.
+5. The measured tree is `migrated`, not original, restored, or hybrid.
 
 A run that recovery rolls back to original sources will pass the original suite — and is scored **red**. That false-green class was caught live (“GREEN 24/24” with an empty diff) and fixed structurally, as was a model that “passed” by decorating every test with `@pytest.mark.skip`.
 
@@ -194,19 +202,19 @@ Portage can plan, own, create, wire, verify, repair, and roll back **new** targe
 A Flask-shaped capability (`app.test_client`, `app_context`, `g`, `session`) is accepted only when a frozen plan artifact **owns and implements it** and consumers are wired to it — checked receiver-aware, so a hallucination can't be laundered through a matching attribute name. This rule is what turns “the model referenced a module it wished existed” from a silent runtime failure into a pre-sandbox rejection.
 
 ### Durability
-LangGraph Postgres checkpointer after every node. Worker lease with heartbeat; expired leases are reclaimable via `FOR UPDATE SKIP LOCKED`. Ingest is once-only on resume. Execute is content-hash idempotent.
+LangGraph Postgres checkpointer after every node. Worker lease with heartbeat; expired leases are reclaimable via `FOR UPDATE SKIP LOCKED`. Ingest is once-only on resume. Execute is content-hash idempotent. Eval metadata rides with the durable job; worker and harness share one job-id upsert, and worker startup reconciles terminal jobs whose harness died before writing `runs`.
 
 ### Bounded recovery, targeted first
 Uniquely attributable failures repair the single owning artifact (measured: a stray `.decode()` fixed for $0.011 without touching its ten-file cut). Otherwise: crash → planned frame blamed → targeted rollback + regenerate; same lone file blamed twice → widen; residue in an unplanned file → replan; exhausted tasks → rollback + skip and an honest red. Whole-file regeneration against an unattributed bug was measured as a near-no-op — which is why attribution, not retry budget, is where the engineering went.
 
 ### Oracle integrity (tests can't be made easier)
-Test files are protected artifacts. Their names, assertion expressions, `raises`/`parametrize`/skip structure and fixture lifecycles are frozen at Plan; only explicitly sanctioned plumbing may differ (e.g. `get_json()` → `json()`, or an audited two-line import swap to a plan-owned context proxy). Adversarial unit tests prove deleted, renamed, skipped, and weakened assertions are all caught. **100% integrity across every report-bearing run in the latest K=3 grid** — greens and reds alike.
+Test files are protected artifacts. Their names, assertion expressions, `raises`/`parametrize`/skip structure and fixture lifecycles are frozen at Plan; only explicitly sanctioned plumbing may differ (e.g. `get_json()` → `json()`, or an audited two-line import swap to a plan-owned context proxy). Adversarial unit tests prove deleted, renamed, skipped, and weakened assertions are caught. R5 supplied the live proof: `ws-example` generation reduced the discovered test-function set, oracle integrity fell to **0.75**, and Portage refused to count any sample green.
 
 ### Measured model escalation
 First N attempts use the driver tier; later attempts use the escalation tier. Every attempt lands in `tasks.attempts_log` with tier, model, tokens, and USD cost — “how often does escalation rescue?” is a SQL query.
 
 ### Honest scoring
-Green cannot be gamed by skip-and-continue, empty diffs, or all-`@pytest.mark.skip` suites. Report reloads task truth from Postgres; Integrate always recomputes the diff; Verify requires `passed > 0`.
+Green cannot be gamed by skip-and-continue, empty diffs, restored originals, hybrid trees, or all-`@pytest.mark.skip` suites. Report reloads task truth from Postgres; Integrate always recomputes the diff; Verify requires `passed > 0`; leaderboard scoring requires `tree_state=migrated`.
 
 ### Pluggable recipes
 A recipe declares detection + task types + per-task `verify_spec`. Unknown recipes yield an empty plan; the run degrades to ingest→verify→report (tests run, nothing changed, verdict red).
@@ -237,20 +245,41 @@ Every LLM call’s tokens and USD (via LiteLLM pricing) are recorded per attempt
 
 ## 09 · Eval Headline
 
-### The current number: ~3% red, down from 38%
+### Development gates are strong; unseen generalization is not
 
-| | red rate | sample |
+| Evidence set | Result | What it means |
 |---|---:|---|
-| 2026-07-14 grid | **38.1%** (8/21) | one K=3 grid, 7 repos, single sitting |
-| **2026-07-23, current engine** | **≈3.4%** (1/29) | rollup of 4 gate suites since the coherent-cut-preservation fix landed |
+| Flaskr + Watchlist K=5 gates | **10/10 green** | difficult known structural/extension apps converge repeatably |
+| Items / RESTX / Structural / Minimal K=3 gates | **12/12 green** | smaller development tiers remain stable |
+| Fresh seven-repo development sweep | **6/7 green** | Microblog red on architect variance; accepted-plan replay is 4/4 |
+| **Frozen R5 v1, three unseen repos × K=3** | **0/9 green** | the recipe does not yet generalize reliably |
 
-The 29-run rollup: Flaskr and Watchlist each **5/5 at K=5**, Items/RESTX/Structural/Minimal each **3/3 at K=3**, plus one fresh single-sample sweep across all seven repos (**6/7 green**) with zero reruns. The one red, in the sweep, is microblog — and it's not a capability failure: its architecture proposal occasionally produces a malformed relationship graph, strict validation correctly rejects it, the run falls back to a plain rewrite plan, and the tree is restored coherently with **oracle integrity 1.0** throughout. Microblog's own migration capability is proven separately — its accepted, frozen plan replays to **26/26 tasks, 4/4 tests, zero recovery**, repeatably.
+R5 v1 ran exactly once from frozen commit `3b25ee9`, manifest
+`corpus/heldout.toml`, an offline sandbox, and Azure GPT-4o for both tiers. Source
+baselines were `ws-example` 42/42, `silicon` 34/34, and `flask-email-login` 18/18.
 
-Caveat, stated plainly: this 29-run figure is a rollup of four separate gate suites at different K, not one re-run of the original 21-sample grid design — that formal re-run, plus held-out validation on repos never used during development, is still on the list before any launch claim. Full per-suite numbers, and exactly what the old 38% consisted of, are in the [Technical Deep Dive](./portage-deep-dive.md#08--failure-taxonomy).
+| Held-out repo | Portage result | Dominant failure |
+|---|---:|---|
+| `ws-example` | **0/3** | test-client facade shadowed route decorators; oracle guard caught lost tests |
+| `silicon` | **0/3** | invalid generated signatures and wrong app-facade construction |
+| `flask-email-login` | **0/3** | architect contract miss, then unrealized CSRF/mail providers |
 
-**Reliability boundary moved from idiom to a single named residual.** JSON APIs, RESTX-style APIs, and now both hard structural apps (Flaskr, Watchlist) migrate green repeatably. Microblog is the last unresolved case, and it fails safely rather than falsely.
+Across the nine jobs: architect acceptance **6/9**, trees **4 migrated / 5
+restored-coherent / 0 hybrid**, 119 LLM calls, 19 recovery visits, **$3.8643**, and
+9/9 durable reports with zero missing run rows. No failed sample was renamed, replaced,
+or rerun.
 
-Fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) is a standing part of the eval and green on the current engine, though the full fault-matrix re-run against this newer recovery machinery is still pending. Recovery quality is reported as a delta against baseline, never a single averaged “recovery rate.”
+The integrity machinery passed even though the recipe failed: rejected cuts restored the
+original suite, restored passes contributed zero migration score, and the live
+`ws-example` test-set mutation was detected rather than accepted. If R5 failures now shape
+production behavior, all three repositories become development inputs; the next honest
+held-out set must keep this 0/9 result visible and use ClipBin plus at least two newly
+scouted untouched repositories.
+
+The modern fault diagnostics also ran before R5. Effective bad-patch, escalation, and
+drop-task samples recovered across the development entries; Flaskr's isolated frozen-plan
+drop-task diagnostic passed 3/3. Earlier invalid fault-injector samples remain in the
+ledger instead of being relabeled.
 
 ---
 
@@ -258,6 +287,8 @@ Fault injection (`bad_patch`, `bad_patch_until_escalation`, `drop_task`) is a st
 
 ### Friction
 - A single shared sandbox image cannot serve mutually incompatible dependency pins — four corpus candidates dropped for that reason; unlock is per-repo sandbox images.
+- **Development convergence did not predict held-out generalization.** Flaskr/Watchlist reached 10/10 while the frozen unseen set went 0/9. The next work is capability coverage, not a larger victory-lap grid.
+- **Oracle protection earned its keep on unseen code.** One R5 adapter deleted test functions; the 0.75 integrity score poison-pilled the run before its partial suite result could look encouraging.
 - Skip-and-continue can produce false greens (original suite passes after full rollback) — fixed by reloading task truth + recomputing diffs + requiring full completion.
 - Models can “pass” by decorating every test with skip — Verify requires `passed > 0`, and the oracle census now catches the whole family mechanically.
 - **Some migrations are unreachable by rewriting files.** Proven by migrating flaskr *by hand* under the same sandbox oracle: 24/24, but only after creating four new modules. That manual run became the acceptance spec — and the engine's missing capability had a name.

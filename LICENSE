@@ -1,21 +1,85 @@
-MIT License
+Portage Source-Available License
+Version 1.0, 1 August 2026
 
-Copyright (c) 2026 Sohail Gidwani
+Copyright (c) 2026 Sohail Gidwani. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software, including its source code, documentation, configuration, and
+associated files (the "Software"), is proprietary. Making the source code
+publicly visible does not place the Software in the public domain or make it
+open-source software.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Limited permission
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Subject to this License, the Copyright Holder grants you a limited,
+non-exclusive, non-transferable, non-sublicensable license to:
+
+  a. view and study the Software;
+  b. make copies strictly necessary to download, install, and run it; and
+  c. run the Software, without modification, solely for personal,
+     educational, research, evaluation, or other non-commercial purposes.
+
+You must retain all copyright, authorship, trademark, and license notices.
+
+2. Permission required
+
+Unless the Copyright Holder gives you prior express written permission, you
+may not:
+
+  a. modify, adapt, translate, fork, or create derivative works from the
+     Software;
+  b. copy the Software except as expressly permitted in Section 1;
+  c. publish, distribute, sublicense, sell, lease, transfer, or otherwise make
+     the Software available to another person;
+  d. incorporate, embed, link, bundle, or reuse any part of the Software in
+     another project, product, application, or service;
+  e. host or provide the Software, or functionality substantially derived
+     from it, as a service for another person;
+  f. use the Software for commercial advantage, monetary compensation,
+     revenue generation, or business production; or
+  g. use the name "Portage," the Copyright Holder's name, or related branding
+     to claim authorship, ownership, sponsorship, or endorsement.
+
+3. Commercial licensing
+
+No commercial rights are granted by this License. Any commercial use or
+monetization requires a separate written agreement with the Copyright Holder
+before that use begins. That agreement may require license fees, royalties,
+revenue or profit sharing, equity, attribution, or other compensation agreed
+by the parties. No commercial use creates an implied license or substitutes
+for that written agreement.
+
+4. Ownership
+
+The Copyright Holder retains all right, title, and interest in the Software.
+Except for the limited permission in Section 1, no copyright, patent,
+trademark, trade-secret, or other intellectual-property right is granted.
+
+5. Termination
+
+Your permission under Section 1 terminates automatically if you breach this
+License. Upon termination, you must stop using the Software and delete all
+copies in your possession or control. Sections 2 through 8 survive
+termination.
+
+6. Third-party materials
+
+Third-party software, dependencies, examples, fixtures, and other materials
+included with or referenced by the Software remain governed by their own
+licenses. This License does not restrict rights granted directly by their
+respective owners.
+
+7. Disclaimer of warranty
+
+THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NON-INFRINGEMENT. YOU USE THE SOFTWARE AT YOUR OWN RISK.
+
+8. Limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER WILL NOT BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO
+THE SOFTWARE OR ITS USE, WHETHER IN CONTRACT, TORT, OR OTHERWISE.
+
+Permission and commercial-license requests must be made directly to the
+Copyright Holder through the Portage repository or another written channel
+designated by the Copyright Holder.

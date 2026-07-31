@@ -11,7 +11,7 @@ honest patch and evidence trail.
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](apps/backend)
 [![Next.js 15](https://img.shields.io/badge/Next.js-15-111111?logo=next.js&logoColor=white)](apps/frontend)
 [![Postgres 16](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](docker-compose.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-52D69A.svg)](LICENSE)
+[![License: Source Available](https://img.shields.io/badge/License-Source--Available-E8A317.svg)](LICENSE)
 
 **Platform phases 0–7 complete · Development recipe gates reached · R5 held-out: 0/9 · Deployment parked**
 
@@ -550,4 +550,7 @@ principle remains **depth before breadth**.
 
 ## License
 
-[MIT](LICENSE)
+Portage is proprietary, source-available software. You may read it and run it
+unmodified for non-commercial purposes. Modification, redistribution, use in
+another project, hosting, and commercial use require prior written permission.
+See the [Portage Source-Available License](LICENSE).
