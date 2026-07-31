@@ -192,9 +192,14 @@ async def eval_leaderboard(suites: str = "") -> dict:
     sql = text(f"""
         SELECT corpus_name, scenario,
                count(*)                                    AS runs,
-               count(*) FILTER (WHERE status = 'green')    AS green,
-               avg(tests_passed::float / nullif(tests_total, 0))      AS test_pass_mean,
-               variance(tests_passed::float / nullif(tests_total, 0)) AS test_pass_variance,
+               count(*) FILTER (
+                   WHERE status = 'green' AND tree_state = 'migrated'
+               )                                           AS green,
+               count(*) FILTER (WHERE tree_state = 'migrated') AS migrated_runs,
+               avg(tests_passed::float / nullif(tests_total, 0))
+                   FILTER (WHERE tree_state = 'migrated')   AS test_pass_mean,
+               variance(tests_passed::float / nullif(tests_total, 0))
+                   FILTER (WHERE tree_state = 'migrated')   AS test_pass_variance,
                avg(tasks_done::float / nullif(tasks_total, 0))        AS completion_mean,
                avg(cost_usd)                               AS cost_mean,
                avg(wall_seconds)                           AS wall_mean,
@@ -236,6 +241,7 @@ async def eval_leaderboard(suites: str = "") -> dict:
                 "tier": tiers.get(r["corpus_name"], ""),
                 "scenario": r["scenario"],
                 "runs": r["runs"],
+                "migrated_runs": r["migrated_runs"],
                 "green": r["green"],
                 "green_rate": round(r["green"] / r["runs"], 3) if r["runs"] else 0.0,
                 "test_pass_mean": round(float(r["test_pass_mean"] or 0), 3),
@@ -268,6 +274,7 @@ async def list_eval_runs(limit: int = 25, scenario: str = "") -> list[dict]:
             "id": str(r.id), "suite": r.suite, "corpus_name": r.corpus_name,
             "scenario": r.scenario, "k_index": r.k_index,
             "job_id": str(r.job_id) if r.job_id else None, "status": r.status,
+            "tree_state": r.tree_state,
             "tests_passed": r.tests_passed, "tests_total": r.tests_total,
             "tasks_total": r.tasks_total, "tasks_done": r.tasks_done,
             "tasks_skipped": r.tasks_skipped,

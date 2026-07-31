@@ -29,7 +29,29 @@ export function AppShell({
     <div className="app-shell">
       <aside className="app-sidebar">
         <Link href="/" className="brand" aria-label="Portage home">
-          <span className="brand-mark">P</span>
+          <span className="brand-mark" aria-hidden="true">
+            {/* the Portage mark: a carried canoe above two waters — the gap is the portage */}
+            <svg viewBox="0 0 64 64" width="22" height="22" role="img">
+              <path
+                fill="currentColor"
+                d="M8 30 C 14 17.5, 50 17.5, 56 30 C 50.5 27.5, 46 32.5, 32 32.5 C 18 32.5, 13.5 27.5, 8 30 Z"
+              />
+              <path
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="4.6"
+                strokeLinecap="round"
+                d="M8.5 45.5 c 2.6 -3.4, 5.6 -3.4, 8.2 0 c 2.6 3.4, 5.6 3.4, 8.2 0"
+              />
+              <path
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="4.6"
+                strokeLinecap="round"
+                d="M39.1 45.5 c 2.6 -3.4, 5.6 -3.4, 8.2 0 c 2.6 3.4, 5.6 3.4, 8.2 0"
+              />
+            </svg>
+          </span>
           <span>
             <strong>Portage</strong>
             <small>Migration agent</small>

@@ -203,6 +203,10 @@ def test_architect_checklist_is_exhaustive_packable_and_shared_with_policy():
                 "name": "RuntimeSurface", "kind": "class", "signature": "",
                 "members": ["app_context", "test_cli_runner", "test_client", "testing"],
             },
+            {
+                "name": "render_template", "kind": "function", "signature": "",
+                "members": [],
+            },
         ],
         "consumers": consumers,
         "depends_on": [],
@@ -280,9 +284,14 @@ def test_materializer_completes_all_deterministic_contract_facts_once():
     assert recipe.artifact_plan_violations(completed, ARCHITECTURE_FILES, planned) == []
     assert audit[0]["path"] == "pkg/runtime.py"
     assert audit[0]["added_exports"] == [
+        {"name": "render_template", "kind": "function"},
         {"name": "g", "kind": "variable"},
         {"name": "session", "kind": "variable"},
-    ]
+            {"name": "flash", "kind": "function"},
+            {"name": "get_flashed_messages", "kind": "function"},
+            {"name": "get_request_context", "kind": "function"},
+            {"name": "manage_session", "kind": "function"},
+        ]
     assert audit[0]["added_class_members"] == [{
         "export": "RuntimeSurface",
         "members": ["app_context", "test_cli_runner", "testing"],

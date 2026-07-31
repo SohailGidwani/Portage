@@ -12,6 +12,7 @@ import json
 import logging
 import uuid
 from hashlib import sha256
+from pathlib import Path
 
 from portage_agent.db import task_store
 from portage_agent.storage import LocalStorage
@@ -24,12 +25,43 @@ from .redaction import scrub
 log = logging.getLogger("portage.agent")
 
 
+def _checkpoint_tree_state(worktree: str, checkpoint: dict) -> str | None:
+    """Classify the measured cut against its pre-cut snapshot."""
+    if not checkpoint or not worktree:
+        return None
+    root = Path(checkpoint.get("root", ""))
+    matches: list[bool] = []
+    for path, record in checkpoint.get("files", {}).items():
+        target = Path(worktree, path)
+        if not record.get("existed"):
+            matches.append(not target.exists())
+            continue
+        snapshot = root / record.get("snapshot", "")
+        try:
+            matches.append(target.read_bytes() == snapshot.read_bytes())
+        except OSError:
+            return None
+    if not matches:
+        return None
+    if all(matches):
+        return "restored_coherent"
+    return "hybrid" if any(matches) else "migrated"
+
+
 async def report_node(state: GraphState) -> GraphState:
     job_id = state["job_id"]
     migrate = bool(state.get("migrate"))
     verify_summary = state.get("test_summary") or {}
     integrate_summary = state.get("integrate_summary") or {}
-    final = integrate_summary if migrate else verify_summary
+    final = dict(integrate_summary if migrate else verify_summary)
+    tree_state = (
+        _checkpoint_tree_state(
+            state.get("worktree", ""), state.get("current_batch_checkpoint") or {},
+        )
+        or state.get("migration_tree_state")
+        or ("migrated" if migrate else "original")
+    )
+    final["tree_state"] = tree_state
 
     # Reload the plan from Postgres — the truth. The state copy is Execute's LAST output
     # and goes stale when a later Recover skips tasks (observed: a fully-rolled-back run
@@ -219,6 +251,7 @@ async def report_node(state: GraphState) -> GraphState:
         "affected_tests": state.get("affected_tests", []),
         "recovery": recovery,
         "migration_outcome": migration_outcome,
+        "tree_state": tree_state,
         "unsupported_test_seams": unsupported,
         "oracle_integrity": oracle_integrity,
         "verified_batches": state.get("verified_batches", []),

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Portage mark: a carried canoe above two waters — the gap between them is the portage. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b9a4ff"/>
+      <stop offset="1" stop-color="#7354e6"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <!-- hull-up canoe: smooth keel arc on top, sagging gunwale below, sharp upturned tips -->
+  <path fill="#f7f5ff" d="M8 30
+    C 14 17.5, 50 17.5, 56 30
+    C 50.5 27.5, 46 32.5, 32 32.5
+    C 18 32.5, 13.5 27.5, 8 30 Z"/>
+  <!-- two waters as wavelet squiggles, the carry gap centered under the hull -->
+  <path fill="none" stroke="#f7f5ff" stroke-width="4.6" stroke-linecap="round"
+        d="M8.5 45.5 c 2.6 -3.4, 5.6 -3.4, 8.2 0 c 2.6 3.4, 5.6 3.4, 8.2 0"/>
+  <path fill="none" stroke="#f7f5ff" stroke-width="4.6" stroke-linecap="round"
+        d="M39.1 45.5 c 2.6 -3.4, 5.6 -3.4, 8.2 0 c 2.6 3.4, 5.6 3.4, 8.2 0"/>
+</svg>

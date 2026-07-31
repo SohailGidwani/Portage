@@ -1,0 +1,57 @@
+# R5 held-out Flask -> FastAPI corpus.
+# Frozen before any Portage migration; selection evidence lives in the local
+# notes/portage-corpus-expansion-candidates.md file.
+version = 1
+
+[[repos]]
+name = "ws-example"
+repo_url = "https://github.com/unibo-dtm-se/ws-example"
+recipe = "flask_to_fastapi"
+ref = "6903148c2644e50e971655dc4f645ab2b742fa5b"
+tier = "structural"
+stresses = [
+  "app_factory",
+  "basic_auth",
+  "authorization",
+  "pagination",
+  "patch_routes",
+  "content_negotiation",
+  "templates",
+  "openapi",
+]
+source = "github-heldout"
+notes = "Apache-2.0. Untouched offline baseline: 42/42 on 2026-07-27."
+
+[[repos]]
+name = "silicon"
+repo_url = "https://github.com/cu/silicon"
+recipe = "flask_to_fastapi"
+ref = "143910c10516c6c48120e1f981aec6a9f344fe5d"
+tier = "structural"
+stresses = [
+  "app_factory",
+  "sqlite_db",
+  "cli",
+  "revisions",
+  "full_text_search",
+  "jinja_filters",
+]
+source = "github-heldout"
+notes = "Apache-2.0. Untouched offline baseline: 34/34 on 2026-07-27."
+
+[[repos]]
+name = "flask-email-login"
+repo_url = "https://github.com/jelmerdejong/flask-email-login"
+recipe = "flask_to_fastapi"
+ref = "4b6ab3ac7d24b35503c8f63fb5dba8e1ddb5e16d"
+tier = "structural"
+stresses = [
+  "app_factory",
+  "magic_link_auth",
+  "csrf",
+  "mail_outbox",
+  "flask_login",
+  "extension_initialization",
+]
+source = "github-heldout"
+notes = "MIT. Untouched offline baseline: 18/18 on 2026-07-27."

@@ -14,6 +14,10 @@ import signal
 from portage_agent.agent import build_graph, open_checkpointer, run_job
 from portage_agent.config import settings
 from portage_agent.core.interfaces import ClaimedJob
+from portage_agent.eval.harness import (
+    persist_completed_eval_job,
+    reconcile_completed_eval_runs,
+)
 from portage_agent.logging_conf import setup_logging
 from portage_agent.worker.queue import PostgresJobQueue
 
@@ -51,6 +55,11 @@ async def _process(queue: PostgresJobQueue, graph, job: ClaimedJob) -> None:
         log.exception("job=%s FAILED", job.id)
         await queue.fail(job.id, error=repr(exc))
     finally:
+        try:
+            await persist_completed_eval_job(job.id)
+        except Exception:
+            # The job/report is already durable. Startup reconciliation retries this path.
+            log.exception("eval run persistence failed for job=%s", job.id)
         hb.cancel()
         try:
             await hb
@@ -66,6 +75,12 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop.set)
 
     queue = PostgresJobQueue()
+    try:
+        reconciled = await reconcile_completed_eval_runs()
+        if reconciled:
+            log.info("reconciled %s completed eval run(s)", reconciled)
+    except Exception:
+        log.exception("completed eval run reconciliation failed; continuing")
     async with open_checkpointer() as checkpointer:
         graph = build_graph(checkpointer)
         log.info(

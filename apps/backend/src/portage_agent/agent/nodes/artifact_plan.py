@@ -44,6 +44,7 @@ def _artifact_path(value: object, existing: set[str]) -> str:
 def parse_artifact_plan(
     text: str, *, existing_files: set[str], rewrite_paths: set[str],
     max_artifacts: int = MAX_CREATED_ARTIFACTS,
+    allow_empty_exports: bool = False,
 ) -> list[dict]:
     """Parse and strictly validate one architect JSON response.
 
@@ -98,7 +99,7 @@ def parse_artifact_plan(
             raise ValueError(f"artifact {index} has duplicate capabilities")
 
         exports = item.get("exports")
-        if not isinstance(exports, list) or not exports:
+        if not isinstance(exports, list) or (not exports and not allow_empty_exports):
             raise ValueError(f"artifact {index} must declare at least one export")
         normalized_exports: list[dict] = []
         export_names: set[str] = set()

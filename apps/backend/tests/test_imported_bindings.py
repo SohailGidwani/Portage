@@ -112,3 +112,19 @@ def test_parent_package_symbol_reexport_is_not_mistaken_for_submodule(tmp_path):
     assert ModuleBinding("api/__init__.py", "app", "app") in bindings
     assert not any(b.importer == "wsgi.py" and b.symbol is None for b in bindings)
     assert export_contract(root, "api/app.py") == ["app"]
+
+
+def test_same_basename_in_different_packages_does_not_cross_bind(tmp_path):
+    root = _repo(tmp_path, {
+        "app/email.py": "def send_email():\n    pass\n",
+        "app/auth/email.py": "def send_reset():\n    pass\n",
+        "app/auth/routes.py": (
+            "from app.auth.email import send_reset\n"
+            "send_reset()\n"
+        ),
+    })
+
+    assert imported_bindings(root, "app/email.py") == []
+    assert imported_bindings(root, "app/auth/email.py") == [
+        ModuleBinding("app/auth/routes.py", "send_reset", "send_reset"),
+    ]

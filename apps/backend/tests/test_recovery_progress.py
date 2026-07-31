@@ -3,6 +3,7 @@
 import importlib
 import subprocess
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,6 +18,8 @@ from portage_agent.agent.nodes.recover import (
     contract_failure_target,
     missing_unplanned_test_compat,
     repeated_failure_count,
+    seam_failure_owner,
+    syntax_error_target,
     targeted_contract_repair_count,
     unique_traceback_leaf_target,
 )
@@ -96,6 +99,61 @@ def test_runtime_contract_failures_map_only_to_a_unique_frozen_owner():
     ) is None
 
 
+@pytest.mark.asyncio
+async def test_missing_seam_export_uses_real_recover_targeted_path(
+    tmp_path, monkeypatch,
+):
+    tasks = [
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path=path, type=role, status="done", attempts=3,
+            attempts_log=[], verify_spec={"action": "rewrite"},
+        )
+        for path, role in (
+            ("pkg/hooks.py", "support"),
+            ("pkg/factory.py", "app_factory"),
+        )
+    ]
+    seam_plan = {"decisions": {"request_hooks:pkg/hooks.py": {
+        "kind": "request_hooks", "path": "pkg/hooks.py",
+        "files": ["pkg/hooks.py", "pkg/factory.py"],
+        "hooks": [{"function": "warm_scope", "scope": "before_app_request"}],
+    }}}
+    output = "ImportError: cannot import name 'warm_scope' from 'pkg.hooks'"
+    assert seam_failure_owner(
+        output, seam_plan, {task.target_path for task in tasks},
+    ) == "pkg/hooks.py"
+    assert seam_failure_owner(
+        "TypeError: Meta.create_schema() missing 1 required positional argument: 'bind'",
+        {"decisions": {"extension_provider:pkg/store.py:store": {
+            "kind": "extension_provider", "provider": "pkg/store.py",
+            "members": ["create_schema"],
+        }}},
+        {"pkg/store.py", "pkg/factory.py"},
+    ) == "pkg/store.py"
+
+    update = AsyncMock()
+    monkeypatch.setattr(recover_module.task_store, "load_tasks", AsyncMock(return_value=tasks))
+    monkeypatch.setattr(recover_module.task_store, "update_task", update)
+    monkeypatch.setattr(recover_module, "file_diff", AsyncMock(return_value="hook diff"))
+    monkeypatch.setattr(recover_module, "_rollback_file", AsyncMock())
+
+    result = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "worktree": str(tmp_path),
+        "last_verify_errors": output,
+        "last_failure_fingerprint": "missing-hook",
+        "current_batch_paths": [task.target_path for task in tasks],
+        "interface_manifest": {},
+        "seam_plan": seam_plan,
+        "recovery_actions": [],
+    })
+
+    assert result["recover_route"] == "execute"
+    assert result["contract_repair_owner"] == "pkg/hooks.py"
+    assert result["recovery_actions"][0]["classification"] == "contract_failure"
+    assert result["recovery_actions"][0]["targets"] == ["pkg/hooks.py"]
+
+
 def test_ambiguous_member_ownership_refuses_targeted_repair():
     manifest = {
         f"pkg/{name}.py::Compat": {
@@ -128,6 +186,81 @@ def test_traceback_leaf_attribution_requires_one_application_artifact():
         "E   RuntimeError: boom\n"
     )
     assert unique_traceback_leaf_target(ambiguous, eligible) is None
+
+    same_line = "pkg/app.py:12: AttributeError: broken adapter\n"
+    assert unique_traceback_leaf_target(same_line, eligible) == "pkg/app.py"
+    terminal_wins = (
+        "pkg/app.py:4: in create_app\n"
+        "E   AttributeError: broken adapter\n"
+        "pkg/db.py:31: AttributeError\n"
+    )
+    assert unique_traceback_leaf_target(terminal_wins, eligible) == "pkg/db.py"
+
+
+@pytest.mark.asyncio
+async def test_syntax_error_targets_only_the_named_generated_file(
+    tmp_path, monkeypatch,
+):
+    tasks = [
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path=path, type=role, status="done", attempts=1,
+            attempts_log=[], verify_spec={"action": "rewrite"},
+        )
+        for path, role in (
+            ("pkg/factory.py", "app_factory"),
+            ("pkg/routes.py", "router"),
+        )
+    ]
+    output = (
+        '  File "/workspaces/job-migrated/pkg/factory.py", line 18\n'
+        "    value = lambda: (raise RuntimeError())\n"
+        "SyntaxError: invalid syntax\n"
+    )
+    assert syntax_error_target(
+        output, {task.target_path for task in tasks},
+    ) == "pkg/factory.py"
+
+    update = AsyncMock()
+    monkeypatch.setattr(recover_module.task_store, "load_tasks", AsyncMock(return_value=tasks))
+    monkeypatch.setattr(recover_module.task_store, "update_task", update)
+    monkeypatch.setattr(recover_module, "file_diff", AsyncMock(return_value="factory diff"))
+    monkeypatch.setattr(recover_module, "_rollback_file", AsyncMock())
+
+    result = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "worktree": str(tmp_path),
+        "last_verify_errors": output,
+        "last_failure_fingerprint": "syntax",
+        "current_batch_paths": [task.target_path for task in tasks],
+        "interface_manifest": {},
+        "seam_plan": {},
+        "recovery_actions": [],
+    })
+
+    assert result["recover_route"] == "execute"
+    assert result["contract_repair_owner"] == "pkg/factory.py"
+    assert result["recovery_actions"][0]["targets"] == ["pkg/factory.py"]
+    assert result["recover_budget_used"] == 0
+
+    update.reset_mock()
+    injected = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "worktree": str(tmp_path),
+        "config": {"inject_fault": "bad_patch"},
+        "last_verify_errors": output,
+        "last_failure_fingerprint": "injected-syntax",
+        "current_batch_paths": [task.target_path for task in tasks],
+        "interface_manifest": {},
+        "seam_plan": {},
+        "recovery_actions": [],
+    })
+
+    assert injected["contract_repair_owner"] == ""
+    assert injected["recovery_actions"][0]["classification"] == "crash_batch"
+    assert set(injected["recovery_actions"][0]["targets"]) == {
+        "pkg/factory.py", "pkg/routes.py",
+    }
+    assert injected["recover_budget_used"] == 1
 
 
 @pytest.mark.asyncio
@@ -182,7 +315,7 @@ async def test_unique_traceback_leaf_gets_runtime_targeted_repair(
 
 
 @pytest.mark.asyncio
-async def test_failed_targeted_repair_restores_and_reverifies_the_whole_cut(
+async def test_failed_targeted_repair_restores_only_the_owner_and_keeps_the_cut(
     tmp_path, monkeypatch,
 ):
     package = tmp_path / "pkg"
@@ -193,7 +326,10 @@ async def test_failed_targeted_repair_restores_and_reverifies_the_whole_cut(
         SimpleNamespace(
             id=uuid.uuid4(), target_path=path, type=role, status="done", attempts=3,
             attempts_log=(
-                [{"action": "contract_repair", "scope": "runtime_targeted"}]
+                [
+                    {"action": "contract_repair", "scope": "runtime_targeted"},
+                    {"action": "contract_repair", "scope": "runtime_targeted"},
+                ]
                 if path == "pkg/db.py" else []
             ),
             verify_spec={"action": "rewrite"}, content_hash=None,
@@ -208,8 +344,15 @@ async def test_failed_targeted_repair_restores_and_reverifies_the_whole_cut(
             "pkg/app.py": {"status": "pending", "action": "rewrite"},
         },
     )
-    (package / "db.py").write_text("VALUE = 'broken-repair'\n")
+    (package / "db.py").write_text("VALUE = 'generated-db'\n")
     (package / "app.py").write_text("VALUE = 'generated-app'\n")
+    repair_checkpoint = create_cut_checkpoint(
+        str(tmp_path),
+        ["pkg/db.py"],
+        {"pkg/db.py": {"status": "done", "action": "rewrite"}},
+        ".portage-targeted-repair-checkpoint",
+    )
+    (package / "db.py").write_text("VALUE = 'broken-repair'\n")
     update = AsyncMock()
     monkeypatch.setattr(recover_module.task_store, "load_tasks", AsyncMock(return_value=tasks))
     monkeypatch.setattr(recover_module.task_store, "update_task", update)
@@ -226,6 +369,7 @@ async def test_failed_targeted_repair_restores_and_reverifies_the_whole_cut(
         "last_failure_fingerprint": "repair-failed",
         "current_batch_paths": ["pkg/db.py", "pkg/app.py"],
         "current_batch_checkpoint": checkpoint,
+        "targeted_repair_checkpoint": repair_checkpoint,
         "interface_manifest": {},
         "recovery_actions": [],
     })
@@ -233,12 +377,60 @@ async def test_failed_targeted_repair_restores_and_reverifies_the_whole_cut(
     assert result["recover_route"] == "verify"
     assert result["cut_restore_pending_verification"] is True
     assert result["recovery_actions"][0]["action"] == "restore_cut_reverify"
-    assert (package / "db.py").read_text() == "VALUE = 'original-db'\n"
-    assert (package / "app.py").read_text() == "VALUE = 'original-app'\n"
+    assert (package / "db.py").read_text() == "VALUE = 'generated-db'\n"
+    assert (package / "app.py").read_text() == "VALUE = 'generated-app'\n"
     skipped = [
         call for call in update.await_args_list if call.kwargs.get("status") == "skipped"
     ]
-    assert len(skipped) == 2
+    assert skipped == []
+    restored = [
+        call for call in update.await_args_list if call.kwargs.get("status") == "done"
+    ]
+    assert len(restored) == 1
+
+
+@pytest.mark.asyncio
+async def test_distinct_targeted_owner_advances_the_repair_checkpoint(
+    tmp_path, monkeypatch,
+):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "db.py").write_text("DB = 1\n")
+    (package / "app.py").write_text("APP = 1\n")
+    old = create_cut_checkpoint(
+        str(tmp_path), ["pkg/db.py"],
+        {"pkg/db.py": {"status": "done", "action": "rewrite"}},
+        ".portage-targeted-repair-checkpoint",
+    )
+    tasks = [
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path=path, type="support", status="done",
+            attempts=1, attempts_log=[], verify_spec={"action": "rewrite"},
+        )
+        for path in ("pkg/db.py", "pkg/app.py")
+    ]
+    monkeypatch.setattr(
+        recover_module.task_store, "load_tasks", AsyncMock(return_value=tasks),
+    )
+    monkeypatch.setattr(recover_module.task_store, "update_task", AsyncMock())
+    monkeypatch.setattr(recover_module, "file_diff", AsyncMock(return_value="diff"))
+
+    result = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "worktree": str(tmp_path),
+        "last_verify_errors": "pkg/app.py:1: in create_app\nRuntimeError: next\n",
+        "last_failure_fingerprint": "new-owner",
+        "current_batch_paths": ["pkg/db.py", "pkg/app.py"],
+        "targeted_repair_checkpoint": old,
+        "interface_manifest": {},
+        "recovery_actions": [],
+    })
+
+    assert result["contract_repair_owner"] == "pkg/app.py"
+    assert result["targeted_repair_checkpoint"]["paths"] == ["pkg/app.py"]
+    assert not Path(
+        old["root"], old["files"]["pkg/db.py"]["snapshot"],
+    ).exists()
 
 
 @pytest.mark.asyncio
@@ -300,6 +492,107 @@ async def test_successful_restored_cut_reverification_clears_checkpoint_without_
     assert result["current_batch_checkpoint"] == {}
     assert "verified_batches" not in result
     assert not (tmp_path / ".portage-cut-checkpoint").exists()
+
+
+@pytest.mark.asyncio
+async def test_verify_rejects_a_new_import_cycle_before_starting_the_sandbox(
+    tmp_path, monkeypatch,
+):
+    original = tmp_path / "original"
+    migrated = tmp_path / "migrated"
+    for root in (original, migrated):
+        (root / "pkg").mkdir(parents=True)
+    (original / "pkg" / "a.py").write_text("VALUE = 1\n")
+    (original / "pkg" / "b.py").write_text("from pkg.a import VALUE\n")
+    (migrated / "pkg" / "a.py").write_text("from pkg.b import VALUE\n")
+    (migrated / "pkg" / "b.py").write_text("from pkg.a import VALUE\n")
+    run_tests = AsyncMock()
+    monkeypatch.setattr(verify_module, "_run_tests", run_tests)
+    monkeypatch.setattr(verify_module, "worktree_diff", AsyncMock(return_value="diff"))
+
+    result = await verify_module.verify_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "migrate": True,
+        "workspace": str(original),
+        "worktree": str(migrated),
+        "graph_summary": {},
+        "config": {"verify_delay_seconds": 0},
+        "current_batch_paths": ["pkg/a.py", "pkg/b.py"],
+        "current_batch_tests": ["tests/test_pkg.py"],
+    })
+
+    assert result["verify_passed"] is False
+    assert "new runtime import cycle introduced" in result["last_verify_errors"]
+    run_tests.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_rejects_recipe_residue_missing_from_the_plan(
+    tmp_path, monkeypatch,
+):
+    original = tmp_path / "original"
+    migrated = tmp_path / "migrated"
+    for root in (original, migrated):
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg" / "api.py").write_text(
+            "from flask_restx import Namespace\napi = Namespace('api')\n"
+        )
+    run_tests = AsyncMock()
+    monkeypatch.setattr(verify_module, "_run_tests", run_tests)
+    monkeypatch.setattr(verify_module, "worktree_diff", AsyncMock(return_value="diff"))
+
+    result = await verify_module.verify_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "migrate": True,
+        "migration_recipe": "flask_to_fastapi",
+        "workspace": str(original),
+        "worktree": str(migrated),
+        "plan": [],
+        "graph_summary": {},
+        "config": {"verify_delay_seconds": 0},
+    })
+
+    assert result["verify_passed"] is False
+    assert "pkg/api.py" in result["last_verify_errors"]
+    run_tests.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unplanned_residue_restores_generated_consumers_before_replan(
+    tmp_path, monkeypatch,
+):
+    app = tmp_path / "pkg" / "app.py"
+    omitted = tmp_path / "pkg" / "api.py"
+    app.parent.mkdir()
+    app.write_text("from flask import Flask\n")
+    omitted.write_text("from flask_restx import Namespace\n")
+    task = SimpleNamespace(id=uuid.uuid4(), target_path="pkg/app.py")
+    checkpoint = create_cut_checkpoint(
+        str(tmp_path), ["pkg/app.py"],
+        {"pkg/app.py": {"status": "pending", "action": "rewrite"}},
+    )
+    app.write_text("from fastapi import FastAPI\n")
+    update = AsyncMock()
+    monkeypatch.setattr(
+        recover_module.task_store, "load_tasks", AsyncMock(return_value=[task]),
+    )
+    monkeypatch.setattr(recover_module.task_store, "update_task", update)
+
+    result = await recover_module.recover_node({
+        "job_id": "00000000-0000-0000-0000-000000000001",
+        "migration_recipe": "flask_to_fastapi",
+        "worktree": str(tmp_path),
+        "last_verify_errors": "recipe residue",
+        "last_failure_fingerprint": "residue",
+        "current_batch_checkpoint": checkpoint,
+        "recovery_actions": [],
+    })
+
+    assert result["recover_route"] == "plan"
+    assert result["replan_requested"] is True
+    assert result["recovery_actions"][0]["targets"] == ["pkg/api.py"]
+    assert app.read_text() == "from flask import Flask\n"
+    assert update.await_args.kwargs["status"] == "pending"
 
 
 def test_implemented_provider_moves_member_repair_to_unique_consumer(tmp_path):
@@ -453,7 +746,7 @@ async def test_contract_target_gets_repair_after_ordinary_attempts_exhausted(
 async def test_contract_target_stops_when_separate_repair_allowance_is_spent(
     tmp_path, monkeypatch,
 ):
-    task, manifest = _consumer_contract_fixture(tmp_path, targeted_repairs=1)
+    task, manifest = _consumer_contract_fixture(tmp_path, targeted_repairs=2)
     update = AsyncMock()
     monkeypatch.setattr(recover_module.task_store, "load_tasks", AsyncMock(return_value=[task]))
     monkeypatch.setattr(recover_module.task_store, "update_task", update)

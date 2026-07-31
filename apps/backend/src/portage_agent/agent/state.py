@@ -51,7 +51,9 @@ class GraphState(TypedDict, total=False):
     # Filesystem-backed pre-cut snapshot metadata. Source bytes stay in the worktree,
     # not in checkpoint JSON, and are discarded after a successful Verify.
     current_batch_checkpoint: dict
+    targeted_repair_checkpoint: dict
     cut_restore_pending_verification: bool
+    migration_tree_state: str  # migrated | restored_coherent | hybrid
     verify_attempts: int  # bumped by Verify each run (diagnostic)
     verify_passed: bool
     last_verify_errors: str  # failing-test output; Recover classifies it, Execute retries with it

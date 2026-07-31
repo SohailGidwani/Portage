@@ -290,6 +290,24 @@ def _edge_candidates(
                     ),
                 )
 
+            # A planned Flask support module called by the application factory is an
+            # app-owned registrar/initializer even when its function has a project-
+            # specific name. Migrating the provider alone creates an impossible mixed
+            # framework state, so verify it with the consumer that invokes it.
+            if (
+                provider.role == "support"
+                and consumer.role == "app_factory"
+                and binding_called
+            ):
+                add(
+                    provider.path, consumer.path, "factory_provider_call", "call",
+                    next(
+                        (_evidence(source, call) for call in calls
+                         if _call_uses_binding(call, binding)),
+                        binding.local,
+                    ),
+                )
+
             if (
                 provider.role == "app_factory"
                 and consumer.role == "test_harness"

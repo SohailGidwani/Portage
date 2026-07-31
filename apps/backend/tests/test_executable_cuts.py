@@ -30,6 +30,31 @@ def _ordered(files: dict[str, str], planned: list[PlannedFile]) -> list[PlannedF
     return dependency_order(files, planned)
 
 
+def test_replan_decision_merge_grows_only_derived_topology():
+    old = {
+        "runtime": {
+            "kind": "ambient_context_runtime",
+            "instruction": "frozen",
+            "files": ["pkg/context.py"],
+            "factory_files": [],
+        },
+    }
+    new = {
+        "runtime": {
+            "kind": "ambient_context_runtime",
+            "instruction": "recomputed",
+            "files": ["pkg/context.py", "pkg/app.py"],
+            "factory_files": ["pkg/app.py"],
+        },
+    }
+
+    assert plan_module.merge_replan_decisions(new, old)["runtime"] == {
+        **old["runtime"],
+        "files": ["pkg/app.py", "pkg/context.py"],
+        "factory_files": ["pkg/app.py"],
+    }
+
+
 def _write_factory_fixture(root) -> None:
     package = root / "pkg"
     tests = root / "tests"
@@ -202,8 +227,8 @@ def test_resource_router_factory_and_harness_are_one_cut():
         "pkg/db.py", "pkg/views.py", "pkg/__init__.py", "tests/conftest.py",
     ]
     assert set(analysis["cuts"][0]["edge_kinds"]) == {
-        "extension_initialization", "factory_harness", "framework_state",
-        "resource_lifecycle", "router_registration",
+        "extension_initialization", "factory_harness", "factory_provider_call",
+        "framework_state", "resource_lifecycle", "router_registration",
     }
 
 
@@ -375,6 +400,7 @@ async def test_plan_checkpoints_cut_and_uses_it_as_coordinated_unit(tmp_path, mo
     })
 
     assert result["seam_plan"]["version"] == 2
+    assert "views" not in result["seam_plan"]["project_roots"]
     assert result["seam_plan"]["execution_cuts"] == [{
         "id": "executable-cut-1",
         "paths": ["pkg/views.py", "pkg/__init__.py", "tests/conftest.py"],
@@ -395,6 +421,14 @@ async def test_replan_grows_cut_without_retaining_overlapping_stale_unit(
     tmp_path, monkeypatch,
 ):
     _write_factory_fixture(tmp_path)
+    (tmp_path / "pkg" / "views.py").write_text(
+        "from flask import Blueprint, g\n"
+        "bp = Blueprint('items', __name__)\n"
+        "@bp.before_app_request\n"
+        "def load_item():\n    g.item = None\n"
+        "@bp.get('/items')\n"
+        "def items():\n    return []\n"
+    )
 
     async def snapshots(_job_id, specs):
         return [
@@ -414,9 +448,7 @@ async def test_replan_grows_cut_without_retaining_overlapping_stale_unit(
     }
 
     initial = await plan_module.plan_node(base_state)
-    assert initial["seam_plan"]["execution_cuts"][0]["paths"] == [
-        "pkg/__init__.py", "tests/conftest.py",
-    ]
+    assert initial["seam_plan"]["execution_cuts"] == []
 
     replanned = await plan_module.plan_node({
         **base_state,
@@ -427,6 +459,9 @@ async def test_replan_grows_cut_without_retaining_overlapping_stale_unit(
     assert replanned["seam_plan"]["execution_cuts"][0]["paths"] == [
         "pkg/views.py", "pkg/__init__.py", "tests/conftest.py",
     ]
+    assert replanned["seam_plan"]["decisions"][
+        "request_hooks:pkg/views.py"
+    ]["files"] == ["pkg/__init__.py", "pkg/views.py"]
     units = replanned["seam_plan"]["units"]
     assert len(units) == 1
     assert units[0]["paths"] == [
