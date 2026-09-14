@@ -54,6 +54,13 @@ async def report_node(state: GraphState) -> GraphState:
     verify_summary = state.get("test_summary") or {}
     integrate_summary = state.get("integrate_summary") or {}
     final = dict(integrate_summary if migrate else verify_summary)
+    stopped_ambiguous = any(
+        action.get("action") == "stop_preserve_evidence"
+        for action in state.get("recovery_actions", [])
+    )
+    if stopped_ambiguous:
+        final = dict(integrate_summary or verify_summary)
+        final["scope"] = "integration" if integrate_summary else "verification_subset"
     tree_state = (
         _checkpoint_tree_state(
             state.get("worktree", ""), state.get("current_batch_checkpoint") or {},
@@ -101,7 +108,7 @@ async def report_node(state: GraphState) -> GraphState:
     oracle_breaks: list[dict] = []
     oracle_root = state.get("worktree") or state.get("workspace") or ""
     for oracle_path, entry in oracle_manifest.items():
-        current = read_file(oracle_root, oracle_path) or ""
+        current = read_file(oracle_root, oracle_path, limit=None) or ""
         violations = oracle_violations(entry, current)
         result = {
             "path": oracle_path,
@@ -160,9 +167,14 @@ async def report_node(state: GraphState) -> GraphState:
             if architect_task is None or architect_task.get("status") == "done"
             else "plan_rejected"
         )
+    elif stopped_ambiguous:
+        migration_outcome = "failed"
     elif unsupported:
         migration_outcome = "unsupported"
-    elif migrate and suite_ok and tasks_done == len(plan) and not oracle_breaks:
+    elif (
+        migrate and suite_ok and state.get("integration_passed", suite_ok)
+        and tasks_done == len(plan) and not oracle_breaks
+    ):
         migration_outcome = "success"
     elif migrate:
         migration_outcome = "failed"

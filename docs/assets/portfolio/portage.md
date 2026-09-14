@@ -1,10 +1,15 @@
 # Portage — Autonomous Code-Migration Agent
 
+> **September 13, 2026: experimental system, demonstration frozen.** All three former R5
+> repositories later achieved one strict autonomous development K1 green. The latest
+> Microblog preservation replay is red. The remediation goal is **stopped with incomplete
+> preservation**, not complete. Historical gates below span different code versions.
+
 > Portfolio project page. Pair with [`portage-deep-dive.md`](./portage-deep-dive.md) for the full technical write-up. Asset paths are relative to this file (`../…`).
 
 | | |
 |---|---|
-| **Live demo** | `LIVE_DEMO_URL` *(fill after deploy)* |
+| **Project page** | [sohailgidwani.app/projects/portage](https://sohailgidwani.app/projects/portage) |
 | **Source** | [github.com/SohailGidwani/Portage](https://github.com/SohailGidwani/Portage) |
 | **Deep dive** | [Technical Deep Dive](./portage-deep-dive.md) |
 
@@ -16,7 +21,7 @@
 |---|---|
 | Autonomous migration agent | End-to-end Flask → FastAPI without a human in the loop |
 | Designs target architecture | Plans, owns, creates and wires **new** modules the migration needs — not just file rewrites |
-| Eval-proven | Development gates: **Flaskr + Watchlist 10/10 at K=5** · unseen R5: **0/9 green** |
+| Measured results | Historical development gates: **Flaskr + Watchlist 10/10 at K=5** · frozen R5 v1: **0/9** · three later development K1 greens |
 | CLI + MCP | One engine, two interfaces |
 | Checkpoint resume | Kill the worker mid-run; it continues from Postgres |
 | Honest green bar | Full suite + every task done + intact oracle + `tree_state=migrated` — or red |
@@ -30,7 +35,10 @@
 
 Portage is an autonomous code-migration agent. Given a repository and a migration recipe, it plans the target architecture, rewrites existing files **and creates the new modules the migration requires**, verifies against the repo's own test suite in a network-off Docker sandbox, recovers from failures under bounded budgets, and reports honestly — including when it fails.
 
-v1 ships one recipe: **Flask → FastAPI**. That target is deliberate. Routing decorators, request/response handling, blueprints→routers, error handlers, app factories, ambient request context (`g`, `session`), Click CLIs, and test-client seams need *understanding*, not mechanical rewriting. Deterministic codemods cannot do this reliably. The architecture is recipe-pluggable; the evidence is recipe-specific by design (*narrow + measured*).
+v1 implements one experimental recipe: **Flask → FastAPI**. It combines model generation
+with deterministic analysis and code transformation for routes, factories, request context,
+templates, extensions, and test plumbing. The engine exposes recipe interfaces, but its
+evidence is specific to this recipe. Generalization to other migrations is unproven.
 
 **The capability that unlocked the hard repos:** some migrations are unreachable by rewriting existing files. Flask's `g`/`session` have no FastAPI equivalent — a correct port needs a *new* request-context module, a test-compatibility surface, a rendering layer, and every consumer wired to them coherently. Portage now plans those artifacts (a bounded architecture call), freezes their contracts before generation, compiles the deterministic parts itself, and enforces that a framework-shaped capability is only valid when the plan **owns and implements it** — so a model can't reference a helper it wishes existed. That is what took the canonical Flask tutorial app from *never once green* to green autonomously, repeatably, for ~$0.15–0.23 a run.
 
@@ -39,9 +47,18 @@ A second wave — **coherent-cut preservation** — closed the gap that first ca
 The first frozen held-out evaluation then supplied the necessary correction. On three
 repositories never migrated during development, Portage scored **0/9 strict green**. The
 engine failed honestly—five trees restored coherently, four remained migrated-but-red,
-zero were hybrid, and an attempted test-set reduction was caught—but the recipe did not
-generalize. The project now has both halves of a credible result: strong development
+zero were hybrid—but the recipe did not generalize. A later forensic audit also corrected
+an oracle measurement bug: the supposedly changed long test file was byte-identical, but
+two readers had truncated it at 8,000 characters. The R5 score remains 0/9 because every sample was
+independently red. The project now has both halves of a credible result: strong development
 convergence and a measured unseen-repository gap.
+
+Those R5 repositories are now development inputs. Each later achieved a strict autonomous
+K1 green: **ws-example 42/42 tests and 5/5 tasks**, **Silicon 34/34 and 14/14**, and
+**flask-email-login 18/18 and 15/15**. Each has a migrated tree and oracle integrity 1.0.
+These were later successes in disclosed iteration sequences, not first-try or held-out
+successes. Microblog preservation remains incomplete, so the development chapter has been
+stopped rather than described as fully complete.
 
 One core engine, two interfaces:
 
@@ -95,7 +112,7 @@ A submitted job runs this graph. Every node is checkpointed to Postgres (`thread
 | **Plan** | Recipe detects framework usage and classifies files; tasks are ordered by a **cycle-safe SCC condensation of the real import graph** (dependencies first); the **interface manifest** freezes every cross-file symbol's target shape; a bounded **architect call** proposes new artifacts and a deterministic **contract compiler** completes what the engine already knows; **executable cuts** define which files must be mutually coherent before tests can honestly run; the oracle census freezes what tests are allowed to change. All of it checkpointed. |
 | **Execute** | LLM generation in dependency order, in bounded coordinated units. Every draft passes mechanical AST gates *before* the sandbox — contract presence and shape, defined-vs-invented capability ownership, provider→consumer import direction, decorator/middleware shape, new-import-cycle rejection. Violations get one accounted repair call with the rejected draft attached. Content-hash idempotent on resume; driver → escalation model ladder. |
 | **Verify** | Per-cut tests in an ephemeral `--network none` Docker sandbox. JUnit-parsed. All-skipped suites are failures (`passed > 0`). |
-| **Recover** | Uniquely attributable failures (contract owner, import-cycle edge, traceback leaf) repair **one artifact** on a separate bounded ledger; otherwise replan / batch retry / skip-and-continue. Failure fingerprints stop no-progress loops; a failed repair returns to the last coherent cut. |
+| **Recover** | Uniquely attributable failures repair **one artifact** on a separate bounded ledger. Known omissions can replan; explicit injected faults retain bounded retries. Ambiguous failures stop at Report with the draft and evidence retained, without whole-batch regeneration. This is cost control, not a measured success-rate improvement. |
 | **Integrate** | Full suite as the final gate; always recomputes the migration diff from the worktree (never trusts a stale cached diff). An Integrate-only regression can route back through Recover once. |
 | **Report** | Reloads task truth from Postgres; emits the artifact plan, oracle census, per-call cost ledger, recovery actions, diffs, tree lineage, and verdict. Eval rows are idempotently persisted/reconciled by job id. |
 
@@ -205,10 +222,15 @@ A Flask-shaped capability (`app.test_client`, `app_context`, `g`, `session`) is 
 LangGraph Postgres checkpointer after every node. Worker lease with heartbeat; expired leases are reclaimable via `FOR UPDATE SKIP LOCKED`. Ingest is once-only on resume. Execute is content-hash idempotent. Eval metadata rides with the durable job; worker and harness share one job-id upsert, and worker startup reconciles terminal jobs whose harness died before writing `runs`.
 
 ### Bounded recovery, targeted first
-Uniquely attributable failures repair the single owning artifact (measured: a stray `.decode()` fixed for $0.011 without touching its ten-file cut). Otherwise: crash → planned frame blamed → targeted rollback + regenerate; same lone file blamed twice → widen; residue in an unplanned file → replan; exhausted tasks → rollback + skip and an honest red. Whole-file regeneration against an unattributed bug was measured as a near-no-op — which is why attribution, not retry budget, is where the engineering went.
+Uniquely attributable failures can repair the owning artifact under a bounded allowance.
+The September stabilization policy stops ambiguous failures and retains the draft, failure
+summary, diff, checkpoints, and task ledger. It does not regenerate a large batch to guess
+at a fix. Replan for missing source files and explicit fault-injection retries retain their
+existing bounded paths. The new stop decision is locally tested against a saved failure;
+it is a cost-control change, not a measured migration-success improvement.
 
 ### Oracle integrity (tests can't be made easier)
-Test files are protected artifacts. Their names, assertion expressions, `raises`/`parametrize`/skip structure and fixture lifecycles are frozen at Plan; only explicitly sanctioned plumbing may differ (e.g. `get_json()` → `json()`, or an audited two-line import swap to a plan-owned context proxy). Adversarial unit tests prove deleted, renamed, skipped, and weakened assertions are caught. R5 supplied the live proof: `ws-example` generation reduced the discovered test-function set, oracle integrity fell to **0.75**, and Portage refused to count any sample green.
+Test files are protected artifacts. Their names, assertion expressions, `raises`/`parametrize`/skip structure and fixture lifecycles are frozen at Plan; only explicitly sanctioned plumbing may differ (e.g. `get_json()` → `json()`, or an audited two-line import swap to a plan-owned context proxy). Adversarial unit tests prove deleted, renamed, skipped, and weakened assertions are caught. R5 also exposed a measurement defect: Execute and Report truncated a protected file at 8,000 characters and incorrectly reported 0.75 integrity even though the source and migrated files were byte-identical. Both paths now read full content, with a long-file regression; the original R5 samples remain red for independent migration failures.
 
 ### Measured model escalation
 First N attempts use the driver tier; later attempts use the escalation tier. Every attempt lands in `tasks.attempts_log` with tier, model, tokens, and USD cost — “how often does escalation rescue?” is a SQL query.
@@ -245,7 +267,10 @@ Every LLM call’s tokens and USD (via LiteLLM pricing) are recorded per attempt
 
 ## 09 · Eval Headline
 
-### Development gates are strong; unseen generalization is not
+### Historical development milestones; unseen reliability remains unproven
+
+These results span different versions and independently scoped suites. They are not
+evidence that one current release passes every development gate.
 
 | Evidence set | Result | What it means |
 |---|---:|---|
@@ -253,6 +278,10 @@ Every LLM call’s tokens and USD (via LiteLLM pricing) are recorded per attempt
 | Items / RESTX / Structural / Minimal K=3 gates | **12/12 green** | smaller development tiers remain stable |
 | Fresh seven-repo development sweep | **6/7 green** | Microblog red on architect variance; accepted-plan replay is 4/4 |
 | **Frozen R5 v1, three unseen repos × K=3** | **0/9 green** | the recipe does not yet generalize reliably |
+| Post-R5 `ws-example` development K1 | **1/1 green, 42/42** | first general capability remediation is green; not held-out evidence |
+| Post-R5 `silicon` development K1 | **one green, 34/34** | 14/14 tasks; migrated; oracle 1.0 |
+| Post-R5 `flask-email-login` development K1 | **one green, 18/18** | 15/15 tasks; migrated; oracle 1.0 |
+| Latest Microblog preservation replay | **red, 1/26 tasks** | 39 calls, $2.056208; restored coherent; oracle 1.0; no migrated-test credit |
 
 R5 v1 ran exactly once from frozen commit `3b25ee9`, manifest
 `corpus/heldout.toml`, an offline sandbox, and Azure GPT-4o for both tiers. Source
@@ -260,7 +289,7 @@ baselines were `ws-example` 42/42, `silicon` 34/34, and `flask-email-login` 18/1
 
 | Held-out repo | Portage result | Dominant failure |
 |---|---:|---|
-| `ws-example` | **0/3** | test-client facade shadowed route decorators; oracle guard caught lost tests |
+| `ws-example` | **0/3** | test-client facade shadowed FastAPI route decorators |
 | `silicon` | **0/3** | invalid generated signatures and wrong app-facade construction |
 | `flask-email-login` | **0/3** | architect contract miss, then unrealized CSRF/mail providers |
 
@@ -269,12 +298,28 @@ restored-coherent / 0 hybrid**, 119 LLM calls, 19 recovery visits, **$3.8643**, 
 9/9 durable reports with zero missing run rows. No failed sample was renamed, replaced,
 or rerun.
 
-The integrity machinery passed even though the recipe failed: rejected cuts restored the
-original suite, restored passes contributed zero migration score, and the live
-`ws-example` test-set mutation was detected rather than accepted. If R5 failures now shape
-production behavior, all three repositories become development inputs; the next honest
-held-out set must keep this 0/9 result visible and use ClipBin plus at least two newly
-scouted untouched repositories.
+The scoring machinery held even though the recipe failed: rejected cuts restored the
+original suite and restored passes contributed zero migration score. A later audit proved
+the reported `ws-example` test-set change was instead a long-file oracle-reader false
+positive; fixing it does not alter the 0/9 because the migrations were independently red.
+All three repositories are now development inputs. Fresh held-out evaluation is parked;
+any future generalization experiment must preserve this 0/9 and use untouched inputs.
+
+The successful remediation jobs are `170d4b50-bb3e-4a3e-9023-063456b1c3aa`,
+`41bceb1e-d2b0-4c37-9ba4-308cf0ce7c36`, and
+`93ebb9df-0cd1-403d-928d-256cf0067a36`, respectively. Their suite versions and costs are
+listed in the repository README.
+
+The latest Microblog replay is `16ca313f-1420-4881-ae0d-a1570c669b06`, suite
+`r5-microblog-replay-k1-v2-20260912`. Callback retention was repaired, but missing provider
+imports and database-session lifecycle failures remained. Two local repairs were followed
+by a 24-file regeneration that exhausted the cost ceiling. Its restored original suite
+passed 4/4; evaluation correctly credited 0/4 migrated tests. Those four model tests are
+not comprehensive web-application coverage.
+
+The remediation goal is **stopped with incomplete preservation**. The demonstration uses
+retained historical runs. No paid migration evaluation was performed for the stabilization
+changes, and backend regression checks are not a claim of corpus-wide reliability.
 
 The modern fault diagnostics also ran before R5. Effective bad-patch, escalation, and
 drop-task samples recovered across the development entries; Flaskr's isolated frozen-plan
@@ -287,8 +332,8 @@ ledger instead of being relabeled.
 
 ### Friction
 - A single shared sandbox image cannot serve mutually incompatible dependency pins — four corpus candidates dropped for that reason; unlock is per-repo sandbox images.
-- **Development convergence did not predict held-out generalization.** Flaskr/Watchlist reached 10/10 while the frozen unseen set went 0/9. The next work is capability coverage, not a larger victory-lap grid.
-- **Oracle protection earned its keep on unseen code.** One R5 adapter deleted test functions; the 0.75 integrity score poison-pilled the run before its partial suite result could look encouraging.
+- **Development convergence did not predict held-out generalization.** Flaskr/Watchlist reached 10/10 while the frozen unseen set went 0/9. Further capability expansion is parked pending evidence of user value.
+- **Oracle measurement needs the same scrutiny as migration output.** R5's 0.75 integrity score looked like deleted tests, but byte-level reconstruction proved the file was unchanged and the reader had truncated it at 8,000 characters. The readers and regression coverage are fixed; the original red outcome remains unchanged.
 - Skip-and-continue can produce false greens (original suite passes after full rollback) — fixed by reloading task truth + recomputing diffs + requiring full completion.
 - Models can “pass” by decorating every test with skip — Verify requires `passed > 0`, and the oracle census now catches the whole family mechanically.
 - **Some migrations are unreachable by rewriting files.** Proven by migrating flaskr *by hand* under the same sandbox oracle: 24/24, but only after creating four new modules. That manual run became the acceptance spec — and the engine's missing capability had a name.
@@ -316,5 +361,5 @@ ledger instead of being relabeled.
 |---|---|
 | **Technical Deep Dive** | [portage-deep-dive.md](./portage-deep-dive.md) — architecture, graph nodes, durability, recovery, methodology, taxonomy, CLI/MCP contracts, auth |
 | **Source** | [github.com/SohailGidwani/Portage](https://github.com/SohailGidwani/Portage) |
-| **Live demo** | `LIVE_DEMO_URL` |
+| **Demonstration** | Frozen recordings of historical runs; public execution remains parked |
 | **In-repo docs** | `docs/METHODOLOGY.md` · `corpus/FINDINGS.md` · `docs/USAGE.md` |

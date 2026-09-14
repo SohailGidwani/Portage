@@ -92,6 +92,20 @@ def test_from_parent_package_imports_target_module(tmp_path):
     assert export_contract(root, "pkg/db.py") == ["get_db"]
 
 
+def test_from_package_imported_submodule_is_not_a_package_export(tmp_path):
+    root = _repo(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/page.py": "def read(): return 1\n",
+        "pkg/views.py": "from pkg import page\nvalue = page.read()\n",
+    })
+
+    assert imported_bindings(root, "pkg/__init__.py") == []
+    assert export_contract(root, "pkg/__init__.py") == []
+    assert imported_bindings(root, "pkg/page.py") == [
+        ModuleBinding("pkg/views.py", None, "page"),
+    ]
+
+
 def test_from_relative_parent_package_imports_target_module(tmp_path):
     root = _repo(tmp_path, {
         "app/pkg/db.py": "def get_db():\n    return 1\n",

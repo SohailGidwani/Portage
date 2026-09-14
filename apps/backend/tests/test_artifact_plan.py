@@ -20,6 +20,7 @@ from portage_agent.agent.nodes.common import (
 )
 from portage_agent.agent.nodes.executable_cut import build_executable_cut_analysis
 from portage_agent.agent.nodes.execute import (
+    _cluster_violations,
     _validated_deterministic_artifacts,
     contract_sections,
     contract_violations,
@@ -145,6 +146,36 @@ def test_new_import_cycles_are_rejected_but_source_cycles_are_preserved():
     assert new_import_cycle_violations(lazy_source, cyclic) == [
         "new runtime import cycle introduced: pkg/a.py -> pkg/b.py -> pkg/a.py"
     ]
+
+
+def test_third_party_submodule_does_not_alias_a_project_module_basename():
+    original = {"pkg/app.py": "VALUE = 1\n"}
+    migrated = {
+        "_compat.py": "from click.testing import CliRunner\n",
+        "pkg/testing.py": "from _compat import CliRunner\n",
+        **original,
+    }
+
+    assert new_import_cycle_violations(original, migrated) == []
+
+
+def test_candidate_provider_cycle_is_rejected_before_verify():
+    source = {
+        "pkg/extensions.py": "db = object()\n",
+        "pkg/models.py": "from pkg.extensions import db\n",
+    }
+    candidate = {
+        "pkg/extensions.py": "from pkg.models import User\ndb = object()\n",
+    }
+
+    broken = _cluster_violations(
+        candidate, {}, {}, {}, source, source,
+    )
+
+    assert broken == {"pkg/extensions.py": [
+        "new runtime import cycle introduced: "
+        "pkg/extensions.py -> pkg/models.py -> pkg/extensions.py",
+    ]}
 
 
 def test_planned_function_signature_freezes_provider_call_shape(tmp_path):
@@ -281,6 +312,26 @@ def test_test_facade_contract_prunes_unconsumed_function_exports():
         completed, FLASK_ARCHITECT_FILES, planned,
     ) == []
 
+    direct_only = json.loads(_flask_architect_proposal(include_authentication=True))
+    testing = next(
+        item for item in direct_only if "direct_test_surface" in item["capabilities"]
+    )
+    testing["capabilities"] = ["direct_test_surface"]
+    testing["exports"].append({
+        "name": "create_app", "kind": "function", "members": [],
+    })
+    completed, audit = recipe.materialize_artifact_contracts(
+        direct_only, FLASK_ARCHITECT_FILES, planned,
+    )
+    testing = next(
+        item for item in completed if "direct_test_surface" in item["capabilities"]
+    )
+    assert all(export["kind"] != "function" for export in testing["exports"])
+    assert any(
+        {item["name"] for item in entry.get("removed_exports", [])} == {"create_app"}
+        for entry in audit if entry["path"] == testing["path"]
+    )
+
 
 def test_contract_compiler_completes_a_capability_owner_with_empty_exports():
     recipe = FlaskToFastAPIRecipe()
@@ -313,6 +364,92 @@ def test_contract_compiler_completes_a_capability_owner_with_empty_exports():
     assert facade["name"] == "FastAPIApp"
     assert {"app_context", "test_client"} <= set(facade["members"])
     assert any(item["path"] == runtime["path"] for item in audit)
+
+
+def test_combined_runtime_and_application_receivers_are_rejected_after_completion():
+    files = {
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "def create_app(): return Flask(__name__)\n"
+        ),
+        "pkg/auth.py": "from flask import g, session\nprint(g.user, session.get('id'))\n",
+        "pkg/blog.py": "from flask import g, session\nprint(g.user, session.get('id'))\n",
+        "tests/test_app.py": (
+            "from pkg.app import create_app\n"
+            "def test_app():\n"
+            "    app = create_app()\n"
+            "    with app.app_context(): pass\n"
+        ),
+    }
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(files)
+    proposal = [{
+        "path": "pkg/runtime_context.py", "role": "support",
+        "purpose": "Own runtime and app context.",
+        "instructions": "Implement the frozen runtime owner.",
+        "capabilities": [
+            "request_context", "session_and_flash", "direct_test_surface",
+        ],
+        "exports": [], "consumers": [], "depends_on": [],
+    }]
+
+    with pytest.raises(
+        plan_module.ArchitectPlanRejection,
+        match="application facade with request middleware",
+    ):
+        plan_module._validate_artifact_plan(recipe, proposal, files, planned)
+
+
+def test_contract_compiler_keeps_returned_client_methods_off_app_facade(tmp_path):
+    files = {
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "def create_app(): return Flask(__name__)\n"
+        ),
+        "tests/test_api.py": (
+            "from pkg.app import create_app\n"
+            "def client(): return create_app().test_client()\n"
+            "def test_api(client):\n"
+            "    assert client.get('/items').status_code == 200\n"
+        ),
+    }
+    for path, source in files.items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+    recipe = FlaskToFastAPIRecipe()
+    planned = recipe.plan_files(files)
+    proposal = [{
+        "path": "pkg/testing.py", "role": "support",
+        "purpose": "Own the application test surface.",
+        "instructions": "Return a separate HTTP client adapter.",
+        "capabilities": ["direct_test_surface"],
+        "exports": [{
+            "name": "CompatApp", "kind": "class", "signature": "",
+            "members": ["get", "post", "patch", "test_client"],
+        }],
+        "consumers": ["pkg/app.py"], "depends_on": [],
+    }]
+
+    completed, audit = plan_module._validate_artifact_plan(
+        recipe, proposal, files, planned,
+    )
+    provider = completed[0]
+    facade = provider["exports"][0]
+    rendered = recipe.render_created_artifact(
+        PlannedFile(
+            path=provider["path"], role="support", action="create",
+            artifact_contract=provider,
+        ),
+        str(tmp_path),
+    )
+
+    assert facade["members"] == ["test_client"]
+    assert "def test_client(self):" in rendered
+    assert "def get(self" not in rendered
+    assert next(item for item in audit if item["path"] == "pkg/testing.py")[
+        "removed_class_members"
+    ] == [{"export": "CompatApp", "members": ["get", "patch", "post"]}]
 
 
 def test_contract_compiler_canonicalizes_recipe_owned_runtime_surface():
@@ -932,6 +1069,62 @@ async def test_invalid_materializer_output_fails_loudly_without_repair(
     assert failed["status"] == "failed"
     assert failed["verify_spec"]["artifact_plan"] == []
     assert failed["append_attempt"]["action"] == "architect"
+
+
+@pytest.mark.asyncio
+async def test_uncompleted_empty_artifact_triggers_architect_repair(
+    tmp_path, monkeypatch,
+):
+    architect = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000090",
+        status="pending", attempts=0,
+        verify_spec={"kind": "architecture", "action": "architect"},
+    )
+    update = AsyncMock()
+    empty = _valid(exports=[])
+    complete = AsyncMock(side_effect=[
+        SimpleNamespace(
+            text=empty, prompt_tokens=10, completion_tokens=5, cost_usd=0.01,
+        ),
+        SimpleNamespace(
+            text=_valid(), prompt_tokens=12, completion_tokens=6, cost_usd=0.02,
+        ),
+    ])
+    monkeypatch.setattr(
+        plan_module.task_store, "ensure_architect_task", AsyncMock(return_value=architect),
+    )
+    monkeypatch.setattr(plan_module.task_store, "update_task", update)
+    monkeypatch.setattr(
+        plan_module, "get_llm", lambda: SimpleNamespace(complete=complete),
+    )
+
+    class Recipe:
+        @staticmethod
+        def should_plan_artifacts(files, planned):
+            return True
+
+        @staticmethod
+        def build_artifact_plan_prompt(**kwargs):
+            return "plan artifacts"
+
+        @staticmethod
+        def materialize_artifact_contracts(plan, files, planned):
+            return plan, []
+
+    frozen, _ = await plan_module._plan_created_artifacts(
+        job_id="00000000-0000-0000-0000-000000000091",
+        recipe=Recipe(), files={"pkg/app.py": ""},
+        planned=[PlannedFile(path="pkg/app.py", role="app_factory")],
+        existing_plan=None, workspace=str(tmp_path),
+    )
+
+    assert frozen[0]["exports"]
+    assert complete.await_count == 2
+    entries = [call.kwargs["append_attempt"] for call in update.await_args_list]
+    assert [entry["action"] for entry in entries] == [
+        "architect", "architect_repair",
+    ]
+    assert "must declare at least one export" in entries[0]["error"]
 
 
 @pytest.mark.asyncio

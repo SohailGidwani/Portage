@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+from http import HTTPStatus
 from pathlib import PurePosixPath
 
 from portage_agent.agent.nodes.common import (
@@ -61,10 +62,6 @@ _CLICK_COMMAND = re.compile(
     re.MULTILINE,
 )
 
-_TEMPLATE_URL_FOR = re.compile(
-    r"\burl_for\(\s*['\"]([^'\"]+)['\"]"
-)
-
 _DIRECT_TEST_MEMBERS = ("test_client", "test_cli_runner", "testing")
 
 _DIRECT_TEST_CONTEXT_GLOBALS = frozenset({"g", "session", "current_app", "request"})
@@ -85,7 +82,7 @@ _GENERAL_ARTIFACT_BASENAMES = ("runtime.py", "compat.py", "support.py", "adapter
 
 _ALLOWED_IMPORT_ROOTS = {
     "_portage_fastapi_test_compat",
-    "click", "fastapi", "httpx", "itsdangerous", "jinja2", "multipart", "pydantic",
+    "click", "fastapi", "httpx", "itsdangerous", "jinja2", "markupsafe", "multipart", "pydantic",
     "pytest", "sqlalchemy", "starlette", "uvicorn", "werkzeug",
 }
 
@@ -358,6 +355,151 @@ def _direct_json_return_functions(source: str) -> list[str]:
             for node in ast.walk(function)
         )
     })
+
+
+def _route_response_status_contracts(source: str) -> list[dict]:
+    """Freeze source route statuses that are lost when Flask tuples become dicts."""
+    tree = _parsed(source)
+    if tree is None:
+        return []
+
+    def status_value(node: ast.AST) -> int | None:
+        if (
+            isinstance(node, ast.Constant) and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+        ):
+            return node.value
+        if isinstance(node, ast.Attribute) and node.attr in HTTPStatus.__members__:
+            return HTTPStatus[node.attr].value
+        return None
+
+    def content_key(value: ast.AST) -> str | None:
+        if isinstance(value, ast.Tuple) and value.elts:
+            value = value.elts[0]
+        if isinstance(value, ast.Call) and (
+            ast.unparse(value.func).split(".")[-1] == "jsonify"
+        ):
+            if len(value.args) == 1:
+                value = value.args[0]
+            elif value.keywords:
+                keys = [item.arg for item in value.keywords if item.arg]
+                return keys[0] if len(keys) == 1 else None
+        if not isinstance(value, ast.Dict):
+            return None
+        keys = [
+            key.value for key in value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+        return keys[0] if len(keys) == 1 else None
+
+    functions = {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    helper_statuses = {
+        name: status
+        for name, function in functions.items()
+        for returned in (
+            node.value for node in ast.walk(function)
+            if isinstance(node, ast.Return) and node.value is not None
+        )
+        if isinstance(returned, ast.Tuple) and len(returned.elts) >= 2
+        if (status := status_value(returned.elts[1])) is not None
+    }
+    helper_content_keys = {
+        name: key
+        for name, function in functions.items()
+        for returned in (
+            node.value for node in ast.walk(function)
+            if isinstance(node, ast.Return) and node.value is not None
+        )
+        if (key := content_key(returned)) is not None
+    }
+
+    def returned_status(value: ast.AST) -> int | None:
+        if isinstance(value, ast.Tuple) and len(value.elts) >= 2:
+            return status_value(value.elts[1])
+        if isinstance(value, ast.Call):
+            return helper_statuses.get(ast.unparse(value.func).split(".")[-1])
+        return None
+
+    def returned_content_key(value: ast.AST) -> str | None:
+        direct = content_key(value)
+        if direct is not None:
+            return direct
+        if isinstance(value, ast.Call):
+            return helper_content_keys.get(ast.unparse(value.func).split(".")[-1])
+        return None
+
+    contracts = []
+    for function in (
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func).split(".")[-1]
+            in {"route", "get", "post", "put", "patch", "delete"}
+            for decorator in node.decorator_list
+        )
+    ):
+        handlers = []
+        for handler in (
+            node for node in ast.walk(function) if isinstance(node, ast.ExceptHandler)
+        ):
+            statuses = {
+                status for returned in (
+                    node.value for statement in handler.body for node in ast.walk(statement)
+                    if isinstance(node, ast.Return) and node.value is not None
+                )
+                if (status := returned_status(returned)) is not None
+            }
+            if len(statuses) != 1:
+                continue
+            exceptions = sorted(
+                ast.unparse(item).split(".")[-1]
+                for item in (
+                    handler.type.elts if isinstance(handler.type, ast.Tuple)
+                    else [handler.type] if handler.type is not None else []
+                )
+            )
+            handler_contract = {
+                "exceptions": exceptions, "status_code": next(iter(statuses)),
+            }
+            keys = {
+                key for returned in (
+                    node.value for statement in handler.body
+                    for node in ast.walk(statement)
+                    if isinstance(node, ast.Return) and node.value is not None
+                )
+                if (key := returned_content_key(returned)) is not None
+            }
+            if len(keys) == 1:
+                handler_contract["content_key"] = next(iter(keys))
+            handlers.append(handler_contract)
+        returns = []
+        for returned in (
+            node.value for node in ast.walk(function)
+            if isinstance(node, ast.Return) and node.value is not None
+        ):
+            status = returned_status(returned)
+            if status is None:
+                continue
+            response = returned.elts[0] if isinstance(returned, ast.Tuple) else returned
+            literals = sorted({
+                node.value for node in ast.walk(response)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.value not in {"detail", "error", "message"}
+            })
+            if literals:
+                contract = {"literals": literals, "status_code": status}
+                if key := returned_content_key(returned):
+                    contract["content_key"] = key
+                returns.append(contract)
+        if handlers or returns:
+            contracts.append({
+                "function": function.name, "handlers": handlers, "returns": returns,
+            })
+    return contracts
 
 
 def _blueprint_symbols(source: str) -> set[str]:
@@ -654,6 +796,46 @@ def _factory_config_facts(source: str) -> dict:
     }
 
 
+def _module_flask_app_exports(source: str) -> list[str]:
+    """Module-level names constructed from Flask, including aliased imports."""
+    tree = _parsed(source)
+    if tree is None:
+        return []
+    direct = {
+        alias.asname or alias.name
+        for statement in tree.body if isinstance(statement, ast.ImportFrom)
+        and statement.module == "flask"
+        for alias in statement.names if alias.name == "Flask"
+    }
+    modules = {
+        alias.asname or alias.name
+        for statement in tree.body if isinstance(statement, ast.Import)
+        for alias in statement.names if alias.name == "flask"
+    }
+    exports = set()
+    for statement in tree.body:
+        if not (
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and (
+                isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id in direct
+                or isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "Flask"
+                and isinstance(statement.value.func.value, ast.Name)
+                and statement.value.func.value.id in modules
+            )
+        ):
+            continue
+        exports.update(
+            target.id for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            ) if isinstance(target, ast.Name)
+        )
+    return sorted(exports)
+
+
 def _factory_database_config(files: dict[str, str], path: str) -> dict:
     """Resolve a simple config.from_object(mapping[factory_default]) DB URI source."""
     tree = _parsed(files.get(path, ""))
@@ -897,6 +1079,7 @@ def _resource_facts(source: str, helper_name: str) -> dict:
         return {
             "config_keys": [], "context_cache_members": [], "resource_files": [],
             "cleanup_functions": [], "initializer": "", "sqlite_cross_thread": False,
+            "row_factory_each_call": False,
         }
     functions = {
         node.name: node for node in tree.body
@@ -939,6 +1122,17 @@ def _resource_facts(source: str, helper_name: str) -> dict:
             and node.func.value.id == "sqlite3" and node.func.attr == "connect"
             for node in ast.walk(tree)
         ),
+        "row_factory_each_call": bool(helper and any(
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Attribute) and target.attr == "row_factory"
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+            for statement in helper.body
+        )),
     }
 
 
@@ -973,6 +1167,10 @@ def _click_command_contracts(files: dict[str, str]) -> list[dict]:
 
 def _click_registrar_contracts(files: dict[str, str]) -> list[dict]:
     """Top-level functions that register nested Click commands on an app-like object."""
+    imports: dict[tuple[str, str], tuple[str, str | None]] = {}
+    for provider in files:
+        for binding in imported_bindings_from_sources(files, provider):
+            imports[(binding.importer, binding.local)] = (provider, binding.symbol)
     contracts = []
     for path, source in files.items():
         tree = _parsed(source)
@@ -993,16 +1191,46 @@ def _click_registrar_contracts(files: dict[str, str]) -> list[dict]:
                 and node.value.value.id == receiver
                 for node in ast.walk(function)
             ):
+                cleanup_callbacks = set()
+                local_functions = {
+                    node.name for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                for call in (
+                    node for node in ast.walk(function)
+                    if isinstance(node, ast.Call) and node.args
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "teardown_appcontext"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == receiver
+                ):
+                    callback = ast.unparse(call.args[0])
+                    if callback in local_functions:
+                        cleanup_callbacks.add((path, callback))
+                        continue
+                    binding, _, member = callback.partition(".")
+                    imported = imports.get((path, binding))
+                    if imported is None:
+                        continue
+                    provider, symbol = imported
+                    function_name = symbol or member
+                    if function_name:
+                        cleanup_callbacks.add((provider, function_name))
                 contracts.append({
                     "module": path,
                     "function": function.name,
                     "receiver": receiver,
+                    "cleanup_callbacks": [
+                        {"provider": provider, "function": callback}
+                        for provider, callback in sorted(cleanup_callbacks)
+                    ],
                 })
     return sorted(contracts, key=lambda item: (item["module"], item["function"]))
 
 
 def _initializer_contracts(
     files: dict[str, str], planned: list[PlannedFile], owner: str, symbol: str,
+    member: str = "",
 ) -> list[dict]:
     roles = {item.path: item.role for item in planned}
     contracts = []
@@ -1015,15 +1243,17 @@ def _initializer_contracts(
         target = binding.local if binding.symbol == symbol else (
             f"{binding.local}.{symbol}" if binding.symbol is None else ""
         )
-        if target and any(
-            isinstance(node, ast.Call) and ast.unparse(node.func) == target
-            for node in ast.walk(tree)
-        ):
+        call_target = f"{target}.{member}" if target and member else target
+        call = next((
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == call_target
+        ), None)
+        if call is not None:
             contracts.append({
                 "factory": binding.importer,
                 "provider": owner,
                 "symbol": symbol,
-                "original_call": f"{target}(app)",
+                "original_call": ast.unparse(call),
             })
     return contracts
 
@@ -1123,7 +1353,9 @@ def _route_name_contracts(source: str) -> list[dict]:
             if not (
                 isinstance(decorator, ast.Call)
                 and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr == "route"
+                and decorator.func.attr in {
+                    "route", "get", "post", "put", "patch", "delete", "options",
+                }
                 and isinstance(decorator.func.value, ast.Name)
             ):
                 continue
@@ -1163,9 +1395,8 @@ def _view_decorator_contracts(source: str) -> list[dict]:
         return []
     contracts = []
     for function in (
-        node for node in tree.body
+        node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.args.args
     ):
         nested = {
             node.name: node for node in function.body
@@ -1181,32 +1412,72 @@ def _view_decorator_contracts(source: str) -> list[dict]:
                 isinstance(decorator, ast.Call)
                 and ast.unparse(decorator.func).split(".")[-1] == "wraps"
                 for decorator in wrapper.decorator_list
-            ):
+            ) and function.args.args:
                 contracts.append({
                     "function": function.name,
                     "parameter": function.args.args[0].arg,
                     "wrapper": name,
                 })
-    return contracts
+                continue
+            inner = {
+                node.name: node for node in wrapper.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            inner_returned = {
+                node.value.id for node in wrapper.body
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+            }
+            for inner_name in sorted(inner_returned & inner.keys()):
+                inner_wrapper = inner[inner_name]
+                if wrapper.args.args and any(
+                    isinstance(decorator, ast.Call)
+                    and ast.unparse(decorator.func).split(".")[-1] == "wraps"
+                    for decorator in inner_wrapper.decorator_list
+                ):
+                    contracts.append({
+                        "function": function.name,
+                        "container": wrapper.name,
+                        "parameter": wrapper.args.args[0].arg,
+                        "wrapper": inner_name,
+                    })
+    return [
+        contract for contract in contracts
+        if contract.get("container") or not any(
+            other.get("container") == contract["function"]
+            and other["parameter"] == contract["parameter"]
+            and other["wrapper"] == contract["wrapper"]
+            for other in contracts
+        )
+    ]
 
 
 def _factory_static_mount(files: dict[str, str], factory_path: str) -> dict:
     package = PurePosixPath(factory_path).parent
-    static_root = package / "static" if str(package) != "." else PurePosixPath("static")
-    has_static = any(
-        static_root == PurePosixPath(path)
-        or static_root in PurePosixPath(path).parents
-        for path in files
-    )
-    template_uses_static = any(
-        PurePosixPath(path).suffix.lower() in {".html", ".jinja", ".jinja2"}
-        and "static" in _TEMPLATE_URL_FOR.findall(source)
-        for path, source in files.items()
-    )
-    return (
-        {"path": "/static", "name": "static", "directory": static_root.as_posix()}
-        if has_static and template_uses_static else {}
-    )
+    tree = _parsed(files.get(factory_path, ""))
+    constructor = next((
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and ast.unparse(node.func).split(".")[-1] == "Flask"
+    ), None) if tree is not None else None
+    if constructor is None:
+        return {}
+    folder = next((
+        keyword.value for keyword in constructor.keywords
+        if keyword.arg == "static_folder"
+    ), ast.Constant("static"))
+    if isinstance(folder, ast.Constant) and folder.value is None:
+        return {}
+    if not (isinstance(folder, ast.Constant) and isinstance(folder.value, str)):
+        return {}
+    url_path = next((
+        keyword.value.value for keyword in constructor.keywords
+        if keyword.arg == "static_url_path"
+        and isinstance(keyword.value, ast.Constant)
+        and isinstance(keyword.value.value, str)
+    ), "/static")
+    directory = PurePosixPath(folder.value)
+    if not directory.is_absolute() and str(package) != ".":
+        directory = package / directory
+    return {"path": url_path, "name": "static", "directory": directory.as_posix()}
 
 
 def _mixed_form_routes(source: str) -> list[dict]:
@@ -1339,10 +1610,49 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
     framework registrations rather than preserved as provider methods.
     """
     protocols = []
+    framework_handler_exceptions: dict[str, set[str]] = {}
+    for source in files.values():
+        source_tree = _parsed(source)
+        if source_tree is None:
+            continue
+        imported = {
+            alias.asname or alias.name: (statement.module or "", alias.name)
+            for statement in source_tree.body if isinstance(statement, ast.ImportFrom)
+            and (statement.module or "").startswith("flask_")
+            for alias in statement.names
+        }
+        for function in (
+            node for node in ast.walk(source_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for decorator in function.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call) and decorator.args
+                    and ast.unparse(decorator.func).split(".")[-1] == "errorhandler"
+                    and isinstance(decorator.args[0], ast.Name)
+                    and decorator.args[0].id in imported
+                ):
+                    continue
+                module, name = imported[decorator.args[0].id]
+                framework_handler_exceptions.setdefault(module, set()).add(name)
     for provider, source in sorted(files.items()):
         tree = _parsed(source)
         if tree is None:
             continue
+        extension_constructors = {
+            alias.asname or alias.name: {
+                "module": statement.module or "", "name": alias.name,
+            }
+            for statement in tree.body if isinstance(statement, ast.ImportFrom)
+            and (statement.module or "").startswith("flask_")
+            for alias in statement.names
+        }
+        extension_modules = {
+            alias.asname or alias.name: alias.name
+            for statement in tree.body if isinstance(statement, ast.Import)
+            for alias in statement.names if alias.name.startswith("flask_")
+        }
+        extension_symbols = {}
         symbols = {
             target.id
             for statement in tree.body
@@ -1354,6 +1664,31 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
             )
             if isinstance(target, ast.Name)
         }
+        for statement in tree.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or not isinstance(
+                statement.value, ast.Call,
+            ):
+                continue
+            constructor = statement.value.func
+            origin = (
+                extension_constructors.get(constructor.id)
+                if isinstance(constructor, ast.Name)
+                else {
+                    "module": extension_modules[ast.unparse(constructor.value)],
+                    "name": constructor.attr,
+                }
+                if isinstance(constructor, ast.Attribute)
+                and ast.unparse(constructor.value) in extension_modules
+                else None
+            )
+            if origin is None:
+                continue
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            ):
+                if isinstance(target, ast.Name):
+                    extension_symbols[target.id] = origin
         if not symbols:
             continue
         bindings = imported_bindings_from_sources(files, provider)
@@ -1371,6 +1706,7 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
             attribute_members: set[str] = set()
             attribute_values: dict[str, str | int | float | bool | None] = {}
             callbacks: list[dict[str, str]] = []
+            context_manager_members: set[str] = set()
             consumers: set[str] = set()
             has_parameterized_decorator = False
             for consumer, local_roots in roots.items():
@@ -1380,6 +1716,13 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
                 literal_wrappers = set(_flask_babel_literal_bindings(
                     files.get(consumer, ""),
                 ))
+                context_calls = {
+                    id(item.context_expr)
+                    for with_node in ast.walk(consumer_tree)
+                    if isinstance(with_node, (ast.With, ast.AsyncWith))
+                    for item in with_node.items
+                    if isinstance(item.context_expr, ast.Call)
+                }
                 for node in ast.walk(consumer_tree):
                     if (
                         isinstance(node, ast.Call)
@@ -1388,6 +1731,8 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
                     ):
                         callable_members.add(node.func.attr)
                         consumers.add(consumer)
+                        if id(node) in context_calls:
+                            context_manager_members.add(node.func.attr)
                     if isinstance(node, (ast.Assign, ast.AnnAssign)):
                         targets = (
                             node.targets if isinstance(node, ast.Assign)
@@ -1452,18 +1797,74 @@ def _decorated_provider_protocols(files: dict[str, str]) -> list[dict]:
                                     "function": function.name,
                                     "source": ast.unparse(function),
                                 })
-            if members and not has_parameterized_decorator:
+            constructor = extension_symbols.get(symbol, {})
+            if constructor.get("module") == "flask_mail":
+                message_consumers = {
+                    path for path, candidate in files.items()
+                    if any(
+                        isinstance(statement, ast.ImportFrom)
+                        and statement.module == "flask_mail"
+                        and any(alias.name == "Message" for alias in statement.names)
+                        for statement in ((_parsed(candidate) or ast.Module(body=[])).body)
+                    )
+                }
+                if message_consumers:
+                    callable_members.add("Message")
+                    consumers.update(message_consumers)
+            if (
+                members
+                or symbol in extension_symbols
+                and (callable_members or attribute_members)
+                and extension_symbols[symbol]["module"] != "flask_sqlalchemy"
+            ) and not has_parameterized_decorator:
                 protocols.append({
                     "provider": provider,
                     "symbol": symbol,
+                    "constructor": extension_symbols.get(symbol, {}),
                     "decorator_members": sorted(members),
                     "callable_members": sorted(callable_members),
+                    "context_manager_members": sorted(context_manager_members),
+                    "exception_members": sorted(framework_handler_exceptions.get(
+                        extension_symbols.get(symbol, {}).get("module", ""), set(),
+                    )),
                     "attribute_members": sorted(attribute_members),
                     "attribute_values": dict(sorted(attribute_values.items())),
                     "callbacks": sorted(callbacks, key=lambda item: item["function"]),
                     "consumers": sorted(consumers - {provider}),
                 })
     return protocols
+
+
+def _flask_form_contracts(files: dict[str, str]) -> list[dict]:
+    """Find FlaskForm subclasses and the modules that construct them."""
+    contracts = []
+    for provider, source in sorted(files.items()):
+        tree = _parsed(source)
+        if tree is None:
+            continue
+        bases = {
+            alias.asname or alias.name
+            for statement in tree.body if isinstance(statement, ast.ImportFrom)
+            and statement.module == "flask_wtf"
+            for alias in statement.names if alias.name == "FlaskForm"
+        }
+        classes = sorted(
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+            and any(ast.unparse(base) in bases for base in node.bases)
+        )
+        if not classes:
+            continue
+        consumers = sorted({
+            binding.importer
+            for binding in imported_bindings_from_sources(files, provider)
+            if binding.symbol in classes
+        })
+        contracts.append({
+            "provider": provider,
+            "classes": classes,
+            "consumers": consumers,
+        })
+    return contracts
 
 
 def _factory_bindings_by_consumer(
@@ -2014,9 +2415,19 @@ def _artifact_capability_requirements(
             "render_template",
             *_exercised_flask_template_functions(files, consumers),
         }
-        requirements["template_rendering"]["required_exports"] = sorted(functions)
+        exposes_environment = any(
+            isinstance(node, ast.Attribute)
+            and node.attr in {"add_app_template_filter", "template_filter"}
+            for path in consumers
+            if (tree := _parsed(files.get(path, ""))) is not None
+            for node in ast.walk(tree)
+        )
+        requirements["template_rendering"]["required_exports"] = sorted({
+            *functions, *({"templates"} if exposes_environment else set()),
+        })
         requirements["template_rendering"]["required_export_kinds"] = {
-            name: "function" for name in sorted(functions)
+            **{name: "function" for name in sorted(functions)},
+            **({"templates": "variable"} if exposes_environment else {}),
         }
     if "authentication" in requirements:
         bindings = _flask_login_consumer_contracts(files)

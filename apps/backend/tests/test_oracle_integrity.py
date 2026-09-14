@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from portage_agent.agent.nodes.common import read_file
 from portage_agent.agent.nodes.oracle import (
     build_oracle_manifest,
     classify_test_strategy,
@@ -100,6 +101,23 @@ def runner(app):
     no_yield = source.replace("yield tmp_path", "return tmp_path")
     assert any("dependencies/lifecycle" in v for v in oracle_violations(entry, no_dependency))
     assert any("dependencies/lifecycle" in v for v in oracle_violations(entry, no_yield))
+
+
+def test_oracle_reads_protected_files_beyond_prompt_context_limit(tmp_path):
+    padding = "# protected test padding\n" * 400
+    source = padding + "def test_late():\n    assert 2 + 2 == 4\n"
+    root = _repo(tmp_path, {"tests/test_long.py": source})
+    entry = build_oracle_manifest(root)["tests/test_long.py"]
+
+    full = read_file(root, "tests/test_long.py", limit=None)
+
+    assert full == source
+    assert len(full) > 8000
+    assert oracle_violations(entry, full) == []
+    assert any(
+        "test set changed" in violation
+        for violation in oracle_violations(entry, full.replace("test_late", "test_changed"))
+    )
 
 
 def test_strategy_prefers_adapter_and_marks_direct_flask_globals_unsupported():

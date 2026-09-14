@@ -104,11 +104,25 @@ def _validate_artifact_plan(
             ):
                 raise TypeError("completion audit must be a list of objects")
             json.dumps(completion)
+            originally_empty = {
+                item["path"] for item in frozen if not item.get("exports")
+            }
+            still_empty = [
+                item["path"] for item in completed
+                if item["path"] in originally_empty and not item.get("exports")
+            ]
+            if still_empty:
+                raise ArchitectPlanRejection([
+                    f"artifact {path} must declare at least one export"
+                    for path in still_empty
+                ])
             frozen = parse_artifact_plan(
                 json.dumps(completed),
                 existing_files=set(files),
                 rewrite_paths={item.path for item in planned},
             )
+        except ArchitectPlanRejection:
+            raise
         except Exception as exc:
             raise ArtifactContractMaterializationError(
                 f"recipe artifact contract materialization failed: {exc}"

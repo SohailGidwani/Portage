@@ -22,6 +22,7 @@ from portage_agent.eval.harness import (  # noqa: E402
 
 async def test_worker_reconciliation_persists_one_idempotent_run_row(tmp_path):
     job_id = uuid.uuid4()
+    poison_id = uuid.uuid4()
     report = tmp_path / "report.json"
     report.write_text(json.dumps({
         "tasks_total": 1,
@@ -52,7 +53,18 @@ async def test_worker_reconciliation_persists_one_idempotent_run_row(tmp_path):
         test_summary={"passed": 1, "total": 1, "tree_state": "migrated"},
     )
     async with AsyncSessionLocal() as session, session.begin():
-        session.add(job)
+        session.add_all([
+            job,
+            Job(
+                id=poison_id,
+                repo_url="/fixtures/flask_app",
+                migration_recipe="flask_to_fastapi",
+                status="done",
+                config={EVAL_CONFIG_KEY: {**metadata, "suite": "x" * 65}},
+                report_path=str(report),
+                test_summary={"passed": 1, "total": 1, "tree_state": "migrated"},
+            ),
+        ])
 
     try:
         assert await reconcile_completed_eval_runs() >= 1
@@ -67,7 +79,7 @@ async def test_worker_reconciliation_persists_one_idempotent_run_row(tmp_path):
     finally:
         async with AsyncSessionLocal() as session, session.begin():
             await session.execute(delete(EvalRun).where(EvalRun.job_id == job_id))
-            await session.execute(delete(Job).where(Job.id == job_id))
+            await session.execute(delete(Job).where(Job.id.in_([job_id, poison_id])))
 
 
 async def test_leaderboard_counts_only_migrated_trees():
