@@ -74,8 +74,8 @@ flowchart LR
     V -->|more batches| E
     V -->|pass| IN[Integrate full suite]
     V -->|fail| R[Recover]
-    IN -->|one bounded repair| R
-    R -->|regenerate| E
+    IN -->|classify failure| R
+    R -->|attributed repair or injected retry| E
     R -->|replan| P
     R -->|stop honestly| RP[Report]
     IN -->|pass or budget exhausted| RP
@@ -103,8 +103,9 @@ One autonomous run follows this path:
    repairs the plan, escalates the model tier, or rolls back. Identical failures are
    fingerprinted and bounded. Ambiguous failures go directly to Report with the current
    draft retained; their last result is labeled as verification-subset or integration evidence.
-6. **Integrate** runs the authoritative full suite. One reserved recovery pass can repair
-   regressions visible only at full-suite scope.
+6. **Integrate** runs the authoritative full suite. Failures can enter Recover for
+   classification; ambiguous failures stop without regeneration. The explicit
+   integration-only fault scenario retains its reserved retry.
 7. **Report** recomputes the diff, reloads task truth from Postgres, checks oracle
    integrity, records cost/recovery evidence, and assigns `success`, `failed`, or
    `unsupported`.
@@ -430,8 +431,10 @@ failure taxonomy are documented in:
 
 ### Run a development grid
 
-This launches 21 paid model runs against the development corpus. Cost varies by model and
-failure path; inspect `.env` limits first.
+With the current ten-repository development corpus, this schedules **30 paid migration
+runs** (10 repositories × K=3, baseline only). Cost varies by model and failure path;
+inspect `.env` limits first. This is a reference command, not a next step: paid evaluation
+remains parked pending an explicit decision to resume.
 
 ```bash
 docker compose run --rm worker python -m portage_agent.eval \
@@ -452,8 +455,10 @@ v1, but it cannot improve the published 0/9 one-shot held-out result.
 - task attempts record tier, model, tokens, cost, action, and failure context;
 - generated drafts are retained for repair instead of blindly regenerated;
 - verification fingerprints combine normalized failure output and the exact diff;
-- the second identical failure requests diagnosis and the third stops the no-progress loop;
-- Integrate has one separately budgeted recovery visit;
+- ambiguous failures stop with retained evidence before diagnosis or batch regeneration;
+- eligible attributed repairs and explicit injected-fault retries retain fingerprint-based
+  no-progress limits and fixed budgets;
+- the explicit integration-only fault scenario retains one separately budgeted recovery visit;
 - successful batches, recovery decisions, unsupported seams, and escalation rescues are
   first-class report fields.
 
@@ -544,7 +549,7 @@ infra/           deployment infrastructure
 | 5 | Rich CLI and MCP tools | ✅ |
 | 6 | Dashboard-as-proof, evaluation lab, methodology package | ✅ |
 | 7 | GitHub auth, isolation, redaction, demo cost protection | ✅ |
-| 8 | Hosted deployment | ⏸ parked while recipe depth improves |
+| 8 | Hosted deployment | ⏸ parked alongside recipe expansion; demonstration frozen |
 
 ### Recipe Excellence path
 
