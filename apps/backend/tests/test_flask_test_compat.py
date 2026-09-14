@@ -50,11 +50,13 @@ def test_client_response_config_and_context_facades(compat):
     with wrapped.app_context() as active:
         assert active is wrapped
     with wrapped.test_client() as client:
+        assert client.application is wrapped._app
         response = client.get("/json")
         assert response.status_code == 200
         assert response.get_json() == {"ok": True}
         assert response.get_data(as_text=True)
         assert response.data
+        assert response.mimetype == "application/json"
 
 
 def test_client_uses_flask_redirect_default_and_preserves_explicit_follow(compat):
@@ -67,8 +69,11 @@ def test_client_uses_flask_redirect_default_and_preserves_explicit_follow(compat
     client = compat.adapt_app(app).test_client()
     response = client.get("/redirect")
     assert response.status_code == 302
-    assert response.headers["location"] == "/json"
-    assert client.get("/redirect", follow_redirects=True).status_code == 200
+    assert response.location == "/json"
+    assert b'<a href="/json">' in response.data
+    followed = client.get("/redirect", follow_redirects=True)
+    assert followed.status_code == 200
+    assert str(followed.request.url) == "http://localhost/json"
 
 
 def test_app_context_delegates_to_application_owned_context(compat):

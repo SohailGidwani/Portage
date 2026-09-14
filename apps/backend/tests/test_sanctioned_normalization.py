@@ -213,7 +213,10 @@ def test_architect_checklist_is_exhaustive_packable_and_shared_with_policy():
     }
     assert recipe.artifact_plan_violations(
         [combined_owner], ARCHITECTURE_FILES, planned,
-    ) == []
+    ) == [
+        "artifact pkg/runtime.py combines the FastAPI application facade with request "
+        "middleware; assign direct_test_surface to a separate owner"
+    ]
 
     incomplete = {
         **combined_owner,
@@ -279,9 +282,15 @@ def test_materializer_completes_all_deterministic_contract_facts_once():
     assert exports["g"]["kind"] == "variable"
     assert exports["session"]["kind"] == "variable"
     assert exports["RuntimeSurface"]["members"] == [
-        "app_context", "test_cli_runner", "test_client", "testing",
+        "app_context", "get_request_context", "manage_session", "test_cli_runner",
+        "test_client", "testing",
     ]
-    assert recipe.artifact_plan_violations(completed, ARCHITECTURE_FILES, planned) == []
+    assert recipe.artifact_plan_violations(
+        completed, ARCHITECTURE_FILES, planned,
+    ) == [
+        "artifact pkg/runtime.py combines the FastAPI application facade with request "
+        "middleware; assign direct_test_surface to a separate owner"
+    ]
     assert audit[0]["path"] == "pkg/runtime.py"
     assert audit[0]["added_exports"] == [
         {"name": "render_template", "kind": "function"},
@@ -292,10 +301,16 @@ def test_materializer_completes_all_deterministic_contract_facts_once():
             {"name": "get_request_context", "kind": "function"},
             {"name": "manage_session", "kind": "function"},
         ]
-    assert audit[0]["added_class_members"] == [{
-        "export": "RuntimeSurface",
-        "members": ["app_context", "test_cli_runner", "testing"],
-    }]
+    assert audit[0]["added_class_members"] == [
+        {
+            "export": "RuntimeSurface",
+            "members": ["app_context", "test_cli_runner", "testing"],
+        },
+        {
+            "export": "RuntimeSurface",
+            "members": ["get_request_context", "manage_session"],
+        },
+    ]
 
     repeated, repeated_audit = recipe.materialize_artifact_contracts(
         completed, ARCHITECTURE_FILES, planned,

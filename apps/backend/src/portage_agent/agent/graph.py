@@ -81,7 +81,7 @@ def build_graph(checkpointer):
         "recover", _after_recover,
         {
             "execute": "execute", "plan": "plan", "verify": "verify",
-            "integrate": "integrate",
+            "integrate": "integrate", "report": "report",
         },
     )
     builder.add_conditional_edges(

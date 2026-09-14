@@ -1,7 +1,6 @@
 """Framework plumbing; behavioural tests below remain framework-neutral."""
 
 import pytest
-
 from structapp import create_app
 from structapp.db import get_db, init_db
 

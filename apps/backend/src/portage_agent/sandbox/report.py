@@ -31,7 +31,7 @@ class TestReport:
 
     @property
     def ok(self) -> bool:
-        return self.failed == 0 and self.errors == 0 and self.total > 0
+        return self.failed == 0 and self.errors == 0 and self.passed > 0
 
     def to_dict(self) -> dict:
         return asdict(self)

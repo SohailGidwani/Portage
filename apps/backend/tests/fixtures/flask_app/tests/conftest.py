@@ -9,7 +9,6 @@ framework.
 """
 
 import pytest
-
 from flaskapp import store
 from flaskapp.app import create_app
 

@@ -67,7 +67,7 @@ class GraphState(TypedDict, total=False):
     # --- Recover (Phase 3) ---
     recover_visits: int  # total audit count for every Recover entry
     recover_budget_used: int  # only non-progress/whole-cut failures debit this budget
-    recover_route: str  # "execute" | "plan" | "integrate" — Recover's routing decision
+    recover_route: str  # "execute" | "plan" | "verify" | "integrate" | "report"
     replan_requested: bool  # set by Recover, consumed by Plan (append missed tasks)
     recovery_actions: Annotated[list[dict], operator.add]  # audit log for report/frontend
     integration_recovery_visits: int

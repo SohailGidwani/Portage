@@ -1,5 +1,13 @@
 # Portage: Technical Deep Dive
 
+> **Standing, September 13, 2026:** this document retains historical architecture and
+> evaluation evidence. The [project page](./portage.md) and repository README hold the
+> current standing: three later autonomous development K1 greens, frozen R5 v1 at 0/9,
+> and a red Microblog preservation replay. The remediation goal is stopped with incomplete
+> preservation. The demonstration is frozen. Current recovery stops ambiguous failures
+> directly at Report, retaining evidence; older batch-regeneration descriptions below
+> describe the historical implementation. This policy has local tests, not new paid gates.
+
 > Portfolio deep dive. Pair with [`portage.md`](./portage.md) for the project page. Asset paths are relative to this file (`../…`). Every number below comes from the `runs`/`metrics` tables or from documented DoD scripts — nothing hand-waved.
 
 | | |
@@ -555,7 +563,7 @@ Every red and engine error in that grid was root-caused off its own checkpoint �
 | 4 | extension-surface gaps | watchlist (2 runs) | Flask-SQLAlchemy's `db.Model`/session surface only partly realized; an invalid FastAPI-shaped session-middleware import slipped past generation; inherited uppercase config was dropped → `KeyError: 'SECRET_KEY'` | SQLAlchemy extension providers now realize their full frozen surface (`Model`, `metadata`, `event`, `case`, `session`, `first_or_404`, `get_or_404`, `init_app`, `paginate`) for both class and mapping facades; invalid middleware imports normalized to the real Starlette class; `config.from_object` completion merges in every missing uppercase default |
 | 5 | import-cycle collection failure | microblog (3 runs, identical) | `app/__init__.py` imports `app.main.routes.before_request`; `app/main/routes.py` imports `db` from the still-initializing `app` package — a cycle the source never had | new import cycles are now rejected twice: once at generation time (provider files may not import their declared consumers) and once at Verify (source vs. migrated import graph compared before any sandbox starts) |
 
-All five classes are closed on the current engine, and every fix is source-derived (AST facts, frozen contracts, import-graph comparison) — none select a repository, file path, or test name.
+These five classes were addressed in that historical development batch with source-derived fixes (AST facts, frozen contracts, import-graph comparison), not repository-identity rules. This does not establish current-version regression closure.
 
 ### Movement, in one line per repo
 
@@ -589,7 +597,7 @@ The engine that produced the 61.9%/38.1% grid above is not the engine running to
 | v1 | 2/5 | 5/5 |
 | v2 | 3/5 | 3/5 |
 | v3 | 3/5 | 5/5 |
-| **v4** (current code) | **5/5** | **5/5** |
+| **v4** (July gate version) | **5/5** | **5/5** |
 
 Items, RESTX, Structural, and Minimal each independently hold their own **3/3** K=3 gate on the same code.
 
@@ -902,7 +910,10 @@ This ledger feeds: recovery timelines in the UI, escalation-rescue queries, per-
 
 ### Phase R (current) — recipe excellence
 
-After Phase 6, external review made the call that shapes everything since: the strongest claim is *depth*, not breadth — “reliably performs one genuinely difficult migration, measures where it fails, and recovers better than a generic coding agent.” Deployment was **parked by decision** (the repo is already deploy-ready) until the recipe meets a measured readiness bar.
+After Phase 6, development focused on one migration and explicit reliability measurements.
+The historical aspiration of outperforming a generic coding agent has not been established
+by a controlled comparison. Public execution remains parked; deployment configuration alone
+does not establish readiness for untrusted inputs.
 
 | Stage | Content | Status |
 |---|---|---|
@@ -912,15 +923,15 @@ After Phase 6, external review made the call that shapes everything since: the s
 | R4 | Artifact-producing plans + idiom profiles ([§06b](#06b--artifact-producing-plans)) | ✅ shipped, incl. extension surfaces (`flask_restx`, `flask_sqlalchemy`) |
 | R4.1 | Coherent-cut preservation, one generation gate, import-cycle rejection, durable eval rows | ✅ shipped |
 | R5 | **Held-out validation** — freeze three unseen repos; publish dev vs held-out side by side | ⚠️ v1 measured **0/9 green** |
-| R5.1 | Generalize from R5 failure classes while preserving every development gate; freeze a fresh unseen set | next |
+| R5.1 | Remediate R5 failures while preserving existing gates | Stopped with incomplete preservation; three later K1 greens, Microblog replay red |
 
 **Readiness bar (set before the work):** JSON-API tier ≥90% green · template/session
 tier 70–80% · extension tier supported or honestly rejected · no fault-scenario
 degradation · no false greens or weakened tests · **reproduced on held-out
 repositories**. The development side is largely met, but R5 v1 failed the required final
-clause at 0/9. That result is now the governing constraint. If its repos shape fixes, they
-become development inputs; the next honest validation needs ClipBin plus at least two
-newly scouted untouched repositories and must publish v1 beside it.
+clause at 0/9. All three repositories subsequently became development inputs. Further
+recipe work and fresh held-out evaluation are parked; any resumption needs a separately
+authorized experiment and must keep v1 published beside any new result.
 
 ---
 
@@ -951,21 +962,22 @@ green ⇔ full_suite_pass ∧ all_tasks_done ∧ skipped_tasks == 0
 | `drop_task` | Replan |
 
 ### Reliability boundary (one sentence)
-Portage converges strongly on the development corpus, but R5 v1 scored 0/9 on unseen repositories; **general capability realization—not another known-corpus grid—is the frontier now.**
+Portage has historical development greens and three later remediation K1 greens, but R5 v1 remains 0/9 and current preservation is incomplete; the goal is stopped, not complete.
 
-### Headline numbers (current through 2026-07-27)
+### Historical numbers and September 13 stopping decision
 | Metric | Value |
 |---|---|
 | Reliability gate | **Flaskr 5/5 · Watchlist 5/5 at K=5**; Items/RESTX/Structural/Minimal 3/3 at K=3 |
 | Full-corpus confirmation | **6/7 green**, one sample each, `r4-final-external-k1-20260723` |
-| flaskr (acceptance benchmark) | 24/24 tests · 12/12 tasks · 0 recovery · $0.15–0.23 across every measured sample |
+| flaskr (selected historical greens) | 24/24 tests; selected successful samples cost $0.15–0.23, not a range across all attempts |
 | watchlist | 15/15 tests · 13/13 tasks · 0–1 recovery · $0.22 |
-| microblog | accepted-plan replay 26/26 tasks, 4/4 tests, 0 recovery; autonomous proposal variance remains |
+| microblog | Historical replay 26/26 tasks and 4/4 tests; latest preservation replay `16ca313f` red, 1/26 tasks, restored-coherent tree, $2.056208 |
 | **R5 held-out v1** | **0/9 strict green** · architect 6/9 · trees 4 migrated / 5 restored / 0 hybrid |
 | R5 accounting | 119 LLM calls · 19 recovery visits · $3.8643 · 9/9 reports · 0 missing run rows |
-| Oracle integrity | R5 `ws-example` test loss detected at 0.75; no weakened result counted green |
-| Backend test suite | 303 passing |
-| Still pending before launch | generalize R5 failures · preserve development/fault gates · validate on a fresh unseen set |
+| Oracle integrity | R5 `ws-example` 0.75 was a truncated-reader false positive, corrected in August; all three original attempts remain red for independent failures |
+| Later remediation | ws-example 42/42, silicon 34/34, flask-email-login 18/18; one later autonomous K1 green each, development evidence only |
+| Backend test suite | September stabilization: 357 passing, Ruff clean; not migration-reliability evidence |
+| Stopping decision | Incomplete preservation; demo frozen. New recipe work, paid evaluation, fresh held-out runs, and launch hardening are parked |
 
 ### Asset index (copy with this folder)
 ```

@@ -140,12 +140,14 @@ def non_python_sources(
     return out
 
 
-def read_file(root: str, rel: str, *, limit: int = 8000) -> str | None:
+def read_file(root: str, rel: str, *, limit: int | None = 8000) -> str | None:
     p = Path(root) / rel
     if not p.exists():
         return None
     text = p.read_text(errors="replace")
-    return text if len(text) <= limit else text[:limit] + "\n# … (truncated)\n"
+    return text if limit is None or len(text) <= limit else (
+        text[:limit] + "\n# … (truncated)\n"
+    )
 
 
 def write_file(root: str, rel: str, content: str) -> str:
@@ -331,6 +333,10 @@ def imported_bindings_from_sources(
     are skipped and star imports are deliberately ignored.
     """
     wanted = _module_names(target)
+    target_is_package = Path(target).name == "__init__.py"
+    source_modules = {
+        module for rel in sources if rel != target for module in _module_names(rel)
+    }
     out: list[ModuleBinding] = []
     for rel, src in sources.items():
         if rel == target:
@@ -350,6 +356,14 @@ def imported_bindings_from_sources(
                 elif mod in wanted:
                     for a in node.names:
                         if a.name != "*":
+                            candidate = f"{mod}.{a.name}".lstrip(".")
+                            if (
+                                target_is_package and candidate in source_modules
+                                and not _package_reexports_symbol(
+                                    sources, mod, a.name,
+                                )
+                            ):
+                                continue
                             out.append(ModuleBinding(rel, a.name, a.asname or a.name))
                 else:
                     # `from pkg import db` / `from .pkg import db` imports the target
@@ -607,7 +621,7 @@ def _planned_imports(
             elif isinstance(node, ast.Import):
                 mods.extend(a.name for a in node.names)
         for mod in mods:
-            dep = by_module.get(mod) or by_module.get(mod.split(".")[-1])
+            dep = by_module.get(mod)
             if dep and dep != path:
                 deps[path].add(dep)
     return deps

@@ -366,7 +366,7 @@ async def persist_completed_eval_job(job_id: uuid.UUID) -> bool:
 
 
 async def reconcile_completed_eval_runs() -> int:
-    """Backfill terminal eval jobs whose harness died before writing `runs`."""
+    """Backfill valid terminal eval jobs without letting one bad row block the rest."""
     async with AsyncSessionLocal() as session:
         job_ids = (
             await session.execute(
@@ -379,9 +379,13 @@ async def reconcile_completed_eval_runs() -> int:
                 )
             )
         ).scalars().all()
+    reconciled = 0
     for job_id in job_ids:
-        await persist_completed_eval_job(job_id)
-    return len(job_ids)
+        try:
+            reconciled += int(await persist_completed_eval_job(job_id))
+        except Exception:
+            log.exception("eval run reconciliation skipped invalid job=%s", job_id)
+    return reconciled
 
 
 async def _persist_metrics(cfg: HarnessConfig, corpus_name: str, scenario: str,

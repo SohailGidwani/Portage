@@ -192,7 +192,8 @@ async def verify_node(state: GraphState) -> GraphState:
     # skip instead of porting them). Zero passing tests is a failure to recover from,
     # never a pass.
     passed = (
-        summary.get("passed", 0) > 0
+        result.exit_code == 0
+        and summary.get("passed", 0) > 0
         and summary.get("failed", 0) == 0
         and summary.get("errors", 0) == 0
     )
@@ -276,7 +277,8 @@ async def integrate_node(state: GraphState) -> GraphState:
         workdir, test_args, env=_test_env(cfg),
     )  # [] => whole suite
     passed = (
-        summary.get("passed", 0) > 0
+        result.exit_code == 0
+        and summary.get("passed", 0) > 0
         and summary.get("failed", 0) == 0
         and summary.get("errors", 0) == 0
     )

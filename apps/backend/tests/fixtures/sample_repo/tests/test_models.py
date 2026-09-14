@@ -1,7 +1,6 @@
 """Tests exercising models + service. Pass with pydantic v2 present."""
 
 import pytest
-
 from sample.models import User, create_user, validate_email
 from sample.service import register_user
 

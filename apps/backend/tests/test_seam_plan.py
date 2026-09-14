@@ -1,8 +1,11 @@
 """R1.1: deterministic framework-seam decisions and selective coupled units."""
 
 import ast
+import asyncio
 import json
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 from portage_agent.agent.nodes.artifact_plan import artifact_planned_files
 from portage_agent.agent.nodes.common import (
@@ -15,6 +18,7 @@ from portage_agent.agent.nodes.execute import (
     all_generation_violations,
     framework_seam_violations,
     planned_capability_consumer_violations,
+    planned_provider_import_violations,
     seam_sections,
 )
 from portage_agent.agent.nodes.plan import complete_unit_dependencies, drop_recipe_task
@@ -318,7 +322,6 @@ def create_app(test_config=None):
         "symbol": "init_app",
         "original_call": "db.init_app(app)",
     }]
-
     bad = """\
 import click
 import sqlite3
@@ -386,6 +389,51 @@ def init_app(app):
         "do not store a live sqlite3 connection directly in ContextVar" in item
         for item in framework_seam_violations(
             direct_contextvar, plan, "pkg/db.py",
+        )
+    )
+    normalized_local = recipe.normalize_generated(
+        "pkg/db.py", direct_contextvar, plan,
+    )
+    assert "current_app" not in normalized_local
+    assert " g." not in normalized_local
+    namespace = {}
+    exec(normalized_local, namespace)
+    namespace["init_app"](SimpleNamespace(
+        state=SimpleNamespace(config={"DATABASE": ":memory:"}),
+    ))
+    first = namespace["get_db"]()
+    assert namespace["get_db"]() is first
+    namespace["close_db"]()
+    assert namespace["get_db"]() is not first
+    namespace["close_db"]()
+    assert framework_seam_violations(
+        normalized_local, plan, "pkg/db.py",
+    ) == []
+
+    plan["decisions"]["ambient"] = {
+        "kind": "ambient_context_runtime",
+        "files": ["pkg/db.py", "pkg/runtime.py"],
+        "runtime_providers": ["pkg/runtime.py"],
+        "current_app_consumers": ["pkg/db.py"],
+    }
+    normalized_context = recipe.normalize_generated(
+        "pkg/db.py",
+        direct_contextvar.replace(
+            "sqlite3.connect(DATABASE,",
+            "sqlite3.connect(g.config['DATABASE'],",
+        ),
+        plan,
+    )
+    assert "from pkg.runtime import current_app, g" in normalized_context
+    assert "if 'db' not in g:" in normalized_context
+    assert "g.db = sqlite3.connect(" in normalized_context
+    assert "sqlite3.connect(current_app.config['DATABASE']" in normalized_context
+    assert "check_same_thread=False" in normalized_context
+    assert not any(
+        "live sqlite3 connection directly in ContextVar" in item
+        or "frozen `g` may cache" in item
+        for item in framework_seam_violations(
+            normalized_context, plan, "pkg/db.py",
         )
     )
 
@@ -481,6 +529,49 @@ def create_app():
     )
 
 
+def test_resource_row_factory_reset_keeps_source_call_frequency():
+    files = {
+        "pkg/db.py": (
+            "import sqlite3\n"
+            "from flask import current_app, g\n"
+            "def get_db():\n"
+            "    if 'db' not in g:\n"
+            "        g.db = sqlite3.connect(current_app.config['DATABASE'])\n"
+            "    g.db.row_factory = sqlite3.Row\n"
+            "    return g.db\n"
+            "def close_db(error=None):\n"
+            "    db = g.pop('db', None)\n"
+            "    if db is not None: db.close()\n"
+        ),
+    }
+    planned = [_pf("pkg/db.py", "support", "request_context")]
+    manifest = {"pkg/db.py::get_db": {
+        "module": "pkg/db.py", "symbol": "get_db", "preserve_shape": True,
+        "additional_exports": ["get_db_dep"],
+    }}
+    plan = recipe.build_seam_plan(files, planned, manifest, [])
+    generated = (
+        "import sqlite3\n"
+        "from pkg.context import current_app, g\n"
+        "def get_db():\n"
+        "    if 'db' not in g:\n"
+        "        g.db = sqlite3.connect(current_app.config['DATABASE'])\n"
+        "        g.db.row_factory = sqlite3.Row\n"
+        "    return g.db\n"
+        "def close_db(error=None): g.pop('db', None)\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/db.py", generated, plan)
+    helper = next(
+        node for node in ast.parse(normalized).body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_db"
+    )
+
+    assert isinstance(helper.body[-3], ast.If)
+    assert ast.unparse(helper.body[-2]).endswith(".row_factory = sqlite3.Row")
+    assert isinstance(helper.body[-1], ast.Return)
+
+
 def test_factory_contract_preserves_alias_and_implicit_static_endpoint():
     files = {
         "pkg/__init__.py": """\
@@ -521,6 +612,58 @@ def create_app():
 """
     assert framework_seam_violations(good, plan, "pkg/__init__.py") == []
 
+    indirect = good.replace(
+        "def create_app():",
+        "def create_app():\n    base_dir = Path(__file__).resolve().parent",
+    ).replace(
+        "Path(__file__).parent / 'static'", "str(base_dir / 'static')",
+    )
+    normalized = recipe.normalize_generated("pkg/__init__.py", indirect, plan)
+    assert "directory=Path(__file__).resolve().parent / 'static'" in normalized
+    assert "check_dir=False" in normalized
+    assert framework_seam_violations(
+        normalized, plan, "pkg/__init__.py",
+    ) == []
+
+    false_package_path = good.replace(
+        "StaticFiles(directory=Path(__file__).parent / 'static')",
+        "StaticFiles(directory='static')",
+    ).replace(
+        "from fastapi.staticfiles import StaticFiles",
+        "from fastapi.staticfiles import StaticFiles\n"
+        "from fastapi.templating import Jinja2Templates\n"
+        "templates = Jinja2Templates(directory='templates')",
+    ).replace(
+        "async def index():", "openapi = Path(__file__).parent / 'static'\nasync def index():",
+    )
+    assert any(
+        "mounting StaticFiles" in item
+        for item in framework_seam_violations(
+            false_package_path, plan, "pkg/__init__.py",
+        )
+    )
+    realized_static = recipe.normalize_generated(
+        "pkg/__init__.py", false_package_path, plan,
+    )
+    assert "directory=Path(__file__).resolve().parent / 'static'" in realized_static
+    assert "check_dir=False" in realized_static
+    assert "def _portage_url_for(context, name, /, **path_params):" in realized_static
+    assert "path_params.pop('filename')" in realized_static
+    assert framework_seam_violations(
+        realized_static, plan, "pkg/__init__.py",
+    ) == []
+
+    already_relative = good.replace(
+        "from fastapi.staticfiles import StaticFiles",
+        "from fastapi.staticfiles import StaticFiles\n"
+        "from fastapi.templating import Jinja2Templates\n"
+        "templates = Jinja2Templates(directory=Path(__file__).parent / 'templates')",
+    )
+    realized_relative = recipe.normalize_generated(
+        "pkg/__init__.py", already_relative, plan,
+    )
+    assert "def _portage_url_for(context, name, /, **path_params):" in realized_relative
+
     missing_alias = good.replace(
         "    app.add_api_route('/', index, name='index')\n", "",
     )
@@ -529,7 +672,6 @@ def create_app():
     )
     assert "name='index'" in realized
     assert framework_seam_violations(realized, plan, "pkg/__init__.py") == []
-
     invalid_alias = missing_alias.replace(
         "    return app\n",
         "    app.router.routes.append(app.router.url_path_for('blog.index').route('/'))\n"
@@ -557,6 +699,35 @@ def create_app():
     )
     assert "@asynccontextmanager\nasync def lifespan(app):" in realized
     assert framework_seam_violations(realized, plan, "pkg/__init__.py") == []
+
+
+def test_default_flask_static_endpoint_is_realized_from_python_sources_only():
+    files = {
+        "pkg/__init__.py": (
+            "from flask import Flask\n"
+            "def create_app(): return Flask(__name__)\n"
+        ),
+        "pkg/views.py": (
+            "from flask import Blueprint, render_template\n"
+            "bp = Blueprint('page', __name__)\n"
+            "@bp.route('/')\n"
+            "def index(): return render_template('index.html')\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = (
+        "from fastapi import FastAPI\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    return app\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/__init__.py", generated, plan)
+
+    assert "app.mount('/static'" in normalized
+    assert "check_dir=False" in normalized
+    assert "Path(__file__).resolve().parent / 'static'" in normalized
 
 
 def test_blueprint_route_names_are_frozen_realized_and_checked():
@@ -649,6 +820,29 @@ bp.add_api_route('/logout', logout, name='wrong')
     assert framework_seam_violations(imperative, plan, "pkg/auth.py") == []
 
 
+def test_blueprint_method_shortcut_preserves_reverse_url_name():
+    files = {"pkg/auth.py": (
+        "from flask import Blueprint\n"
+        "bp = Blueprint('auth', __name__)\n"
+        "@bp.post('/logout')\n"
+        "def logout(): pass\n"
+    )}
+    plan = recipe.build_seam_plan(
+        files, [_pf("pkg/auth.py", "router", "route_to_endpoint")], {}, [],
+    )
+    generated = (
+        "from fastapi import APIRouter\n"
+        "bp = APIRouter()\n"
+        "@bp.post('/logout')\n"
+        "async def logout(): pass\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/auth.py", generated, plan)
+
+    assert "name='auth.logout'" in normalized
+    assert framework_seam_violations(normalized, plan, "pkg/auth.py") == []
+
+
 def test_route_contract_matches_renamed_path_parameters():
     plan = {"decisions": {"routes": {
         "kind": "route_names", "path": "pkg/blog.py", "files": ["pkg/blog.py"],
@@ -683,6 +877,52 @@ async def logout(request):
 
     assert "request.url_for('auth.login').path" in realized
     assert "request.url_for('index').path" in realized
+
+
+def test_url_for_is_coerced_before_python_string_trimming():
+    generated = """\
+async def openapi(request):
+    return request.url_for('home').rstrip('/')
+"""
+
+    realized = recipe.normalize_generated("pkg/views.py", generated, {})
+
+    assert "str(request.url_for('home')).rstrip('/')" in realized
+
+
+def test_template_response_is_not_wrapped_in_another_response():
+    generated = """\
+from fastapi import Request, Response
+from fastapi.templating import Jinja2Templates
+templates = Jinja2Templates(directory='templates')
+def render_page(request: Request, values):
+    return templates.TemplateResponse(request, 'page.html', values)
+def route(request: Request):
+    return Response(render_page(request, {}), media_type='text/html')
+"""
+
+    realized = recipe.normalize_generated("pkg/views.py", generated, {})
+
+    assert "return render_page(request, {})" in realized
+    assert "Response(render_page" not in realized
+
+
+def test_template_helper_receives_request_from_its_route_caller():
+    generated = """\
+from fastapi import Request
+from fastapi.templating import Jinja2Templates
+templates = Jinja2Templates(directory='templates')
+def render_page(values):
+    return templates.TemplateResponse('page.html', {'values': values})
+async def route(request: Request):
+    return render_page({})
+"""
+
+    realized = recipe.normalize_generated("pkg/views.py", generated, {})
+
+    assert "def render_page(values, request: Request)" in realized
+    assert "templates.TemplateResponse(request, 'page.html'" in realized
+    assert "return render_page({}, request)" in realized
 
 
 def test_werkzeug_abort_is_realized_as_raised_fastapi_http_exception():
@@ -762,7 +1002,7 @@ def test_error_handler_envelopes_own_route_exceptions_and_tests_do_not_unwrap():
     )
     realized = recipe.normalize_generated("pkg/api.py", generated_router, plan)
     assert "except store.ItemNotFound" not in realized
-    assert "return store.get_item(item_id)" in realized
+    assert "_portage_flask_response(store.get_item(item_id))" in realized
     assert not any(
         "app-owned exceptions" in item
         for item in framework_seam_violations(realized, plan, "pkg/api.py")
@@ -813,6 +1053,7 @@ def test_exception_handler_response_tuple_keeps_its_source_status():
 
     assert "_portage_response.status_code = 404" in normalized
     assert "return _portage_response" in normalized
+    assert "return _portage_response" in normalized
     assert framework_seam_violations(
         normalized,
         {"decisions": {}, "project_modules": ["pkg.errors"]},
@@ -831,7 +1072,163 @@ def test_exception_handler_render_keyword_becomes_a_real_response_status():
     normalized = recipe.normalize_generated("pkg/errors.py", source, {})
 
     assert "_portage_response.status_code = 404" in normalized
-    assert "return _portage_response" in normalized
+
+
+def test_route_template_status_normalization_is_idempotent():
+    plan = {"decisions": {"statuses": {
+        "kind": "route_response_statuses", "path": "pkg/views.py",
+        "files": ["pkg/views.py"],
+        "routes": [{
+            "function": "view", "handlers": [],
+            "returns": [{"literals": ["missing.html"], "status_code": 404}],
+        }],
+    }}}
+    generated = (
+        "from fastapi import APIRouter, Request\n"
+        "from pkg.templating import render_template\n"
+        "bp = APIRouter()\n"
+        "@bp.get('/missing')\n"
+        "def view(request: Request):\n"
+        "    return render_template(request, 'missing.html')\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+    normalized = recipe.normalize_generated("pkg/views.py", normalized, plan)
+
+    assert "JSONResponse(content=" not in normalized
+    assert "render_template(request, 'missing.html', status_code=404)" in normalized
+
+
+def test_exception_template_helper_status_normalization_is_idempotent():
+    plan = {"decisions": {"statuses": {
+        "kind": "route_response_statuses", "path": "pkg/views.py",
+        "files": ["pkg/views.py"],
+        "routes": [{
+            "function": "search",
+            "handlers": [{"exceptions": ["SearchError"], "status_code": 400}],
+            "returns": [],
+        }],
+    }}}
+    generated = (
+        "from pkg.templating import render_template\n"
+        "def search(request):\n"
+        "    def render_error(error):\n"
+        "        return render_template(request, 'search.html', error=error)\n"
+        "    try:\n"
+        "        return find()\n"
+        "    except SearchError as error:\n"
+        "        return render_error(error)\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+    normalized = recipe.normalize_generated("pkg/views.py", normalized, plan)
+
+    assert "JSONResponse(content=_portage_response" not in normalized
+    assert "status_code=400" in normalized
+
+    already_realized = generated.replace(
+        "        return render_error(error)\n",
+        "        response = render_error(error)\n"
+        "        response.status_code = 400\n"
+        "        return _portage_flask_response(response)\n",
+    )
+    normalized = recipe.normalize_generated("pkg/views.py", already_realized, plan)
+    assert "JSONResponse(content=response" not in normalized
+
+
+def test_mapping_update_cannot_read_a_key_written_earlier_in_the_same_call():
+    plan = {"decisions": {}, "project_modules": ["pkg.views"]}
+    collapsed = (
+        "def view(state):\n"
+        "    state.update({'items': load(), 'count': len(state['items'])})\n"
+    )
+    sequential = (
+        "def view(state):\n"
+        "    state['items'] = load()\n"
+        "    state['count'] = len(state['items'])\n"
+    )
+
+    assert any(
+        "preserve the source's sequential assignments" in item
+        for item in framework_seam_violations(collapsed, plan, "pkg/views.py")
+    )
+    assert framework_seam_violations(sequential, plan, "pkg/views.py") == []
+
+
+def test_route_response_statuses_survive_dict_translation():
+    files = {"pkg/views.py": """\
+from http import HTTPStatus
+from flask import Blueprint, jsonify
+bp = Blueprint('items', __name__)
+@bp.post('/items')
+def create():
+    try:
+        save()
+    except Duplicate:
+        return jsonify({'error': 'already exists'}), HTTPStatus.CONFLICT
+    if invalid():
+        return jsonify({'error': 'invalid item'}), HTTPStatus.BAD_REQUEST
+    return jsonify({'id': 1}), HTTPStatus.CREATED
+"""}
+    planned = [_pf("pkg/views.py", "router", "route_to_endpoint")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = """\
+from fastapi import APIRouter
+bp = APIRouter()
+@bp.post('/items', status_code=201)
+async def create():
+    try:
+        save()
+    except Duplicate:
+        return {'error': 'already exists'}
+    if invalid():
+        return {'error': 'invalid item'}
+    return {'id': 1}
+"""
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+
+    assert "JSONResponse(content={'error': 'already exists'}, status_code=409)" in normalized
+    assert "JSONResponse(content={'error': 'invalid item'}, status_code=400)" in normalized
+
+
+def test_http_exception_dependency_preserves_source_json_error_envelope():
+    files = {"pkg/app.py": """\
+from flask import Flask, jsonify
+from http import HTTPStatus
+def create_app():
+    app = Flask(__name__)
+    @app.get('/items')
+    def items():
+        try:
+            return load_items()
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), HTTPStatus.BAD_REQUEST
+    return app
+"""}
+    planned = [_pf("pkg/app.py", "app_factory", "app_factory")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = """\
+from http import HTTPStatus
+from fastapi import Depends, FastAPI, Request
+def read_page(request: Request):
+    if request.query_params.get('page') == '0':
+        raise ValueError('invalid page')
+    return 1
+def create_app():
+    app = FastAPI()
+    @app.get('/items')
+    async def items(page: int = Depends(read_page)):
+        return []
+    return app
+"""
+
+    realized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert "raise _PortageEnvelopeHTTPException(" in realized
+    assert "status_code=400" in realized
+    assert "@app.exception_handler(_PortageEnvelopeHTTPException)" in realized
+    assert "content={key: exc.detail}" in realized
 
 
 def test_ambient_context_provider_retains_the_active_request():
@@ -994,6 +1391,99 @@ def login_required(view):
     assert framework_seam_violations(realized, plan, "pkg/auth.py") == []
 
 
+def test_decorator_factory_hides_only_its_injected_view_parameter():
+    files = {"pkg/auth.py": """\
+from functools import wraps
+def require_role(admin=False):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            return view(object(), *args, **kwargs)
+        return wrapped
+    return decorator
+"""}
+    planned = [_pf("pkg/auth.py", "router", "route_to_endpoint")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    assert plan["decisions"]["view_decorators:pkg/auth.py"]["decorators"] == [{
+        "function": "require_role", "container": "decorator",
+        "parameter": "view", "wrapper": "wrapped",
+    }]
+    generated = """\
+from functools import wraps
+def require_role(admin=False):
+    def decorator(view):
+        @wraps(view)
+        async def wrapped(request, *args, **kwargs):
+            return await view(object(), request, *args, **kwargs)
+        return wrapped
+    return decorator
+@require_role()
+async def endpoint(user, request, item_id):
+    return item_id
+"""
+
+    realized = recipe.normalize_generated("pkg/auth.py", generated, plan)
+
+    assert "wrapped.__signature__ = inspect.signature(view).replace" in realized
+    namespace = {}
+    exec(realized, namespace)
+    assert list(__import__("inspect").signature(namespace["endpoint"]).parameters) == [
+        "request", "item_id",
+    ]
+
+
+def test_factory_nested_decorator_exposes_request_before_body_dependency():
+    files = {"pkg/app.py": """\
+from functools import wraps
+def create_app():
+    def require_auth():
+        def decorator(view):
+            @wraps(view)
+            def wrapped(*args, **kwargs):
+                return view(object(), *args, **kwargs)
+            return wrapped
+        return decorator
+"""}
+    planned = [_pf("pkg/app.py", "app_factory", "app_factory")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = """\
+from functools import wraps
+from fastapi import Depends, Request
+def create_app():
+    def require_auth():
+        def decorator(view):
+            @wraps(view)
+            async def wrapped(request: Request, *args, **kwargs):
+                return await view(object(), *args, **kwargs)
+            return wrapped
+        return decorator
+    @require_auth()
+    async def endpoint(user, payload: dict = Depends(read_payload)):
+        return payload
+"""
+
+    realized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert "inspect.Parameter('request'" in realized
+    assert "annotation=Request" in realized
+    assert framework_seam_violations(realized, plan, "pkg/app.py") == []
+
+
+def test_request_body_dependency_is_async_and_awaited():
+    generated = """\
+from fastapi import Depends, Request
+def read_payload(request: Request) -> dict:
+    return request.json() or {}
+async def endpoint(payload: dict = Depends(read_payload)):
+    return payload
+"""
+
+    realized = recipe.normalize_generated("pkg/views.py", generated, {})
+
+    assert "async def read_payload(request: Request)" in realized
+    assert "return await request.json() or {}" in realized
+
+
 def test_factory_contract_requires_defaults_overrides_initializer_order_and_one_app():
     files = {
         **FILES,
@@ -1006,7 +1496,7 @@ def test_factory_contract_requires_defaults_overrides_initializer_order_and_one_
 from flask import Flask
 from . import db
 def create_app(test_config=None):
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=None)
     app.config.from_mapping(SECRET_KEY='dev', DATABASE='default.sqlite')
     if test_config:
         app.config.update(test_config)
@@ -1059,7 +1549,8 @@ def create_app(test_config=None):
     return app
 """
     assert framework_seam_violations(
-        good, plan, "pkg/__init__.py", manifest,
+        good + "\ndef render(request):\n    return vars(request.state)\n",
+        plan, "pkg/__init__.py", manifest,
     ) == []
     local_config = """\
 from . import db
@@ -1075,6 +1566,50 @@ def create_app(test_config=None):
 """
     assert framework_seam_violations(
         local_config, plan, "pkg/__init__.py", manifest,
+    ) == []
+    branch_config = """\
+from .testing import AppFacade
+def create_app(test_config=None):
+    if test_config:
+        config = {'SECRET_KEY': 'test', 'DATABASE': 'test.sqlite'}
+    else:
+        config = {'SECRET_KEY': 'dev', 'DATABASE': 'default.sqlite'}
+    app = AppFacade(testing=bool(test_config))
+    return app
+"""
+    normalized_branch = recipe.normalize_generated(
+        "pkg/__init__.py", branch_config, plan,
+    )
+    assert "dict(config) if hasattr(config, 'items')" in normalized_branch
+    assert "app.state.config.update(test_config)" in normalized_branch
+    assert framework_seam_violations(
+        normalized_branch, plan, "pkg/__init__.py", manifest,
+    ) == []
+
+    override_only_files = {
+        "pkg/__init__.py": (
+            "from flask import Flask\n"
+            "def create_app(test_config=None):\n"
+            "    app = Flask(__name__)\n"
+            "    if test_config: app.config.update(test_config)\n"
+            "    return app\n"
+        ),
+    }
+    override_plan = recipe.build_seam_plan(
+        override_only_files, recipe.plan_files(override_only_files), {}, [],
+    )
+    override_only = recipe.normalize_generated(
+        "pkg/__init__.py",
+        "from fastapi import FastAPI\n"
+        "def create_app(test_config=None):\n"
+        "    app = FastAPI()\n"
+        "    app.state.config = {}\n"
+        "    return app\n",
+        override_plan,
+    )
+    assert "app.state.config.update(test_config)" in override_only
+    assert framework_seam_violations(
+        override_only, override_plan, "pkg/__init__.py",
     ) == []
     missing_initializer = local_config.replace("    db.init_app(app)\n", "")
     normalized = recipe.normalize_generated(
@@ -1152,7 +1687,7 @@ def test_plain_flask_string_route_requires_explicit_fastapi_text_response():
         "pkg/app.py": """\
 from flask import Flask
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=None)
     @app.route('/hello')
     def hello():
         return 'Hello, World!'
@@ -1189,6 +1724,103 @@ def create_app():
         "return PlainTextResponse('Hello, World!')", "return 'Hello, World!'",
     )
     assert framework_seam_violations(decorator_response, plan, "pkg/app.py") == []
+
+
+def test_imported_template_provider_uses_current_response_api_without_json_wrapper():
+    plan = {"decisions": {
+        "provider": {
+            "kind": "planned_provider_exports", "provider": "pkg/templating.py",
+            "exports": {
+                "render_template": {"kind": "function", "members": []},
+                "templates": {"kind": "variable", "members": []},
+            },
+            "files": ["pkg/templating.py", "pkg/views.py"],
+            "instruction": "frozen template provider",
+        },
+        "runtime": {
+            "kind": "template_runtime", "provider_files": ["pkg/templating.py"],
+            "provider_functions": {"pkg/templating.py": ["render_template"]},
+            "consumer_functions": {"pkg/views.py": ["render_template"]},
+            "files": ["pkg/templating.py", "pkg/views.py"],
+            "instruction": "current request-first API",
+        },
+    }}
+    generated = (
+        "from fastapi import APIRouter, Request\n"
+        "from fastapi.responses import JSONResponse\n"
+        "from pkg.templating import render_template, templates\n"
+        "bp = APIRouter()\n"
+        "@bp.get('/')\n"
+        "async def view(request: Request):\n"
+        "    return JSONResponse(content=templates.TemplateResponse(\n"
+        "        'missing.html', {'request': request}, status_code=404\n"
+        "    ), status_code=404)\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+
+    assert "render_template(request, 'missing.html', status_code=404)" in normalized
+    assert "JSONResponse" not in normalized
+
+    nested_helper = generated.replace(
+        "    return JSONResponse(content=templates.TemplateResponse(\n"
+        "        'missing.html', {'request': request}, status_code=404\n"
+        "    ), status_code=404)\n",
+        "    def render_error():\n"
+        "        return render_template(request, 'missing.html', status_code=404)\n"
+        "    return JSONResponse(content=render_error(), status_code=404)\n",
+    )
+    normalized = recipe.normalize_generated("pkg/views.py", nested_helper, plan)
+    assert "_portage_flask_response(render_error())" in normalized
+    assert "JSONResponse" not in normalized
+
+
+def test_computed_string_route_keeps_flask_html_response_bytes():
+    generated = """\
+from __future__ import annotations
+from fastapi import APIRouter
+bp = APIRouter()
+def render_value(): return '<p>value</p>'
+@bp.post('/render')
+async def render():
+    return render_value()
+"""
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, {})
+    namespace = {}
+    exec(normalized, namespace)
+    response = asyncio.run(namespace["render"]())
+
+    assert normalized.splitlines()[0] == "from __future__ import annotations"
+    assert response.body == b"<p>value</p>"
+    assert response.media_type == "text/html"
+
+
+def test_module_member_import_is_aliased_when_route_has_the_same_name():
+    files = {
+        "pkg/store.py": "def history(): return []\n",
+        "pkg/views.py": (
+            "from flask import Blueprint\n"
+            "from . import store\n"
+            "bp = Blueprint('page', __name__)\n"
+            "@bp.route('/history')\n"
+            "def history(): return store.history()\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = (
+        "from fastapi import APIRouter\n"
+        "from pkg.store import history\n"
+        "bp = APIRouter()\n"
+        "@bp.get('/history')\n"
+        "def history(): return history()\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+
+    assert "from pkg.store import history as _portage_history" in normalized
+    assert "_portage_flask_response(_portage_history())" in normalized
 
 
 def test_session_provider_uses_request_mapping_not_raw_cookies():
@@ -1266,6 +1898,7 @@ def render(request, name, **context):
     assert framework_seam_violations(
         normalized, plan, "pkg/templating.py",
     ) == []
+    assert "str(Path(__file__).resolve().parent / 'templates')" in normalized
 
 
 def test_mixed_form_routes_and_request_hooks_are_frozen_and_checked():
@@ -1454,6 +2087,34 @@ async def page(store=Depends(object)):
     normalized = recipe.normalize_generated("pkg/views.py", missing_request, plan)
     assert "async def page(request: Request, store=Depends(object))" in normalized
     assert "render(request, 'page.html', value=1)" in normalized
+
+    ambient = {"decisions": {
+        "templates": {
+            **plan["decisions"]["templates"],
+            "files": ["pkg/rendering.py", "pkg/email.py"],
+            "consumer_functions": {"pkg/email.py": ["render_template"]},
+        },
+        "context": {
+            "kind": "ambient_context_runtime",
+            "files": ["pkg/email.py", "pkg/runtime.py"],
+            "runtime_providers": ["pkg/runtime.py"],
+        },
+    }}
+    helper = recipe.normalize_generated(
+        "pkg/email.py",
+        "from fastapi import Request\n"
+        "from pkg.runtime import g\n"
+        "from pkg.rendering import render_template\n"
+        "def render_email(): return render_template(Request, 'message.html')\n"
+        "def duplicate(): return render_template("
+        "g.request, g.request, Request, Request(), 'dupe.html')\n"
+        "def message(): return Message(body=render_template('message.txt'))\n",
+        ambient,
+    )
+    assert "from pkg.runtime import g" in helper
+    assert "render_template(g.request, 'message.html')" in helper
+    assert "render_template(g.request, 'dupe.html')" in helper
+    assert "render_template(g.request, 'message.txt').body.decode()" in helper
 
 
 def test_template_auth_global_is_loaded_at_render_time_to_avoid_provider_cycles():
@@ -1849,6 +2510,29 @@ def test_session_middleware_installation_is_separate_from_session_access():
     assert framework_seam_violations(installed, plan, "pkg/app.py") == []
 
 
+def test_session_middleware_cannot_masquerade_as_an_unrelated_provider():
+    plan = {
+        "version": 1,
+        "decisions": {},
+        "project_modules": ["pkg.extensions"],
+        "project_roots": ["pkg"],
+    }
+    bad = (
+        "from starlette.middleware.sessions import SessionMiddleware\n"
+        "csrf = SessionMiddleware(secret_key='secret')\n"
+    )
+    assert any(
+        "ASGI middleware, not a session/proxy" in item
+        for item in framework_seam_violations(bad, plan, "pkg/extensions.py")
+    )
+
+    wrapped = bad.replace(
+        "csrf = SessionMiddleware(secret_key='secret')",
+        "wrapped = SessionMiddleware(app, secret_key='secret')",
+    )
+    assert framework_seam_violations(wrapped, plan, "pkg/extensions.py") == []
+
+
 def test_apirouter_cannot_own_middleware():
     source = (
         "from fastapi import APIRouter as Router\n"
@@ -1922,6 +2606,7 @@ def test_direct_test_surface_is_rendered_and_constructed_by_its_consumer(tmp_pat
     rendered = recipe.render_created_artifact(provider, str(tmp_path))
     assert "class AppFacade(FastAPI):" in rendered
     assert "def test_client(self):" in rendered
+    assert "return FlaskClientAdapter(self)" in rendered
 
     raw = (
         "from fastapi import FastAPI\n"
@@ -1941,6 +2626,31 @@ def test_direct_test_surface_is_rendered_and_constructed_by_its_consumer(tmp_pat
         "must construct planned facade" in item
         for item in framework_seam_violations(realized, plan, "pkg/app.py")
     )
+
+    wrapped = raw.replace("return app", "return AppFacade(app)")
+    realized_wrapped = recipe.normalize_generated("pkg/app.py", wrapped, plan)
+    assert "app = AppFacade()" in realized_wrapped
+    assert "return app" in realized_wrapped
+    assert "AppFacade(app)" not in realized_wrapped
+
+    module_plan = recipe.build_seam_plan({
+        "pkg/app.py": (
+            "from flask import Flask as WebApp\n"
+            "app = WebApp(__name__)\n"
+            "@app.get('/')\n"
+            "def index(): return 'ok'\n"
+        ),
+    }, [provider, factory], {}, [])
+    factory_only = (
+        "from pkg.testing import AppFacade\n"
+        "def create_app():\n"
+        "    application = AppFacade()\n"
+        "    return application\n"
+    )
+    realized_export = recipe.normalize_generated(
+        "pkg/app.py", factory_only, module_plan,
+    )
+    assert realized_export.endswith("app = create_app()\n")
 
     testing_provider = PlannedFile(
         path="pkg/testing.py", role="support", action="create",
@@ -1970,6 +2680,295 @@ def create_app():
     assert "raw_app.testing" not in realized
 
 
+def test_public_factory_uses_frozen_facade_in_every_branch():
+    provider = PlannedFile(
+        path="pkg/testing.py",
+        role="support",
+        action="create",
+        artifact_contract={
+            "capabilities": ["direct_test_surface"],
+            "exports": [{
+                "name": "AppFacade",
+                "kind": "class",
+                "members": ["app_context", "testing"],
+            }],
+            "consumers": ["pkg/app.py"],
+            "depends_on": [],
+        },
+    )
+    factory = PlannedFile(path="pkg/app.py", role="app_factory")
+    plan = recipe.build_seam_plan({}, [provider, factory], {}, [])
+    generated = """\
+from __future__ import annotations
+from fastapi import FastAPI
+from pkg.testing import AppFacade
+def create_app(testing=False):
+    if testing:
+        app = FastAPI(title='test')
+    else:
+        app = FastAPI(title='live')
+    app.testing = testing
+    return app
+"""
+
+    realized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert realized.startswith("from __future__ import annotations")
+    assert realized.count("app = AppFacade(") == 2
+    assert "app = FastAPI(" not in realized
+    assert "app.testing = testing" in realized
+    assert not any(
+        "must construct planned facade" in item
+        for item in framework_seam_violations(realized, plan, "pkg/app.py")
+    )
+
+
+def test_planned_facade_gate_applies_only_to_factory_consumers():
+    plan = {"decisions": {"surface": {
+        "kind": "planned_test_surface", "provider": "pkg/testing.py",
+        "classes": [{"name": "AppFacade", "members": ["testing"]}],
+        "files": ["pkg/testing.py", "pkg/app.py", "pkg/helper.py"],
+        "factory_consumers": ["pkg/app.py"],
+    }}}
+
+    assert not any(
+        "must construct planned facade" in item
+        for item in framework_seam_violations(
+            "from fastapi import FastAPI\nvalue = FastAPI()\n",
+            plan, "pkg/helper.py",
+        )
+    )
+
+
+def test_factory_moves_source_local_submodule_import_back_inside_factory():
+    files = {
+        "pkg/__init__.py": (
+            "from flask import Flask\n"
+            "def create_app():\n"
+            "    app = Flask(__name__)\n"
+            "    from . import views\n"
+            "    app.register_blueprint(views.bp)\n"
+            "    return app\n"
+        ),
+        "pkg/views.py": "from flask import Blueprint\nbp = Blueprint('v', __name__)\n",
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = """\
+from fastapi import FastAPI
+from pkg.views import bp
+def create_app():
+    app = FastAPI()
+    app.include_router(bp)
+    return app
+"""
+
+    normalized = recipe.normalize_generated("pkg/__init__.py", generated, plan)
+
+    assert normalized.index("def create_app") < normalized.index(
+        "    from pkg.views import bp"
+    )
+    assert not any(
+        "source-local import" in item
+        for item in framework_seam_violations(
+            normalized, plan, "pkg/__init__.py",
+        )
+    )
+
+
+def test_injected_default_parameter_moves_after_required_source_arguments():
+    generated = """\
+from fastapi import APIRouter, Depends, Request
+router = APIRouter()
+def active_request(): return None
+@router.post('/items')
+async def update(request: Request = Depends(active_request), title: str, body: str):
+    return title, body, request
+"""
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, {})
+
+    tree = ast.parse(normalized)
+    update = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "update"
+    )
+    assert [argument.arg for argument in update.args.args] == [
+        "title", "body", "request",
+    ]
+    assert len(update.args.defaults) == 1
+
+
+def test_source_safe_imports_and_private_helpers_close_generated_bindings():
+    files = {
+        "pkg/auth.py": (
+            "from __future__ import annotations\n"
+            "import json\n"
+            "from .models import User\n"
+            "def _decode_token(value):\n"
+            "    return json.loads(value)\n"
+            "def lookup(value):\n"
+            "    return User.query.get(_decode_token(value)['id'])\n"
+        ),
+        "pkg/models.py": "class User: pass\n",
+    }
+    planned = [
+        PlannedFile(path="pkg/auth.py", role="support"),
+        PlannedFile(path="pkg/models.py", role="support"),
+    ]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    plan["project_modules"] = ["pkg.auth", "pkg.models"]
+    plan["project_roots"] = ["pkg"]
+    generated = (
+        "from __future__ import annotations\n"
+        "def lookup(value):\n"
+        "    return User.query.get(_decode_token(value)['id'])\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/auth.py", generated, plan)
+
+    assert "import json" in normalized
+    assert normalized.startswith("from __future__ import annotations")
+    assert "from .models import User" in normalized
+    assert "def _decode_token(value):" in normalized
+    assert all_generation_violations(normalized, {}, "pkg/auth.py", plan) == []
+
+
+def test_source_initializer_callback_closes_generated_factory_binding():
+    files = {
+        "pkg/app.py": (
+            "from flask import Flask, current_app, request\n"
+            "from .extensions import babel\n"
+            "def get_locale():\n"
+            "    return request.accept_languages.best_match("
+            "current_app.config['LANGUAGES'])\n"
+            "def create_app():\n"
+            "    app = Flask(__name__)\n"
+            "    babel.init_app(app, locale_selector=get_locale)\n"
+            "    return app\n"
+        ),
+        "pkg/extensions.py": "babel = object()\n",
+    }
+    planned = [
+        PlannedFile(
+            path="pkg/runtime_context.py", role="support", action="create",
+            artifact_contract={
+                "capabilities": ["request_context"],
+                "exports": [
+                    {"name": "current_app", "kind": "variable", "members": []},
+                    {"name": "get_request_context", "kind": "function", "members": []},
+                ],
+                "consumers": ["pkg/app.py"], "depends_on": [],
+            },
+        ),
+        PlannedFile(path="pkg/app.py", role="app_factory"),
+        PlannedFile(path="pkg/extensions.py", role="support"),
+    ]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    plan["project_modules"] = ["pkg.app", "pkg.extensions", "pkg.runtime_context"]
+    plan["project_roots"] = ["pkg"]
+    generated = (
+        "from fastapi import FastAPI\n"
+        "from pkg.runtime_context import current_app\n"
+        "from .extensions import babel\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    app.state.config = {'LANGUAGES': ['en']}\n"
+        "    babel.init_app(app, locale_selector=get_locale)\n"
+        "    return app\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert "def get_locale():" in normalized
+    assert "locale_selector=get_locale" in normalized
+    assert "_portage_get_request_context()['request']" in normalized
+    compile(normalized, "pkg/app.py", "exec")
+    assert all_generation_violations(normalized, {}, "pkg/app.py", plan) == []
+
+
+def test_source_instance_path_is_owned_as_application_state(tmp_path):
+    files = {
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "def create_app():\n"
+            "    app = Flask(__name__, instance_path='/srv/custom')\n"
+            "    return app\n"
+        ),
+        "pkg/consumer.py": (
+            "from flask import current_app\n"
+            "def data_path(): return current_app.instance_path\n"
+        ),
+    }
+    runtime = PlannedFile(
+        path="pkg/context.py",
+        role="support",
+        action="create",
+        artifact_contract={
+            "capabilities": ["request_context"],
+            "exports": [
+                {"name": "Runtime", "kind": "class", "members": [
+                    "get_request_context", "manage_session",
+                ]},
+                {"name": "current_app", "kind": "variable", "members": []},
+            ],
+            "consumers": ["pkg/app.py", "pkg/consumer.py"],
+            "depends_on": [],
+        },
+    )
+    testing = PlannedFile(
+        path="pkg/testing.py",
+        role="support",
+        action="create",
+        artifact_contract={
+            "capabilities": ["direct_test_surface", "test_context_surface"],
+            "exports": [{
+                "name": "AppFacade", "kind": "class", "members": ["app_context"],
+            }],
+            "consumers": ["pkg/app.py"],
+            "depends_on": ["pkg/context.py"],
+        },
+    )
+    planned = [
+        runtime,
+        testing,
+        PlannedFile(path="pkg/consumer.py", role="support"),
+        PlannedFile(path="pkg/app.py", role="app_factory"),
+    ]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+
+    factory = recipe.normalize_generated(
+        "pkg/app.py",
+        "from fastapi import FastAPI\n"
+        "def create_app():\n"
+        "    app = FastAPI(instance_path='/srv/custom')\n"
+        "    return app\n",
+        plan,
+    )
+    consumer = recipe.normalize_generated(
+        "pkg/consumer.py",
+        "from pkg.context import current_app\n"
+        "def data_path(): return current_app.instance_path\n",
+        plan,
+    )
+    rendered_runtime = recipe.render_created_artifact(runtime, str(tmp_path))
+
+    assert plan["decisions"]["application_factory:pkg/app.py"][
+        "app_state_members"
+    ] == ["instance_path"]
+    assert "app = AppFacade()" in factory
+    assert "app.state.instance_path = '/srv/custom'" in factory
+    assert "instance_path=" not in factory
+    assert "return current_app.instance_path" in consumer
+    assert "return getattr(app.state, name)" in rendered_runtime
+    assert not any(
+        "instance_path" in item
+        for item in framework_seam_violations(
+            consumer, plan, "pkg/consumer.py",
+        )
+    )
+
+
 def test_public_export_may_call_local_factory_that_returns_owned_facade():
     manifest = {
         "pkg/testing.py::AppFacade": {
@@ -1988,6 +2987,34 @@ def create_app():
     application = AppFacade()
     return application
 app = create_app()
+"""
+
+    assert planned_capability_consumer_violations(
+        content, manifest, "pkg/app.py",
+    ) == []
+
+
+def test_public_factory_may_construct_owned_facade_inside_branches():
+    manifest = {
+        "pkg/testing.py::AppFacade": {
+            "module": "pkg/testing.py", "symbol": "AppFacade",
+            "provenance": "planned_create", "members": ["testing"],
+            "capabilities": ["direct_test_surface"],
+            "factory_consumers": ["pkg/app.py"],
+        },
+        "pkg/app.py::create_app": {
+            "module": "pkg/app.py", "symbol": "create_app",
+            "target_kind": "function",
+        },
+    }
+    content = """\
+from pkg.testing import AppFacade
+def create_app(testing=False):
+    if testing:
+        app = AppFacade(testing=True)
+    else:
+        app = AppFacade(testing=False)
+    return app
 """
 
     assert planned_capability_consumer_violations(
@@ -2110,6 +3137,23 @@ class App:
 """
     assert framework_seam_violations(good, plan, "pkg/testing.py") == []
 
+    delegated_good = """\
+class Context:
+    def __init__(self, app):
+        self._app = app
+    def pop(self):
+        for callback in self._app._cleanup_callbacks:
+            callback()
+class App:
+    def __init__(self, cleanup_callbacks=()):
+        self._cleanup_callbacks = tuple(cleanup_callbacks)
+    def app_context(self):
+        return Context(self)
+"""
+    assert framework_seam_violations(
+        delegated_good, plan, "pkg/testing.py",
+    ) == []
+
     wrong_receiver = """\
 class App:
     def __init__(self, cleanup_callbacks=()):
@@ -2230,6 +3274,25 @@ def create_app():
             normalized_factory, plan, "pkg/app.py", manifest,
         )
     )
+
+    plan["decisions"]["provider_protocol:pkg/extensions.py:csrf"] = {
+        "kind": "provider_protocol",
+        "provider": "pkg/extensions.py",
+        "symbol": "csrf",
+        "constructor": {"module": "flask_wtf.csrf", "name": "CSRFProtect"},
+        "files": ["pkg/app.py", "pkg/extensions.py"],
+    }
+    csrf_factory = normalized_factory.replace(
+        "from .context import RuntimeContext",
+        "from .context import RuntimeContext\nfrom .extensions import csrf",
+    ).replace(
+        "    app.add_middleware(RuntimeContext)",
+        "    app.add_middleware(RuntimeContext)\n    csrf.init_app(app)",
+    )
+    normalized_csrf = recipe.normalize_generated("pkg/app.py", csrf_factory, plan)
+    assert normalized_csrf.index("csrf.init_app(app)") < normalized_csrf.index(
+        "add_middleware(RuntimeContext)"
+    ) < normalized_csrf.index("add_middleware(SessionMiddleware")
 
     missing_install = bad_factory.replace(
         "lifespan=RuntimeContext.manage_session", "lifespan=RuntimeContext()",
@@ -2356,6 +3419,30 @@ def test_contract_compiler_links_split_test_context_to_runtime_owner():
     )["added_dependencies"] == ["pkg/context.py"]
 
 
+def test_runtime_current_app_proxy_preserves_flask_logger(tmp_path):
+    artifact = PlannedFile(
+        path="pkg/context.py", role="support", action="create",
+        artifact_contract={
+            "capabilities": ["request_context"],
+            "exports": [
+                {"name": "Runtime", "kind": "class", "members": [
+                    "get_request_context", "manage_session",
+                ]},
+                {"name": "current_app", "kind": "variable", "members": []},
+                {"name": "g", "kind": "variable", "members": []},
+            ],
+            "consumers": ["pkg/views.py"], "depends_on": [],
+        },
+    )
+
+    rendered = recipe.render_created_artifact(artifact, str(tmp_path))
+
+    assert rendered is not None
+    assert "import logging" in rendered
+    assert 'if name == "logger":' in rendered
+    assert "return logging.getLogger" in rendered
+
+
 def test_recipe_deterministically_renders_fixed_context_test_and_template_plumbing(
     tmp_path,
 ):
@@ -2428,13 +3515,30 @@ def test_recipe_deterministically_renders_fixed_context_test_and_template_plumbi
     assert "from pkg.context import _pop_context, _push_context, g, session" in (
         rendered["pkg/testing.py"]
     )
-    assert "TemplateResponse(request, template_name, values)" in (
+    assert "request, template_name, values, status_code=status_code" in (
         rendered["pkg/templating.py"]
     )
     assert 'vars(request.state).get("_state", {})' in rendered["pkg/templating.py"]
     assert 'path_params.pop("filename")' in rendered["pkg/templating.py"]
-    assert "url_for(name, **path_params).path" in rendered["pkg/templating.py"]
+    assert 'path_params.pop("_external", False)' in rendered["pkg/templating.py"]
+    assert "return str(url) if external else url.path" in rendered["pkg/templating.py"]
     assert "def url_for(name: str, **path_params)" in rendered["pkg/templating.py"]
+    assert "templates.env.globals['url_for'] = url_for" in (
+        rendered["pkg/templating.py"]
+    )
+    assert '"config": getattr(request.app.state, "config", {})' in (
+        rendered["pkg/templating.py"]
+    )
+    assert "autoescape=select_autoescape" in rendered["pkg/templating.py"]
+    assert "Jinja2Templates(env=Environment(" in rendered["pkg/templating.py"]
+    namespace = {}
+    exec(rendered["pkg/context.py"], namespace)
+    token = namespace["_push_context"]({"session": {}})
+    namespace["flash"]("saved", "success")
+    assert namespace["get_flashed_messages"](with_categories=True) == [
+        ("success", "saved"),
+    ]
+    namespace["_pop_context"](token)
     violations = {
         path: all_generation_violations(
             content, manifest, path, seam_plan, None,
@@ -2544,7 +3648,31 @@ def test_contract_compiler_canonicalizes_context_and_test_facade(
     assert "class RequestContextMiddleware(BaseHTTPMiddleware)" in rendered_runtime
     assert "current_app = _CurrentAppProxy()" in rendered_runtime
     assert '"app": request.app' in rendered_runtime
-    assert "class app_context(FastAPI)" in rendered_testing
+    assert next(
+        export for export in testing["exports"] if export["kind"] == "class"
+    )["name"] == "FastAPIApp"
+    assert "class FastAPIApp(FastAPI)" in rendered_testing
+    rendered_mapping_facade = recipe.render_created_artifact(
+        PlannedFile(
+            path="pkg/facade.py", role="support", action="create",
+            artifact_contract={
+                "capabilities": ["direct_test_surface"],
+                "depends_on": ["pkg/context.py"],
+                "exports": [{
+                    "name": "App", "kind": "class",
+                    "members": ["app_context", "testing"],
+                }],
+            },
+        ),
+        str(tmp_path),
+    )
+    assert 'dict(config) if hasattr(config, "items")' in rendered_mapping_facade
+    assert any(
+        item.get("renamed_exports") == [{
+            "from": "app_context", "to": "FastAPIApp",
+        }]
+        for item in audit
+    )
 
 
 def test_source_current_app_consumer_uses_frozen_runtime_proxy_not_factory_reentry():
@@ -2639,6 +3767,384 @@ def test_recipe_plans_flask_family_extension_provider_without_base_flask_import(
     assert {subtask.type for subtask in planned[0].subtasks} == {
         "auth_login", "sqlalchemy_plain",
     }
+
+
+def test_source_used_extensions_are_realized_as_material_lifecycle_providers():
+    files = {
+        "pkg/extensions.py": (
+            "from flask_example import Extension\n"
+            "from flask_mail import Mail\n"
+            "from flask_migrate import Migrate\n"
+            "from flask_wtf.csrf import CSRFProtect\n"
+            "mail = Mail()\n"
+            "migrate = Migrate()\n"
+            "csrf = CSRFProtect()\n"
+            "extension = Extension()\n"
+            "extension.mode = 'strict'\n"
+            "@extension.handler\n"
+            "def handle(value): return value\n"
+        ),
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "from flask_example import ExtensionError\n"
+            "from .extensions import csrf, extension, mail, migrate\n"
+            "def create_app():\n"
+            "    app = Flask(__name__)\n"
+            "    csrf.init_app(app)\n"
+            "    mail.init_app(app)\n"
+            "    migrate.init_app(app, object())\n"
+            "    extension.init_app(app)\n"
+            "    @app.errorhandler(ExtensionError)\n"
+            "    def rejected(error): return str(error), 400\n"
+            "    return app\n"
+        ),
+        "pkg/email.py": (
+            "from flask_mail import Message\n"
+            "from .extensions import extension, mail\n"
+            "def send(message):\n"
+            "    Message(subject='notice')\n"
+            "    extension.send(message)\n"
+            "    return mail.send(message)\n"
+        ),
+        "tests/test_mail.py": (
+            "from pkg.extensions import extension, mail\n"
+            "def test_mail():\n"
+            "    with mail.record_messages() as outbox:\n"
+            "        mail.send(object())\n"
+            "        assert len(outbox) == 1\n"
+            "    with extension.record_messages() as captured:\n"
+            "        extension.send(object())\n"
+            "        assert len(captured) == 1\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    protocols = {
+        item["symbol"]: item
+        for item in plan["decisions"].values()
+        if item.get("kind") == "provider_protocol"
+    }
+
+    assert set(protocols) >= {"csrf", "extension", "mail", "migrate"}
+    assert protocols["mail"]["context_manager_members"] == ["record_messages"]
+    assert "Message" in protocols["mail"]["callable_members"]
+    assert protocols["extension"]["attribute_values"] == {"mode": "strict"}
+    assert protocols["extension"]["decorator_members"] == ["handler"]
+    assert protocols["extension"]["exception_members"] == ["ExtensionError"]
+    factory_contract = plan["decisions"]["application_factory:pkg/app.py"]
+    assert [item["symbol"] for item in factory_contract["initializers"]] == [
+        "csrf", "extension", "mail", "migrate",
+    ]
+    assert [item["original_call"] for item in factory_contract["initializers"]] == [
+        "csrf.init_app(app)",
+        "extension.init_app(app)",
+        "mail.init_app(app)",
+        "migrate.init_app(app, object())",
+    ]
+    placeholder_errors = framework_seam_violations(
+        "mail = None\n", plan, "pkg/extensions.py",
+    )
+    assert any("cannot be a None placeholder" in item for item in placeholder_errors)
+
+    translated = "from fastapi import APIRouter\nrouter = APIRouter()\n"
+    assert framework_seam_violations(
+        translated, plan, "pkg/extensions.py",
+    ) == []
+
+    normalized = recipe.normalize_generated(
+        "pkg/extensions.py",
+        "mail = None\nmigrate = None\ncsrf = object()\nextension = None\n",
+        plan,
+    )
+    assert "mail = None" not in normalized
+    assert "migrate = None" not in normalized
+    assert "csrf = object()" not in normalized
+    assert "extension = None" not in normalized
+    assert framework_seam_violations(
+        normalized, plan, "pkg/extensions.py",
+    ) == []
+
+    namespace = {}
+    exec(normalized, namespace)
+    app = SimpleNamespace(
+        state=SimpleNamespace(config={}), exception_handlers={}, middlewares=[],
+    )
+    app.middleware = lambda _kind: lambda function: (
+        app.middlewares.append(function) or function
+    )
+    db = object()
+    assert namespace["csrf"].init_app(app) is app
+    assert namespace["migrate"].init_app(app, db) is app
+    assert namespace["extension"].init_app(app) is app
+    assert namespace["extension"].mode == "strict"
+    assert namespace["extension"].handler(lambda: 1)() == 1
+    assert namespace["ExtensionError"]().description == "Extension"
+    invalid = SimpleNamespace(
+        app=app, method="POST", session={},
+        body=lambda: asyncio.sleep(0, result=b""),
+        form=lambda: asyncio.sleep(0, result={}),
+    )
+    response = asyncio.run(app.middlewares[0](
+        invalid, lambda _request: asyncio.sleep(0, result="ok"),
+    ))
+    assert response.status_code == 400
+
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+    from starlette.middleware.sessions import SessionMiddleware
+
+    live_app = FastAPI()
+    live_app.state.config = {"WTF_CSRF_ENABLED": True}
+    namespace["csrf"].init_app(live_app)
+    live_app.add_middleware(SessionMiddleware, secret_key="test-secret")
+
+    @live_app.get("/form")
+    async def form(request: Request):
+        request.session["_csrf_token"] = "known-token"
+        return {"ready": True}
+
+    @live_app.post("/form")
+    async def submit(request: Request):
+        return dict(await request.form())
+
+    client = TestClient(live_app)
+    assert client.get("/form").status_code == 200
+    valid = client.post("/form", data={"csrf_token": "known-token", "value": "kept"})
+    assert valid.json()["value"] == "kept"
+    assert client.post("/form", data={"value": "rejected"}).status_code == 400
+    with namespace["mail"].record_messages() as outbox:
+        assert namespace["mail"].Message(subject="notice").subject == "notice"
+        message = object()
+        assert namespace["mail"].send(message) is message
+        assert outbox == [message]
+    with namespace["extension"].record_messages() as captured:
+        message = object()
+        assert namespace["extension"].send(message) is message
+        assert captured == [message]
+
+    normalized_factory = recipe.normalize_generated(
+        "pkg/app.py",
+        "from fastapi import FastAPI\n"
+        "from pkg.runtime import ExtensionError\n"
+        "from .extensions import csrf, extension, mail, migrate\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    @app.exception_handler(ExtensionError)\n"
+        "    def rejected(request, error): return str(error)\n"
+        "    return app\n",
+        plan,
+    )
+    assert "from pkg.extensions import ExtensionError" in normalized_factory
+    assert "from pkg.runtime import ExtensionError" not in normalized_factory
+    assert normalized_factory.index("csrf.init_app(app)") < normalized_factory.index(
+        "return app"
+    )
+    assert "migrate.init_app(app, object())" in normalized_factory
+
+
+def test_source_flask_forms_keep_bound_fields_hidden_tag_and_submit_shape(monkeypatch):
+    files = {
+        "pkg/forms.py": (
+            "from flask_wtf import FlaskForm\n"
+            "from wtforms import StringField\n"
+            "class ContactForm(FlaskForm): name = StringField('Name')\n"
+        ),
+        "pkg/views.py": (
+            "from flask import Blueprint\n"
+            "from .forms import ContactForm\n"
+            "bp = Blueprint('views', __name__)\n"
+            "@bp.route('/contact', methods=['GET', 'POST'])\n"
+            "def contact():\n"
+            "    form = ContactForm()\n"
+            "    return str(form.validate_on_submit())\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    planned.append(PlannedFile(
+        path="pkg/runtime.py", role="support", action="create",
+        artifact_contract={"capabilities": ["request_context", "session_and_flash"]},
+    ))
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    decision = plan["decisions"]["form_provider:pkg/forms.py"]
+    assert decision["classes"] == ["ContactForm"]
+    assert decision["consumers"] == ["pkg/views.py"]
+
+    normalized = recipe.normalize_generated(
+        "pkg/forms.py",
+        "from wtforms import StringField\n"
+        "class ContactForm:\n"
+        "    name = StringField('Name')\n",
+        plan,
+    )
+    assert "class ContactForm(_PortageForm)" in normalized
+    assert "def hidden_tag(self)" in normalized
+    assert "def validate_on_submit(self)" in normalized
+    assert all_generation_violations(normalized, {}, "pkg/forms.py", plan) == []
+
+    package = ModuleType("pkg")
+    package.__path__ = []
+    runtime = ModuleType("pkg.runtime")
+    runtime.session = {}
+    runtime.get_request_context = lambda: {
+        "request": SimpleNamespace(method="POST"),
+    }
+    wtforms = ModuleType("wtforms")
+
+    class FakeForm:
+        def __init__(self, formdata=None):
+            self.formdata = formdata
+
+        def validate(self):
+            return True
+
+    class FakeField:
+        def __init__(self, *_args, **_kwargs):
+            self.data = None
+
+    wtforms.Form = FakeForm
+    wtforms.HiddenField = wtforms.StringField = FakeField
+    monkeypatch.setitem(sys.modules, "pkg", package)
+    monkeypatch.setitem(sys.modules, "pkg.runtime", runtime)
+    monkeypatch.setitem(sys.modules, "wtforms", wtforms)
+    namespace = {"__name__": "pkg.forms", "__package__": "pkg"}
+    exec(normalized, namespace)
+    form = namespace["ContactForm"]()
+    assert 'name="csrf_token"' in str(form.hidden_tag())
+    assert runtime.session["_csrf_token"]
+    assert form.validate_on_submit() is True
+
+    consumer = recipe.normalize_generated(
+        "pkg/views.py",
+        "from fastapi import Request\n"
+        "from pkg.forms import ContactForm\n"
+        "async def contact(request: Request):\n"
+        "    form = ContactForm()\n"
+        "    return form.validate_on_submit()\n",
+        plan,
+    )
+    assert "ContactForm(await request.form() if request.method == 'POST' else None)" in consumer
+
+
+def test_basic_authorization_decoder_is_realized_from_source_semantics():
+    files = {
+        "pkg/auth.py": (
+            "from flask import request\n"
+            "def authenticate():\n    return request.authorization\n"
+        ),
+    }
+    planned = [_pf("pkg/auth.py", "router", "route_to_endpoint")]
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = (
+        "def authenticate(authorization):\n"
+        "    return _decode_basic_auth(authorization)\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/auth.py", generated, plan)
+
+    assert "import base64 as _portage_base64" in normalized
+    assert "def _decode_basic_auth(value):" in normalized
+    assert all_generation_violations(normalized, {}, "pkg/auth.py", plan) == []
+    namespace = {}
+    exec(normalized, namespace)
+    assert namespace["_decode_basic_auth"]("Basic dXNlcjpwYXNz") == ["user", "pass"]
+
+
+def test_app_context_facade_depends_on_and_uses_the_runtime_owner(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "commands.py").write_text(
+        "def init_app(app):\n"
+        "    @app.cli.command('seed')\n"
+        "    def seed(): pass\n"
+    )
+    files = {
+        "pkg/app.py": "from flask import Flask\ndef create_app(): return Flask(__name__)\n",
+        "pkg/model.py": "from flask import current_app\nprint(current_app.config)\n",
+        "tests/conftest.py": (
+            "from pkg.app import create_app\n"
+            "def app():\n"
+            "    app = create_app()\n"
+            "    with app.app_context():\n        yield app\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    proposal = [{
+        "path": "pkg/runtime.py", "role": "support", "purpose": "runtime",
+        "instructions": "runtime", "capabilities": ["request_context"],
+        "exports": [{
+            "name": "RuntimeContext", "kind": "class", "signature": "",
+            "members": ["dispatch"],
+        }],
+        "consumers": ["pkg/app.py", "pkg/model.py"], "depends_on": [],
+    }, {
+        "path": "pkg/testing.py", "role": "support", "purpose": "testing",
+        "instructions": "testing", "capabilities": ["direct_test_surface"],
+        "exports": [{
+            "name": "AppFacade", "kind": "class", "signature": "",
+            "members": ["app_context"],
+        }],
+        "consumers": ["pkg/app.py"], "depends_on": [],
+    }]
+
+    completed, _audit = recipe.materialize_artifact_contracts(
+        proposal, files, planned,
+    )
+    facade = next(item for item in completed if item["path"] == "pkg/testing.py")
+    assert facade["depends_on"] == ["pkg/runtime.py"]
+    created = PlannedFile(
+        path=facade["path"], role=facade["role"], action="create",
+        artifact_contract=facade,
+    )
+    rendered = recipe.render_created_artifact(created, str(tmp_path))
+    assert "return _AppContext(self)" in rendered
+    assert "_register_cli_0" not in rendered
+
+
+def test_template_filter_consumers_require_the_template_environment_export(tmp_path):
+    (tmp_path / "pkg" / "templates").mkdir(parents=True)
+    files = {
+        "pkg/one.py": (
+            "from flask import Blueprint, render_template\n"
+            "from pkg.filters import shout\n"
+            "bp = Blueprint('one', __name__)\n"
+            "bp.add_app_template_filter(shout, 'loud')\n"
+            "def page(): return render_template('one.html')\n"
+        ),
+        "pkg/filters.py": "def shout(value): return value.upper()\n",
+        "pkg/two.py": (
+            "from flask import render_template\n"
+            "def page(): return render_template('two.html')\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    proposal = [{
+        "path": "pkg/templating.py", "role": "support",
+        "purpose": "Render templates.", "instructions": "Render templates.",
+        "capabilities": ["template_rendering"],
+        "consumers": ["pkg/one.py", "pkg/two.py"], "depends_on": [],
+        "exports": [{
+            "name": "render_template", "kind": "function",
+            "signature": "", "members": [],
+        }],
+    }]
+
+    completed, _audit = recipe.materialize_artifact_contracts(
+        proposal, files, planned,
+    )
+    artifact = completed[0]
+    assert {item["name"]: item["kind"] for item in artifact["exports"]} == {
+        "render_template": "function", "templates": "variable",
+    }
+
+    created = PlannedFile(
+        path=artifact["path"], role=artifact["role"], action="create",
+        artifact_contract=artifact,
+    )
+    rendered = recipe.render_created_artifact(created, str(tmp_path))
+    assert "templates = Jinja2Templates" in rendered
+    plan = recipe.build_seam_plan(files, [*planned, created], {}, [])
+    normalized = recipe.normalize_generated("pkg/templating.py", rendered, plan)
+    assert "from pkg.filters import shout as _portage_template_filter_0" in normalized
+    assert "templates.env.filters['loud'] = _portage_template_filter_0" in normalized
 
 
 def test_extension_provider_contract_freezes_surface_and_import_direction():
@@ -2842,6 +4348,197 @@ def test_direct_test_facade_captures_source_cli_registrar(tmp_path):
     )
 
 
+def test_module_bound_cli_registrar_is_removed_and_preserves_teardown(tmp_path):
+    files = {
+        "pkg/db.py": (
+            "from flask import current_app, g\n"
+            "def get_db(): return g.db\n"
+            "def get_db_dep(): yield get_db()\n"
+            "def close_db(error=None): g.pop('db', None)\n"
+        ),
+        "pkg/commands.py": (
+            "import click\n"
+            "from .db import close_db\n"
+            "@click.command('init-db')\n"
+            "def init_db_command(): pass\n"
+            "def init_app(app):\n"
+            "    app.teardown_appcontext(close_db)\n"
+            "    app.cli.add_command(init_db_command)\n"
+        ),
+        "pkg/__init__.py": (
+            "from flask import Flask\n"
+            "def create_app():\n"
+            "    app = Flask(__name__)\n"
+            "    from . import commands\n"
+            "    commands.init_app(app)\n"
+            "    return app\n"
+        ),
+        "tests/conftest.py": "def runner(app): return app.test_cli_runner()\n",
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+
+    factory = plan["decisions"]["application_factory:pkg/__init__.py"]
+    assert factory["cleanup_callbacks"] == [{
+        "provider": "pkg/db.py", "functions": ["close_db"],
+    }]
+    generated = (
+        "from pkg.testing import TargetApp\n"
+        "def create_app():\n"
+        "    app = TargetApp()\n"
+        "    from . import commands\n"
+        "    commands.init_app(app)\n"
+        "    return app\n"
+    )
+    plan["decisions"]["surface"] = {
+        "kind": "planned_test_surface", "provider": "pkg/testing.py",
+        "factory_consumers": ["pkg/__init__.py"],
+        "classes": [{"name": "TargetApp", "members": ["app_context"]}],
+        "files": ["pkg/__init__.py"], "instruction": "owned facade",
+    }
+
+    normalized = recipe.normalize_generated("pkg/__init__.py", generated, plan)
+
+    assert "commands.init_app(app)" not in normalized
+    assert "cleanup_callbacks=(_portage_cleanup_0,)" in normalized
+    assert "from pkg.db import close_db as _portage_cleanup_0" in normalized
+
+
+def test_initialized_sqlalchemy_facade_cleans_scoped_session_on_app_context_exit():
+    plan = {"decisions": {
+        "factory": {
+            "kind": "application_factory", "factory": "pkg/app.py",
+            "files": ["pkg/app.py", "pkg/extensions.py"],
+            "initializers": [{
+                "provider": "pkg/extensions.py", "symbol": "db",
+                "original_call": "db.init_app(app)",
+            }],
+            "cleanup_callbacks": [],
+        },
+        "database": {
+            "kind": "extension_provider", "provider": "pkg/extensions.py",
+            "symbol": "db", "members": ["init_app", "session"],
+            "files": ["pkg/app.py", "pkg/extensions.py"],
+        },
+        "surface": {
+            "kind": "planned_test_surface", "provider": "pkg/testing.py",
+            "factory_consumers": ["pkg/app.py"],
+            "classes": [{"name": "TargetApp", "members": ["app_context"]}],
+            "files": ["pkg/app.py"],
+        },
+    }}
+    generated = (
+        "from pkg.extensions import db\n"
+        "from pkg.testing import TargetApp\n"
+        "def create_app():\n"
+        "    app = TargetApp()\n"
+        "    db.init_app(app)\n"
+        "    return app\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert "cleanup_callbacks=(db.session.remove,)" in normalized
+
+
+def test_module_owned_extension_exception_is_not_laundered_through_provider():
+    plan = {"decisions": {"csrf": {
+        "kind": "provider_protocol", "provider": "pkg/extensions.py",
+        "symbol": "csrf", "exception_members": ["CSRFError"],
+        "files": ["pkg/extensions.py", "pkg/app.py"],
+    }}}
+    generated = (
+        "from fastapi import FastAPI\n"
+        "from pkg.extensions import csrf\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    @app.exception_handler(csrf.CSRFError)\n"
+        "    async def handle(request, error): return None\n"
+        "    return app\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/app.py", generated, plan)
+
+    assert "from pkg.extensions import CSRFError" in normalized
+    assert "app.exception_handler(CSRFError)" in normalized
+    assert "csrf.CSRFError" not in normalized
+
+
+def test_factory_instance_path_join_accepts_string_directory():
+    plan = {"decisions": {"factory": {
+        "kind": "application_factory", "factory": "pkg/__init__.py",
+        "app_state_members": ["instance_path"], "files": ["pkg/__init__.py"],
+        "instruction": "preserve instance path",
+    }}}
+    generated = (
+        "from fastapi import FastAPI\n"
+        "import tempfile\n"
+        "def create_app():\n"
+        "    instance_path = tempfile.mkdtemp()\n"
+        "    app = FastAPI()\n"
+        "    app.state.instance_path = instance_path\n"
+        "    app.state.config = {'DATABASE': str(instance_path / 'app.sqlite')}\n"
+        "    return app\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/__init__.py", generated, plan)
+
+    assert "str(_PortagePath(instance_path) / 'app.sqlite')" in normalized
+    assert "from pathlib import Path as _PortagePath" in normalized
+    harness = recipe.normalize_generated(
+        "tests/conftest.py",
+        "from _portage_fastapi_test_compat import adapt_app\n"
+        "def fixture():\n"
+        "    app = create_app()\n"
+        "    app = adapt_app(app, instance_path=app.instance_path)\n"
+        "    return app.instance_path\n",
+        plan,
+    )
+    assert "adapt_app(app, instance_path=app.state.instance_path)" in harness
+    assert "return app.instance_path" in harness
+
+
+def test_planned_provider_export_is_not_read_as_function_member():
+    plan = {"decisions": {"provider": {
+        "kind": "planned_provider_exports", "provider": "pkg/runtime.py",
+        "exports": {
+            "render": {"kind": "function", "members": []},
+            "engine": {"kind": "variable", "members": []},
+        },
+        "files": ["pkg/runtime.py", "pkg/views.py"],
+        "instruction": "consume frozen exports directly",
+    }}}
+    generated = (
+        "from pkg.runtime import render\n"
+        "engine = render.engine\n"
+        "def view(): return engine\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/views.py", generated, plan)
+
+    assert "engine as _portage_engine" in normalized
+    assert "engine = _portage_engine" in normalized
+    manifest = {
+        "runtime::render": {
+            "module": "pkg/runtime.py", "symbol": "render", "target_kind": "function",
+            "members": [], "provenance": "planned_create",
+        },
+        "runtime::engine": {
+            "module": "pkg/runtime.py", "symbol": "engine", "target_kind": "variable",
+            "members": [], "provenance": "planned_create",
+        },
+    }
+    assert planned_provider_import_violations(
+        normalized, manifest, "pkg/views.py",
+    ) == []
+    assert any(
+        "reads provider export `engine` as a member" in item
+        for item in planned_provider_import_violations(
+            generated, manifest, "pkg/views.py",
+        )
+    )
+
+
 def test_factory_normalization_preserves_inherited_object_config_and_session_import():
     files = {
         "pkg/__init__.py": (
@@ -3005,6 +4702,139 @@ def test_extension_provider_uses_source_factory_database_config():
     assert "return self.metadata.drop_all(*args, **kwargs)" in normalized
 
 
+def test_separate_source_database_provider_rebinds_to_runtime_config():
+    files = {
+        "pkg/extensions.py": (
+            "from flask_sqlalchemy import SQLAlchemy\n"
+            "db = SQLAlchemy()\n"
+        ),
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "from .extensions import db\n"
+            "def create_app(config=None):\n"
+            "    app = Flask(__name__)\n"
+            "    app.config.update(config or {})\n"
+            "    db.init_app(app)\n"
+            "    return app\n"
+        ),
+        "tests/test_db.py": (
+            "from pkg.extensions import db\n"
+            "def test_db():\n"
+            "    db.create_all()\n"
+            "    db.session.commit()\n"
+            "    db.drop_all()\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    decision = plan["decisions"]["extension_provider:pkg/extensions.py:db"]
+    assert decision["members"] == [
+        "create_all", "drop_all", "init_app", "session",
+    ]
+    generated = (
+        "from sqlalchemy import create_engine\n"
+        "from sqlalchemy.orm import DeclarativeBase, scoped_session, sessionmaker\n"
+        "class Base(DeclarativeBase): pass\n"
+        "engine = create_engine('sqlite:///initial.db')\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "class DBFacade:\n"
+        "    Model = Base\n"
+        "    engine = engine\n"
+        "    session = scoped_session(SessionLocal)\n"
+        "    def init_app(self): pass\n"
+        "    def create_all(self): pass\n"
+        "    def drop_all(self): pass\n"
+        "db = DBFacade()\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/extensions.py", generated, plan)
+    namespace = {}
+    exec(normalized, namespace)
+    db = namespace["db"]
+    initial_engine = db.engine
+    app = SimpleNamespace(state=SimpleNamespace(config={
+        "SQLALCHEMY_DATABASE_URI": "sqlite://",
+    }))
+
+    db.init_app(app)
+
+    assert db.engine is not initial_engine
+    assert str(db.engine.url) == "sqlite://"
+    db.create_all()
+    db.session.commit()
+    db.drop_all()
+
+    namespace_generated = (
+        "from types import SimpleNamespace\n"
+        "from sqlalchemy import create_engine\n"
+        "from sqlalchemy.orm import DeclarativeBase, scoped_session, sessionmaker\n"
+        "class Base(DeclarativeBase): pass\n"
+        "engine = create_engine('sqlite:///initial.db')\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "def init_app(app): session.configure(bind=create_engine('sqlite:///wrong.db'))\n"
+        "db = SimpleNamespace(session=SessionLocal(), Model=Base, init_app=init_app, "
+        "create_all=lambda: Base.metadata.create_all(bind=engine), "
+        "drop_all=lambda: Base.metadata.drop_all(bind=engine))\n"
+    )
+    namespace_normalized = recipe.normalize_generated(
+        "pkg/extensions.py", namespace_generated, plan,
+    )
+    assert "init_app=_portage_db_init_app" in namespace_normalized
+    namespace = {}
+    exec(namespace_normalized, namespace)
+    namespace["db"].init_app(app)
+    assert str(namespace["db"].engine.url) == "sqlite://"
+    namespace["db"].create_all()
+    namespace["db"].drop_all()
+
+
+def test_runtime_rebound_database_provider_has_import_safe_bootstrap_engine():
+    files = {
+        "pkg/extensions.py": (
+            "from flask_sqlalchemy import SQLAlchemy\n"
+            "db = SQLAlchemy()\n"
+        ),
+        "pkg/app.py": (
+            "from flask import Flask\n"
+            "from .extensions import db\n"
+            "def create_app(config=None):\n"
+            "    app = Flask(__name__)\n"
+            "    app.config.update(config or {})\n"
+            "    db.init_app(app)\n"
+            "    return app\n"
+        ),
+        "tests/test_db.py": (
+            "from pkg.extensions import db\n"
+            "def test_db(): db.create_all()\n"
+        ),
+    }
+    planned = recipe.plan_files(files)
+    plan = recipe.build_seam_plan(files, planned, {}, [])
+    generated = (
+        "from sqlalchemy import create_engine\n"
+        "from sqlalchemy.orm import DeclarativeBase, scoped_session, sessionmaker\n"
+        "def build_runtime_config(instance_path):\n"
+        "    return {'SQLALCHEMY_DATABASE_URI': 'sqlite:///configured.db'}\n"
+        "class Base(DeclarativeBase): pass\n"
+        "engine = create_engine(build_runtime_config()['SQLALCHEMY_DATABASE_URI'])\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "class DBFacade:\n"
+        "    Model = Base\n"
+        "    engine = engine\n"
+        "    session = scoped_session(SessionLocal)\n"
+        "    def init_app(self, app): pass\n"
+        "    def create_all(self): pass\n"
+        "db = DBFacade()\n"
+    )
+
+    normalized = recipe.normalize_generated("pkg/extensions.py", generated, plan)
+    namespace = {}
+    exec(normalized, namespace)
+
+    assert "build_runtime_config()" not in normalized
+    assert str(namespace["db"].engine.url) == "sqlite://"
+
+
 def test_dynamic_class_lambda_methods_receive_the_bound_instance():
     files = {"pkg/__init__.py": (
         "from flask import Flask\n"
@@ -3078,6 +4908,8 @@ def test_direct_decorator_provider_protocol_is_binding_aware_and_realized():
     generated = (
         "class Carrier:\n"
         "    label = translate('wrong')\n"
+        "    def verify(self, callback): return None\n"
+        "    def init_app(self, app): pass\n"
         "sentinel = Carrier()\n"
         "@sentinel.verify\n"
         "def remember(value): return value\n"
@@ -3095,7 +4927,9 @@ def test_direct_decorator_provider_protocol_is_binding_aware_and_realized():
     assert type(namespace["sentinel"]).__name__ == "Carrier"
     assert namespace["sentinel"].label == "Access"
     assert namespace["remember"]("kept") == "kept"
-    assert namespace["sentinel"].init_app(object()) is None
+    app = object()
+    assert namespace["sentinel"].init_app(app) is app
+    assert namespace["sentinel"]._apps == [(app, (), {})]
     assert framework_seam_violations(
         normalized, plan, "pkg/security.py",
     ) == []
@@ -3181,6 +5015,7 @@ def test_flask_login_surface_is_compiled_rendered_and_wired_from_source(tmp_path
     assert rendered_auth is not None
     assert "current_user = _CurrentUserProxy()" in rendered_auth
     assert "async def wrapped_view(**kwargs)" in rendered_auth
+    assert "inspect.signature(view, eval_str=True)" in rendered_auth
     assert "from pkg.extensions import load_user as _load_user_callback" in rendered_auth
     assert "loader = _load_user_callback" in rendered_auth
 
@@ -3607,7 +5442,7 @@ def test_extension_mapping_is_realized_as_source_exercised_object_surface():
 def test_source_exercised_sqlalchemy_methods_work_on_both_facade_shapes():
     members = [
         "Model", "create_all", "drop_all", "first_or_404", "get_or_404",
-        "init_app", "metadata", "paginate", "session",
+        "init_app", "metadata", "paginate", "select", "session",
     ]
     plan = {"decisions": {"extension_provider:pkg/__init__.py:db": {
         "kind": "extension_provider", "provider": "pkg/__init__.py",
@@ -3656,15 +5491,14 @@ def test_source_exercised_sqlalchemy_methods_work_on_both_facade_shapes():
         exec(normalized, namespace)
         db = namespace["db"]
         record = namespace["Record"]
-        select = namespace["select"]
         db.create_all()
         db.session.add_all([record(id=1), record(id=2)])
         db.session.commit()
 
         assert db.get_or_404(record, 1).id == 1
-        assert db.first_or_404(select(record).where(record.id == 2)).id == 2
-        first = db.paginate(select(record).order_by(record.id), page=1, per_page=1)
-        second = db.paginate(select(record).order_by(record.id), page=2, per_page=1)
+        assert db.first_or_404(db.select(record).where(record.id == 2)).id == 2
+        first = db.paginate(db.select(record).order_by(record.id), page=1, per_page=1)
+        second = db.paginate(db.select(record).order_by(record.id), page=2, per_page=1)
         assert [item.id for item in first.items] == [1]
         assert (first.total, first.pages, first.has_next, first.next_num) == (
             2, 2, True, 2,

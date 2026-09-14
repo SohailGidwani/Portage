@@ -1,5 +1,16 @@
 # CLAUDE.md — Portage
 
+## Current stopping decision — September 13, 2026
+
+The R5 remediation goal is **stopped with incomplete preservation**, not complete.
+All three former R5 repos later achieved one autonomous development K1 green; the latest
+Microblog preservation replay is red. The README and `docs/assets/portfolio/portage.md`
+describe the frozen demonstration and current standing. Older phase plans below are history,
+not instructions to resume evaluations. Do not start paid migration runs, expand the recipe,
+or touch a fresh held-out repository without a new explicit user request. Local stabilization
+checks do not establish a migration-success improvement. Implementation notes stay in the
+gitignored `notes/` directory.
+
 Guidance for Claude Code (and humans) working in this repo. Keep future sessions aligned
 with the decisions already made. **`code-migration-agent-planV2.md` (v2) is the source of
 truth**, with `portage-v2-forward-plan.md` as the reasoning behind the v2 pivot; this file

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import re
+from copy import deepcopy
+from http import HTTPStatus
+from pathlib import PurePosixPath
 
 from portage_agent.agent.nodes.common import _module_names, _resolve_module
 
@@ -11,6 +14,355 @@ from ._flask_analysis import (
     _FLASK_LOGIN_NAMES,
     _parsed,
 )
+from ._flask_runtime import _module_import_index
+
+
+def _template_filter_contracts(files: dict[str, str]) -> list[dict]:
+    """Resolve source-registered Jinja filters to importable callables."""
+    contracts = []
+    for path, source in files.items():
+        tree = _parsed(source)
+        if tree is None:
+            continue
+        imports = {
+            alias.asname or alias.name: {
+                "module": _resolve_module(statement.module, statement.level, path),
+                "symbol": alias.name,
+            }
+            for statement in tree.body if isinstance(statement, ast.ImportFrom)
+            for alias in statement.names if alias.name != "*"
+        }
+        local_functions = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def registration(
+            value: ast.AST,
+            name: str | None = None,
+            imports: dict = imports,
+            local_functions: set[str] = local_functions,
+            path: str = path,
+        ) -> dict | None:
+            if not isinstance(value, ast.Name):
+                return None
+            resolved = imports.get(value.id)
+            if resolved is None and value.id in local_functions:
+                resolved = {
+                    "module": path.removesuffix(".py").replace("/", "."),
+                    "symbol": value.id,
+                }
+            return {**resolved, "name": name or resolved["symbol"]} if resolved else None
+
+        for call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"add_app_template_filter", "add_template_filter"}
+            and node.args
+        ):
+            named = next((
+                keyword.value.value for keyword in call.keywords
+                if keyword.arg == "name" and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, str)
+            ), None)
+            if named is None and len(call.args) > 1 and isinstance(
+                call.args[1], ast.Constant,
+            ) and isinstance(call.args[1].value, str):
+                named = call.args[1].value
+            if item := registration(call.args[0], named):
+                contracts.append(item)
+        for function in (
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for decorator in function.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr in {"app_template_filter", "template_filter"}
+                ):
+                    continue
+                named = next((
+                    keyword.value.value for keyword in decorator.keywords
+                    if keyword.arg == "name" and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ), None)
+                if named is None and decorator.args and isinstance(
+                    decorator.args[0], ast.Constant,
+                ) and isinstance(decorator.args[0].value, str):
+                    named = decorator.args[0].value
+                if item := registration(ast.Name(id=function.name), named):
+                    contracts.append(item)
+    return sorted(
+        {(
+            item["module"], item["symbol"], item["name"],
+        ): item for item in contracts}.values(),
+        key=lambda item: (item["name"], item["module"], item["symbol"]),
+    )
+
+
+def _realize_basic_auth_decoding(
+    path: str, content: str, seam_plan: dict | None,
+) -> str:
+    """Close model-invented Basic-auth decoder calls with the stdlib."""
+    if not any(
+        item.get("kind") == "basic_auth" and item.get("path") == path
+        for item in (seam_plan or {}).get("decisions", {}).values()
+    ):
+        return content
+    tree = _parsed(content)
+    if tree is None:
+        return content
+    bound = {
+        name
+        for statement in tree.body
+        for name in (
+            [statement.name]
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            else [alias.asname or alias.name.split(".")[0] for alias in statement.names]
+            if isinstance(statement, (ast.Import, ast.ImportFrom))
+            else [
+                target.id for target in statement.targets
+                if isinstance(target, ast.Name)
+            ]
+            if isinstance(statement, ast.Assign)
+            else []
+        )
+    }
+    missing = sorted({
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id not in bound
+        and re.search(
+            r"(?:decode|parse).*basic.*auth|basic.*auth.*(?:decode|parse)",
+            node.func.id, re.IGNORECASE,
+        )
+    })
+    if not missing:
+        return content
+    imported_alias = next((
+        alias for statement in tree.body if isinstance(statement, ast.Import)
+        for alias in statement.names if alias.name == "base64"
+    ), None)
+    if imported_alias is None:
+        index = int(bool(
+            tree.body and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ))
+        while (
+            index < len(tree.body)
+            and isinstance(tree.body[index], ast.ImportFrom)
+            and tree.body[index].module == "__future__"
+        ):
+            index += 1
+        tree.body.insert(index, ast.Import(
+            names=[ast.alias(name="base64", asname="_portage_base64")],
+        ))
+        base64_name = "_portage_base64"
+    else:
+        base64_name = imported_alias.asname or "base64"
+    helpers = []
+    for name in missing:
+        helpers.extend(ast.parse(
+            f"def {name}(value):\n"
+            "    scheme, token = value.split(' ', 1)\n"
+            "    if scheme.lower() != 'basic':\n"
+            "        raise ValueError('invalid Basic authorization')\n"
+            f"    decoded = {base64_name}.b64decode(token, validate=True).decode('utf-8')\n"
+            "    if ':' not in decoded:\n"
+            "        raise ValueError('invalid Basic authorization')\n"
+            "    return decoded.split(':', 1)\n"
+        ).body)
+    tree.body.extend(helpers)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _normalize_template_directory(content: str) -> str:
+    """Keep relative template roots package-relative, matching Flask semantics."""
+    tree = _parsed(content)
+    if tree is None:
+        return content
+    changed = False
+    for call in (
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and ast.unparse(node.func).split(".")[-1] == "Jinja2Templates"
+    ):
+        keyword = next((item for item in call.keywords if item.arg == "directory"), None)
+        if not (
+            keyword is not None and isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, str)
+            and not PurePosixPath(keyword.value.value).is_absolute()
+        ):
+            continue
+        expression: ast.expr = ast.Attribute(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Call(
+                        func=ast.Name(id="Path", ctx=ast.Load()),
+                        args=[ast.Name(id="__file__", ctx=ast.Load())], keywords=[],
+                    ),
+                    attr="resolve", ctx=ast.Load(),
+                ),
+                args=[], keywords=[],
+            ),
+            attr="parent", ctx=ast.Load(),
+        )
+        for part in PurePosixPath(keyword.value.value).parts:
+            expression = ast.BinOp(
+                left=expression, op=ast.Div(), right=ast.Constant(part),
+            )
+        keyword.value = ast.Call(
+            func=ast.Name(id="str", ctx=ast.Load()), args=[expression], keywords=[],
+        )
+        changed = True
+    if not changed:
+        return content
+    pathlib_import = next((
+        statement for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "pathlib"
+    ), None)
+    if pathlib_import is None:
+        index = int(bool(
+            tree.body and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ))
+        while (
+            index < len(tree.body) and isinstance(tree.body[index], ast.ImportFrom)
+            and tree.body[index].module == "__future__"
+        ):
+            index += 1
+        tree.body.insert(index, ast.ImportFrom(
+            module="pathlib", names=[ast.alias(name="Path")], level=0,
+        ))
+    elif not any(alias.name == "Path" for alias in pathlib_import.names):
+        pathlib_import.names.append(ast.alias(name="Path"))
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _normalize_flask_string_responses(content: str) -> str:
+    """Keep Flask's HTML response semantics for computed string route results."""
+    tree = _parsed(content)
+    if tree is None:
+        return content
+    route_functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr in {
+                "api_route", "delete", "get", "head", "options", "patch", "post", "put",
+            }
+            for decorator in node.decorator_list
+        )
+    ]
+    if not route_functions:
+        return content
+
+    class WrapReturns(ast.NodeTransformer):
+        changed = False
+
+        def visit_FunctionDef(self, node):  # noqa: N802
+            return node
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Return(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if node.value is None or (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_portage_flask_response"
+            ):
+                return node
+            self.changed = True
+            node.value = ast.Call(
+                func=ast.Name(id="_portage_flask_response", ctx=ast.Load()),
+                args=[node.value], keywords=[],
+            )
+            return node
+
+    wrapper = WrapReturns()
+    for function in route_functions:
+        function.body = [wrapper.visit(statement) for statement in function.body]
+    if not wrapper.changed:
+        return content
+    response_import = next((
+        statement for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and statement.module in {"fastapi.responses", "starlette.responses"}
+    ), None)
+    if response_import is None:
+        tree.body.insert(_module_import_index(tree), ast.ImportFrom(
+            module="fastapi.responses", names=[ast.alias(name="HTMLResponse")], level=0,
+        ))
+    elif not any(alias.name == "HTMLResponse" for alias in response_import.names):
+        response_import.names.append(ast.alias(name="HTMLResponse"))
+    tree.body.append(ast.parse(
+        "def _portage_flask_response(value):\n"
+        "    return HTMLResponse(value) if isinstance(value, str) else value\n"
+    ).body[0])
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _normalize_async_request_dependencies(content: str) -> str:
+    """Await Starlette request-body methods inside FastAPI dependencies."""
+    tree = _parsed(content)
+    if tree is None:
+        return content
+    dependency_names = {
+        node.args[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func).split(".")[-1] == "Depends"
+        and node.args and isinstance(node.args[0], ast.Name)
+    }
+    if not dependency_names:
+        return content
+
+    class AwaitRequest(ast.NodeTransformer):
+        changed = False
+
+        def visit_Await(self, node):  # noqa: N802
+            return node
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"body", "form", "json"}
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "request"
+            ):
+                return node
+            self.changed = True
+            return ast.Await(value=node)
+
+    changed = False
+    for index, function in enumerate(tree.body):
+        if not (
+            isinstance(function, ast.FunctionDef)
+            and function.name in dependency_names
+        ):
+            continue
+        awaiter = AwaitRequest()
+        function = awaiter.visit(function)
+        if not awaiter.changed:
+            continue
+        tree.body[index] = ast.copy_location(ast.AsyncFunctionDef(**{
+            field: getattr(function, field) for field in function._fields
+        }), function)
+        changed = True
+    if not changed:
+        return content
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
 
 
 def _normalize_translation_literals(
@@ -200,6 +552,24 @@ def _normalize_template_response(content: str) -> str:
         )
         if isinstance(target, ast.Name)
     }
+    imported_instances = {
+        alias.asname or alias.name
+        for statement in tree.body if isinstance(statement, ast.ImportFrom)
+        for alias in statement.names if alias.name == "templates"
+    }
+    instances.update(imported_instances)
+    instances.update(
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and isinstance(statement.value, ast.Name)
+        and statement.value.id in imported_instances
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name)
+    )
     if not instances:
         return content
     direct_names = {
@@ -210,14 +580,81 @@ def _normalize_template_response(content: str) -> str:
         for alias in statement.names if alias.name == "TemplateResponse"
     }
 
+    def request_argument(function):
+        return next((
+            argument for argument in [
+                *function.args.posonlyargs, *function.args.args,
+                *function.args.kwonlyargs,
+            ]
+            if argument.arg == "request"
+            or argument.annotation is not None
+            and ast.unparse(argument.annotation).split(".")[-1] == "Request"
+        ), None)
+
+    wired = False
+    functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def own_calls(function, name):
+        calls = []
+
+        class Calls(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):  # noqa: N802
+                return None
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node):  # noqa: N802
+                if isinstance(node.func, ast.Name) and node.func.id == name:
+                    calls.append(node)
+                self.generic_visit(node)
+
+        visitor = Calls()
+        for statement in function.body:
+            visitor.visit(statement)
+        return calls
+
+    for helper in functions:
+        if request_argument(helper) is not None or not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "TemplateResponse"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in instances
+            for node in ast.walk(helper)
+        ):
+            continue
+        call_sites = []
+        annotation = None
+        for caller in functions:
+            if caller is helper:
+                continue
+            calls = own_calls(caller, helper.name)
+            if not calls:
+                continue
+            argument = request_argument(caller)
+            if argument is None:
+                call_sites = []
+                break
+            annotation = annotation or argument.annotation
+            call_sites.extend((call, argument.arg) for call in calls)
+        if not call_sites:
+            continue
+        helper.args.args.append(ast.arg(arg="request", annotation=annotation))
+        for call, name in call_sites:
+            call.args.append(ast.Name(id=name, ctx=ast.Load()))
+        wired = True
+
     class Upgrade(ast.NodeTransformer):
         def __init__(self):
             self.requests: list[str] = []
             self.changed = False
 
         def _function(self, node):
-            positional = [*node.args.posonlyargs, *node.args.args]
-            self.requests.append(positional[0].arg if positional else "")
+            argument = request_argument(node)
+            self.requests.append(argument.arg if argument else "")
             node = self.generic_visit(node)
             self.requests.pop()
             return node
@@ -270,20 +707,136 @@ def _normalize_template_response(content: str) -> str:
             return node
 
     upgrade = Upgrade()
+    upgrade.changed = wired
     tree = upgrade.visit(tree)
-    if not upgrade.changed:
+    if upgrade.changed:
+        for statement in list(tree.body):
+            if not (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module in {"starlette.responses", "fastapi.responses"}
+            ):
+                continue
+            statement.names = [
+                alias for alias in statement.names if alias.name != "TemplateResponse"
+            ]
+            if not statement.names:
+                tree.body.remove(statement)
+
+    json_response_names = {
+        alias.asname or alias.name
+        for statement in tree.body if isinstance(statement, ast.ImportFrom)
+        and statement.module in {"fastapi.responses", "starlette.responses"}
+        for alias in statement.names if alias.name == "JSONResponse"
+    }
+    template_helpers = {
+        function.name: function
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (returns := [
+            statement.value for statement in function.body
+            if isinstance(statement, ast.Return) and statement.value is not None
+        ])
+        and all(
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func).split(".")[-1]
+            in {"TemplateResponse", "render_template"}
+            for value in returns
+        )
+    }
+
+    class FlattenTemplateJSON(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not (
+                isinstance(node.func, ast.Name) and node.func.id in json_response_names
+            ):
+                return node
+            content = node.args[0] if node.args else next((
+                keyword.value for keyword in node.keywords if keyword.arg == "content"
+            ), None)
+            if not isinstance(content, ast.Call):
+                return node
+            template_call = (
+                isinstance(content.func, ast.Attribute)
+                and content.func.attr == "TemplateResponse"
+                and isinstance(content.func.value, ast.Name)
+                and content.func.value.id in instances
+            )
+            helper_call = (
+                isinstance(content.func, ast.Name)
+                and content.func.id in template_helpers
+            )
+            if not (template_call or helper_call):
+                return node
+            outer_status = next((
+                keyword for keyword in node.keywords if keyword.arg == "status_code"
+            ), None)
+            if outer_status and helper_call:
+                helper = template_helpers[content.func.id]
+                for returned in (
+                    statement for statement in helper.body
+                    if isinstance(statement, ast.Return)
+                    and isinstance(statement.value, ast.Call)
+                ):
+                    if not any(
+                        keyword.arg == "status_code"
+                        for keyword in returned.value.keywords
+                    ):
+                        returned.value.keywords.append(deepcopy(outer_status))
+            elif outer_status and not any(
+                keyword.arg == "status_code" for keyword in content.keywords
+            ):
+                content.keywords.append(deepcopy(outer_status))
+            self.changed = True
+            return content
+
+    flatten_json = FlattenTemplateJSON()
+    tree = flatten_json.visit(tree)
+    if flatten_json.changed:
+        for statement in list(tree.body):
+            if not (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module in {"fastapi.responses", "starlette.responses"}
+            ):
+                continue
+            statement.names = [
+                alias for alias in statement.names if alias.name != "JSONResponse"
+            ]
+            if not statement.names:
+                tree.body.remove(statement)
+
+    response_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and statement.module in {"fastapi", "fastapi.responses", "starlette.responses"}
+        for alias in statement.names if alias.name in {"Response", "HTMLResponse"}
+    }
+
+    class FlattenResponse(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not (
+                isinstance(node.func, ast.Name)
+                and node.func.id in response_names
+                and len(node.args) == 1
+                and all(keyword.arg == "media_type" for keyword in node.keywords)
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id in template_helpers
+            ):
+                return node
+            self.changed = True
+            return node.args[0]
+
+    flatten = FlattenResponse()
+    tree = flatten.visit(tree)
+    if not (upgrade.changed or flatten_json.changed or flatten.changed):
         return content
-    for statement in list(tree.body):
-        if not (
-            isinstance(statement, ast.ImportFrom)
-            and statement.module in {"starlette.responses", "fastapi.responses"}
-        ):
-            continue
-        statement.names = [
-            alias for alias in statement.names if alias.name != "TemplateResponse"
-        ]
-        if not statement.names:
-            tree.body.remove(statement)
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
 
@@ -367,6 +920,311 @@ def _normalize_exception_handler_status(content: str) -> str:
     return ast.unparse(tree) + "\n"
 
 
+def _realize_route_response_statuses(
+    path: str, content: str, seam_plan: dict | None,
+) -> str:
+    """Restore frozen non-success statuses on translated route returns."""
+    decision = next((
+        item for item in (seam_plan or {}).get("decisions", {}).values()
+        if item.get("kind") == "route_response_statuses" and item.get("path") == path
+    ), None)
+    tree = _parsed(content)
+    if decision is None or tree is None:
+        return content
+    functions = {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    changed = False
+
+    def exception_names(node: ast.AST | None) -> set[str]:
+        if isinstance(node, ast.Tuple):
+            return {name for item in node.elts for name in exception_names(item)}
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return {ast.unparse(node).split(".")[-1]}
+        return set()
+
+    def apply_status(returned: ast.Return, status: int, scope: ast.AST) -> None:
+        nonlocal changed
+        value = returned.value
+        if value is None:
+            return
+        if isinstance(value, ast.Name) and (
+            value.id == "_portage_response"
+            or any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == value.id
+                    and target.attr == "status_code"
+                    for target in node.targets
+                )
+                for node in ast.walk(scope)
+            )
+        ):
+            return
+        if (
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id == "_portage_flask_response" and len(value.args) == 1
+        ):
+            apply_status(ast.Return(value=value.args[0]), status, scope)
+            return
+        if isinstance(value, ast.Call) and ast.unparse(value.func).split(".")[-1] in {
+            "HTMLResponse", "JSONResponse", "PlainTextResponse", "Response",
+            "TemplateResponse", "render_template",
+        }:
+            keyword = next((item for item in value.keywords if item.arg == "status_code"), None)
+            if keyword is None:
+                value.keywords.append(ast.keyword(
+                    arg="status_code", value=ast.Constant(status),
+                ))
+            else:
+                keyword.value = ast.Constant(status)
+            changed = True
+            return
+        if (
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and (helper := functions.get(value.func.id)) is not None
+        ):
+            helper_returns = [
+                node for statement in helper.body for node in ast.walk(statement)
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            if helper_returns and all(
+                isinstance(item.value, ast.Call)
+                and ast.unparse(item.value.func).split(".")[-1]
+                in {"TemplateResponse", "render_template"}
+                for item in helper_returns
+            ):
+                for item in helper_returns:
+                    apply_status(item, status, helper)
+                return
+        returned.value = ast.Call(
+            func=ast.Name(id="JSONResponse", ctx=ast.Load()), args=[],
+            keywords=[
+                ast.keyword(arg="content", value=value),
+                ast.keyword(arg="status_code", value=ast.Constant(status)),
+            ],
+        )
+        changed = True
+
+    for route in decision.get("routes", []):
+        function = functions.get(route["function"])
+        if function is None:
+            continue
+        for contract in route.get("handlers", []):
+            for handler in (
+                node for node in ast.walk(function) if isinstance(node, ast.ExceptHandler)
+                and exception_names(node.type) & set(contract["exceptions"])
+            ):
+                for returned in (
+                    node for statement in handler.body for node in ast.walk(statement)
+                    if isinstance(node, ast.Return)
+                ):
+                    apply_status(returned, contract["status_code"], handler)
+        for returned in (
+            node for node in ast.walk(function) if isinstance(node, ast.Return)
+            and node.value is not None
+        ):
+            literals = {
+                node.value for node in ast.walk(returned.value)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            matches = [
+                item for item in route.get("returns", [])
+                if literals & set(item["literals"])
+            ]
+            if len(matches) == 1:
+                apply_status(returned, matches[0]["status_code"], function)
+
+    envelope_keys: dict[int, set[str]] = {}
+    for route in decision.get("routes", []):
+        for contract in [*route.get("handlers", []), *route.get("returns", [])]:
+            if key := contract.get("content_key"):
+                envelope_keys.setdefault(contract["status_code"], set()).add(key)
+    envelopes = {
+        status: next(iter(keys)) for status, keys in envelope_keys.items()
+        if len(keys) == 1
+    }
+    exception_contracts: dict[str, set[tuple[int, str]]] = {}
+    for route in decision.get("routes", []):
+        for contract in route.get("handlers", []):
+            if key := contract.get("content_key"):
+                for exception in contract.get("exceptions", []):
+                    exception_contracts.setdefault(exception, set()).add((
+                        contract["status_code"], key,
+                    ))
+    exception_envelopes = {
+        exception: next(iter(contracts))
+        for exception, contracts in exception_contracts.items()
+        if len(contracts) == 1
+    }
+    http_exception_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
+        for alias in statement.names if alias.name == "HTTPException"
+    }
+
+    def status_value(call: ast.Call) -> int | None:
+        value = next(
+            (item.value for item in call.keywords if item.arg == "status_code"),
+            call.args[0] if call.args else None,
+        )
+        if isinstance(value, ast.Constant) and isinstance(value.value, int):
+            return value.value
+        if isinstance(value, ast.Attribute) and value.attr in HTTPStatus.__members__:
+            return HTTPStatus[value.attr].value
+        return None
+
+    factory = next((
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "create_app"
+    ), None)
+    app_name = next((
+        node.value.id for node in reversed(factory.body if factory else [])
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+    ), None)
+    if factory is None or app_name is None:
+        envelopes = {}
+        exception_envelopes = {}
+
+    dependency_names = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func).split(".")[-1] == "Depends"
+            and node.args
+        ):
+            continue
+        dependency = node.args[0]
+        if isinstance(dependency, ast.Name):
+            dependency_names.add(dependency.id)
+        elif isinstance(dependency, ast.Call) and isinstance(dependency.func, ast.Name):
+            dependency_names.add(dependency.func.id)
+
+    source_statuses = set()
+
+    class DependencyExceptions(ast.NodeTransformer):
+        def visit_Raise(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not (
+                isinstance(node.exc, ast.Call)
+                and isinstance(node.exc.func, ast.Name)
+                and node.exc.func.id in exception_envelopes
+            ):
+                return node
+            status, _ = exception_envelopes[node.exc.func.id]
+            detail = node.exc.args[0] if node.exc.args else ast.Constant(node.exc.func.id)
+            node.exc = ast.Call(
+                func=ast.Name(id="_PortageEnvelopeHTTPException", ctx=ast.Load()),
+                args=[], keywords=[
+                    ast.keyword(arg="status_code", value=ast.Constant(status)),
+                    ast.keyword(arg="detail", value=detail),
+                ],
+            )
+            source_statuses.add(status)
+            return node
+
+    dependency_normalizer = DependencyExceptions()
+    for function in (
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in dependency_names
+    ):
+        dependency_normalizer.visit(function)
+
+    if source_statuses and not http_exception_names:
+        fastapi_import = next((
+            statement for statement in tree.body
+            if isinstance(statement, ast.ImportFrom) and statement.module == "fastapi"
+        ), None)
+        if fastapi_import is None:
+            tree.body.insert(_module_import_index(tree), ast.ImportFrom(
+                module="fastapi", names=[ast.alias(name="HTTPException")], level=0,
+            ))
+        else:
+            fastapi_import.names.append(ast.alias(name="HTTPException"))
+        http_exception_names.add("HTTPException")
+
+    class EnvelopeExceptions(ast.NodeTransformer):
+        statuses: set[int] = set()
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            status = status_value(node)
+            if not (
+                isinstance(node.func, ast.Name)
+                and node.func.id in http_exception_names
+                and status in envelopes
+            ):
+                return node
+            node.func = ast.Name(
+                id="_PortageEnvelopeHTTPException", ctx=ast.Load(),
+            )
+            self.statuses.add(status)
+            return node
+
+    envelope_normalizer = EnvelopeExceptions()
+    envelope_normalizer.statuses.update(source_statuses)
+    tree = envelope_normalizer.visit(tree)
+    if envelope_normalizer.statuses and not any(
+        isinstance(node, ast.ClassDef)
+        and node.name == "_PortageEnvelopeHTTPException"
+        for node in tree.body
+    ):
+        http_exception_name = sorted(http_exception_names)[0]
+        exception_class = ast.parse(
+            f"class _PortageEnvelopeHTTPException({http_exception_name}):\n"
+            "    pass"
+        ).body[0]
+        index = tree.body.index(factory)
+        tree.body.insert(index, exception_class)
+        mapping = {
+            status: envelopes[status]
+            for status in sorted(envelope_normalizer.statuses)
+        }
+        handler = ast.parse(
+            f"@{app_name}.exception_handler(_PortageEnvelopeHTTPException)\n"
+            "async def _portage_http_exception_envelope(_request, exc):\n"
+            f"    key = {mapping!r}[exc.status_code]\n"
+            "    return JSONResponse(content={key: exc.detail}, "
+            "status_code=exc.status_code, headers=exc.headers)"
+        ).body[0]
+        return_index = next(
+            index for index in range(len(factory.body) - 1, -1, -1)
+            if isinstance(factory.body[index], ast.Return)
+        )
+        factory.body.insert(return_index, handler)
+        changed = True
+    if not changed:
+        return content
+    imported = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "fastapi.responses"
+        and any(alias.name == "JSONResponse" for alias in statement.names)
+        for statement in tree.body
+    )
+    if not imported:
+        index = int(bool(
+            tree.body and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ))
+        while (
+            index < len(tree.body) and isinstance(tree.body[index], ast.ImportFrom)
+            and tree.body[index].module == "__future__"
+        ):
+            index += 1
+        tree.body.insert(index, ast.ImportFrom(
+            module="fastapi.responses", names=[ast.alias(name="JSONResponse")], level=0,
+        ))
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
 def _realize_template_consumers(
     path: str, content: str, seam_plan: dict | None,
 ) -> str:
@@ -402,6 +1260,14 @@ def _realize_template_consumers(
     template_helpers = {
         node.name for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr in {
+                "api_route", "delete", "get", "head", "options", "patch", "post", "put",
+            }
+            for decorator in node.decorator_list
+        )
         and any(
             isinstance(call, ast.Call)
             and ast.unparse(call.func).split(".")[-1] == "TemplateResponse"
@@ -463,7 +1329,7 @@ def _realize_template_consumers(
                 module=provider.removesuffix(".py").replace("/", "."),
                 names=[], level=0,
             )
-            tree.body.insert(0, imported)
+            tree.body.insert(_module_import_index(tree), imported)
         if not any(alias.name == name for alias in imported.names):
             imported.names.append(ast.alias(name=name))
             imports_changed = True
@@ -518,6 +1384,52 @@ def _realize_template_consumers(
         ast.fix_missing_locations(tree)
         return ast.unparse(tree) + "\n"
 
+    ambient_provider = next((
+        providers[0]
+        for item in (seam_plan or {}).get("decisions", {}).values()
+        if item.get("kind") == "ambient_context_runtime"
+        and path in item.get("files", [])
+        and len(providers := item.get("runtime_providers", [])) == 1
+    ), "")
+    ambient_name = ""
+    if ambient_provider and any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        and call.func.id in local_names
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not any(
+            argument.arg == "request"
+            or argument.annotation is not None
+            and ast.unparse(argument.annotation).split(".")[-1] == "Request"
+            for argument in [
+                *function.args.posonlyargs, *function.args.args,
+                *function.args.kwonlyargs,
+            ]
+        )
+        for call in ast.walk(function)
+    ):
+        imported = next((
+            statement for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path)
+            in _module_names(ambient_provider)
+        ), None)
+        if imported is None:
+            imported = ast.ImportFrom(
+                module=ambient_provider.removesuffix(".py").replace("/", "."),
+                names=[], level=0,
+            )
+            tree.body.insert(_module_import_index(tree), imported)
+        alias = next((
+            item for item in imported.names if item.name == "g"
+        ), None)
+        if alias is None:
+            imported.names.append(ast.alias(name="g"))
+            imports_changed = True
+            ambient_name = "g"
+        else:
+            ambient_name = alias.asname or alias.name
+
     request_types = {
         alias.asname or alias.name
         for statement in tree.body
@@ -560,7 +1472,7 @@ def _realize_template_consumers(
         ))
         signature_changed = True
     if signature_changed and not request_types:
-        tree.body.insert(0, ast.ImportFrom(
+        tree.body.insert(_module_import_index(tree), ast.ImportFrom(
             module="starlette.requests", names=[ast.alias(name="Request")], level=0,
         ))
 
@@ -587,7 +1499,85 @@ def _realize_template_consumers(
 
         def visit_Call(self, node):  # noqa: N802
             node = self.generic_visit(node)
+            for index, argument in enumerate(node.args):
+                if (
+                    isinstance(argument, ast.Call)
+                    and isinstance(argument.func, ast.Name)
+                    and argument.func.id in local_names
+                ):
+                    node.args[index] = ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Attribute(
+                                value=argument, attr="body", ctx=ast.Load(),
+                            ),
+                            attr="decode", ctx=ast.Load(),
+                        ),
+                        args=[], keywords=[],
+                    )
+                    self.changed = True
+            for keyword in node.keywords:
+                if (
+                    isinstance(keyword.value, ast.Call)
+                    and isinstance(keyword.value.func, ast.Name)
+                    and keyword.value.func.id in local_names
+                ):
+                    keyword.value = ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Attribute(
+                                value=keyword.value, attr="body", ctx=ast.Load(),
+                            ),
+                            attr="decode", ctx=ast.Load(),
+                        ),
+                        args=[], keywords=[],
+                    )
+                    self.changed = True
             request = self.requests[-1] if self.requests else ""
+            is_template_call = (
+                isinstance(node.func, ast.Name) and node.func.id in local_names
+            )
+            without_request_types = [
+                argument for argument in node.args
+                if not (
+                    isinstance(argument, ast.Name) and argument.id in request_types
+                    or isinstance(argument, ast.Call)
+                    and ast.unparse(argument.func).split(".")[-1] in request_types
+                )
+            ]
+            if is_template_call and len(without_request_types) != len(node.args):
+                node.args = without_request_types
+                self.changed = True
+            if request:
+                while (
+                    len(node.args) >= 2
+                    and all(
+                        isinstance(argument, ast.Name) and argument.id == request
+                        for argument in node.args[:2]
+                    )
+                ):
+                    node.args.pop(1)
+                    self.changed = True
+            if (
+                request and len(local_names) == 1 and len(node.args) >= 2
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "TemplateResponse"
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == request
+            ):
+                context = node.args[2] if len(node.args) > 2 else None
+                keywords = [
+                    keyword for keyword in node.keywords
+                    if keyword.arg != "request"
+                ]
+                if not (
+                    context is None
+                    or isinstance(context, ast.Dict) and not context.keys
+                ):
+                    keywords.append(ast.keyword(arg=None, value=context))
+                self.changed = True
+                return ast.Call(
+                    func=ast.Name(id=next(iter(local_names)), ctx=ast.Load()),
+                    args=[node.args[0], node.args[1]], keywords=keywords,
+                )
             if (
                 request and isinstance(node.func, ast.Name)
                 and node.func.id in local_names
@@ -598,6 +1588,26 @@ def _realize_template_consumers(
             ):
                 node.args.insert(0, ast.Name(id=request, ctx=ast.Load()))
                 self.changed = True
+            elif (
+                not request and ambient_name and isinstance(node.func, ast.Name)
+                and node.func.id in local_names
+            ):
+                ambient_request = ast.Attribute(
+                    value=ast.Name(id=ambient_name, ctx=ast.Load()),
+                    attr="request", ctx=ast.Load(),
+                )
+                if (
+                    node.args and ast.dump(node.args[0]) == ast.dump(ambient_request)
+                ):
+                    while (
+                        len(node.args) >= 2
+                        and ast.dump(node.args[1]) == ast.dump(ambient_request)
+                    ):
+                        node.args.pop(1)
+                        self.changed = True
+                else:
+                    node.args.insert(0, ambient_request)
+                    self.changed = True
             return node
 
     realize = Realize()
@@ -692,60 +1702,97 @@ def _realize_template_provider_globals(
         item for item in (seam_plan or {}).get("decisions", {}).values()
         if item.get("kind") == "template_runtime"
         and path in item.get("provider_files", [])
-        and "current_user" in item.get("context_globals", [])
-        and item.get("authentication_provider")
     ), None)
     tree = _parsed(content)
     if decision is None or tree is None:
         return content
-    provider_path = decision["authentication_provider"]
-    provider = provider_path.removesuffix(".py").replace("/", ".")
-    imported = next((
-        statement for statement in tree.body
-        if isinstance(statement, ast.ImportFrom)
-        and _resolve_module(statement.module, statement.level, path) in _module_names(
-            provider_path
-        )
-    ), None)
-    if imported is not None:
-        imported.names = [
-            alias for alias in imported.names if alias.name != "current_user"
-        ]
-        if not imported.names:
-            tree.body.remove(imported)
-    for function in (
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "render_template"
-    ):
+    provider_path = decision.get("authentication_provider", "")
+    if "current_user" in decision.get("context_globals", []) and provider_path:
+        provider = provider_path.removesuffix(".py").replace("/", ".")
+        imported = next((
+            statement for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and _resolve_module(statement.module, statement.level, path) in _module_names(
+                provider_path
+            )
+        ), None)
+        if imported is not None:
+            imported.names = [
+                alias for alias in imported.names if alias.name != "current_user"
+            ]
+            if not imported.names:
+                tree.body.remove(imported)
+        for function in (
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "render_template"
+        ):
+            if not any(
+                isinstance(statement, ast.ImportFrom)
+                and _resolve_module(statement.module, statement.level, path)
+                in _module_names(provider_path)
+                and any(alias.name == "current_user" for alias in statement.names)
+                for statement in function.body
+            ):
+                function.body.insert(0, ast.ImportFrom(
+                    module=provider, names=[ast.alias(name="current_user")], level=0,
+                ))
+            values = next((
+                statement.value for statement in function.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name) and target.id == "values"
+                    for target in (
+                        statement.targets if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                )
+                and isinstance(statement.value, ast.Dict)
+            ), None)
+            if values is not None and not any(
+                isinstance(key, ast.Constant) and key.value == "current_user"
+                for key in values.keys
+            ):
+                values.keys.append(ast.Constant("current_user"))
+                values.values.append(ast.Name(id="current_user", ctx=ast.Load()))
+    existing_filters = {
+        node.slice.value for node in ast.walk(tree)
+        if isinstance(node, ast.Subscript)
+        and ast.unparse(node.value) == "templates.env.filters"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+    for index, item in enumerate(decision.get("filters", [])):
+        if item["name"] in existing_filters:
+            continue
+        alias = f"_portage_template_filter_{index}"
         if not any(
             isinstance(statement, ast.ImportFrom)
-            and _resolve_module(statement.module, statement.level, path)
-            in _module_names(provider_path)
-            and any(alias.name == "current_user" for alias in statement.names)
-            for statement in function.body
-        ):
-            function.body.insert(0, ast.ImportFrom(
-                module=provider, names=[ast.alias(name="current_user")], level=0,
-            ))
-        values = next((
-            statement.value for statement in function.body
-            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and statement.module == item["module"]
             and any(
-                isinstance(target, ast.Name) and target.id == "values"
-                for target in (
-                    statement.targets if isinstance(statement, ast.Assign)
-                    else [statement.target]
-                )
+                imported.name == item["symbol"] and imported.asname == alias
+                for imported in statement.names
             )
-            and isinstance(statement.value, ast.Dict)
-        ), None)
-        if values is not None and not any(
-            isinstance(key, ast.Constant) and key.value == "current_user"
-            for key in values.keys
+            for statement in tree.body
         ):
-            values.keys.append(ast.Constant("current_user"))
-            values.values.append(ast.Name(id="current_user", ctx=ast.Load()))
+            tree.body.append(ast.ImportFrom(
+                module=item["module"],
+                names=[ast.alias(name=item["symbol"], asname=alias)],
+                level=0,
+            ))
+        tree.body.append(ast.Assign(
+            targets=[ast.Subscript(
+                value=ast.Attribute(
+                    value=ast.Attribute(
+                        value=ast.Name(id="templates", ctx=ast.Load()),
+                        attr="env", ctx=ast.Load(),
+                    ),
+                    attr="filters", ctx=ast.Load(),
+                ),
+                slice=ast.Constant(item["name"]), ctx=ast.Store(),
+            )],
+            value=ast.Name(id=alias, ctx=ast.Load()),
+        ))
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
 
@@ -931,6 +1978,40 @@ def _normalize_redirect_urls(content: str) -> str:
             return node
 
     normalizer = RelativeRedirect()
+    tree = normalizer.visit(tree)
+    if not normalizer.changed:
+        return content
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _normalize_url_string_methods(content: str) -> str:
+    """Coerce Starlette URL objects before applying Python string trimming."""
+    tree = _parsed(content)
+    if tree is None:
+        return content
+
+    class CoerceURL(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"strip", "lstrip", "rstrip"}
+                and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Attribute)
+                and node.func.value.func.attr == "url_for"
+            ):
+                return node
+            node.func.value = ast.Call(
+                func=ast.Name(id="str", ctx=ast.Load()),
+                args=[node.func.value], keywords=[],
+            )
+            self.changed = True
+            return node
+
+    normalizer = CoerceURL()
     tree = normalizer.visit(tree)
     if not normalizer.changed:
         return content
@@ -1622,18 +2703,25 @@ def _realize_view_decorator_contracts(
         for alias in statement.names if alias.name == "wraps"
     ), None)
     changed = False
-    functions = {
-        node.name: node for node in tree.body
+    functions = [
+        node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    ]
     for contract in decision.get("decorators", []):
-        function = functions.get(contract["function"])
-        nested = [
+        function = next((
+            node for node in functions if node.name == contract["function"]
+        ), None)
+        container = next((
             node for node in (function.body if function else [])
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == contract.get("container")
+        ), None) if contract.get("container") else function
+        nested = [
+            node for node in (container.body if container else [])
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         returned = {
-            node.value.id for node in (ast.walk(function) if function else ())
+            node.value.id for node in (ast.walk(container) if container else ())
             if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
         }
         wrapper = next(
@@ -1656,7 +2744,10 @@ def _realize_view_decorator_contracts(
             for decorator in wrapper.decorator_list
         )
         if qualified_wraps and functools_name is None:
-            tree.body.insert(0, ast.Import(names=[ast.alias(name="functools")]))
+            tree.body.insert(
+                _module_import_index(tree),
+                ast.Import(names=[ast.alias(name="functools")]),
+            )
             functools_name = "functools"
             changed = True
         if not wrapped:
@@ -1692,11 +2783,81 @@ def _realize_view_decorator_contracts(
                 *wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs,
             ]
         }
-        for call in (
+        wrapped_calls = [
             node for node in ast.walk(wrapper)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == contract["parameter"]
+        ]
+        injected = max((
+            sum(
+                not isinstance(argument, ast.Starred)
+                and not (
+                    isinstance(argument, ast.Name)
+                    and argument.id in wrapper_parameters
+                )
+                for argument in call.args
+            )
+            for call in wrapped_calls
+        ), default=0)
+        if injected and container is not None and not any(
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == wrapper.name
+                and target.attr == "__signature__"
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+            for node in container.body
+        ):
+            inspect_name = next((
+                alias.asname or alias.name
+                for statement in tree.body if isinstance(statement, ast.Import)
+                for alias in statement.names if alias.name == "inspect"
+            ), None)
+            if inspect_name is None:
+                inspect_name = "inspect"
+                insert_at = int(bool(
+                    tree.body and isinstance(tree.body[0], ast.Expr)
+                    and isinstance(tree.body[0].value, ast.Constant)
+                    and isinstance(tree.body[0].value.value, str)
+                ))
+                while (
+                    insert_at < len(tree.body)
+                    and isinstance(tree.body[insert_at], ast.ImportFrom)
+                    and tree.body[insert_at].module == "__future__"
+                ):
+                    insert_at += 1
+                tree.body.insert(insert_at, ast.Import(names=[ast.alias(name="inspect")]))
+            wrapper_index = container.body.index(wrapper)
+            parameters_name = f"_portage_{wrapper.name}_parameters"
+            signature_statements = ast.parse(
+                f"{parameters_name} = list({inspect_name}.signature("
+                f"{contract['parameter']}).parameters.values())[{injected}:]\n"
+                f"{wrapper.name}.__signature__ = {inspect_name}.signature("
+                f"{contract['parameter']}).replace(parameters={parameters_name})"
+            ).body
+            request_argument = next((
+                argument for argument in [
+                    *wrapper.args.posonlyargs, *wrapper.args.args,
+                ]
+                if argument.arg == "request" and argument.annotation is not None
+            ), None)
+            if request_argument is not None:
+                signature_statements[1:1] = ast.parse(
+                    f"if not any(parameter.name == 'request' "
+                    f"for parameter in {parameters_name}):\n"
+                    f"    {parameters_name}.insert(0, {inspect_name}.Parameter("
+                    f"'request', {inspect_name}.Parameter.POSITIONAL_OR_KEYWORD, "
+                    f"annotation={ast.unparse(request_argument.annotation)}))"
+                ).body
+            container.body[wrapper_index + 1:wrapper_index + 1] = signature_statements
+            changed = True
+        for call in (
+            node for node in wrapped_calls
         ):
             existing = {keyword.arg for keyword in call.keywords if keyword.arg}
             forwarded = [

@@ -116,13 +116,14 @@ async def verify_patch_in_sandbox(
                 return _err("diff does not apply", detail=out[-800:])
             applied = True
 
+        report_path = Path(workdir) / _REPORT_FILE
+        report_path.unlink(missing_ok=True)
         sandbox = DockerSandbox(volume=workdir, mount="/repo")
         result = await sandbox.run(
             ["run-tests", *(test_args or [])], workdir="/repo",
             timeout=timeout_seconds,
         )
 
-        report_path = Path(workdir) / _REPORT_FILE
         if not report_path.exists():
             return _err(
                 f"no test report produced (sandbox exit {result.exit_code}) — "
@@ -138,7 +139,7 @@ async def verify_patch_in_sandbox(
             "applied": applied,
             "tests": {k: getattr(report, k) for k in
                       ("total", "passed", "failed", "errors", "skipped")},
-            "passed": report.ok,
+            "passed": result.exit_code == 0 and report.ok,
             "failing": failing,
             "output_tail": (result.stdout or "")[-1200:],
         }

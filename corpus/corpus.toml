@@ -74,3 +74,37 @@ tier = "framework"
 stresses = ["flask_restx", "namespaces", "marshalling"]
 source = "github"
 notes = "MIT. 4 tests, green in sandbox 2026-07-07. Flask-RESTX namespaces/marshalling -> routers + Pydantic: expected-hard (taxonomy tier 7); failures here feed the known-limitations finding. flask-restx==1.3.0 baked into the sandbox image."
+
+# Former R5 v1 held-out repositories. Their one-shot 0/9 result remains frozen in
+# corpus/heldout.toml; because that evidence drove recipe changes, every later run is a
+# development-corpus measurement and must never be reported as held-out.
+
+[[repos]]
+name = "ws-example"
+repo_url = "https://github.com/unibo-dtm-se/ws-example"
+recipe = "flask_to_fastapi"
+ref = "6903148c2644e50e971655dc4f645ab2b742fa5b"
+tier = "structural"
+stresses = ["app_factory", "basic_auth", "authorization", "pagination", "patch_routes", "content_negotiation", "templates", "openapi"]
+source = "github-former-heldout"
+notes = "Apache-2.0. R5 v1 baseline 42/42; permanently development-only after the published 0/3 migration result informed recipe changes."
+
+[[repos]]
+name = "silicon"
+repo_url = "https://github.com/cu/silicon"
+recipe = "flask_to_fastapi"
+ref = "143910c10516c6c48120e1f981aec6a9f344fe5d"
+tier = "structural"
+stresses = ["app_factory", "sqlite_db", "cli", "revisions", "full_text_search", "jinja_filters"]
+source = "github-former-heldout"
+notes = "Apache-2.0. R5 v1 baseline 34/34; permanently development-only after the published 0/3 migration result informed recipe changes."
+
+[[repos]]
+name = "flask-email-login"
+repo_url = "https://github.com/jelmerdejong/flask-email-login"
+recipe = "flask_to_fastapi"
+ref = "4b6ab3ac7d24b35503c8f63fb5dba8e1ddb5e16d"
+tier = "structural"
+stresses = ["app_factory", "magic_link_auth", "csrf", "mail_outbox", "flask_login", "extension_initialization"]
+source = "github-former-heldout"
+notes = "MIT. R5 v1 baseline 18/18; permanently development-only after the published 0/3 migration result informed recipe changes."

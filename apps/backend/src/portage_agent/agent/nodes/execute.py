@@ -55,6 +55,7 @@ from .common import (
     imported_bindings,
     iter_py_files,
     load_cut_checkpoint,
+    new_import_cycle_violations,
     non_python_context,
     non_python_listing,
     planned_artifact_topology_violations,
@@ -526,9 +527,11 @@ def planned_provider_import_violations(
 ) -> list[str]:
     """Keep consumer imports inside the frozen surface of planned providers."""
     providers: dict[str, set[str]] = {}
+    provider_specs: dict[str, dict[str, dict]] = {}
     for pin in manifest.values():
         if pin.get("provenance") == "planned_create" and pin.get("module") != path:
             providers.setdefault(pin["module"], set()).add(pin["symbol"])
+            provider_specs.setdefault(pin["module"], {})[pin["symbol"]] = pin
     if not providers:
         return []
     try:
@@ -541,6 +544,7 @@ def planned_provider_import_violations(
         return matches[0] if len(matches) == 1 else None
 
     module_bindings: dict[str, str] = {}
+    direct_bindings: dict[str, tuple[str, str]] = {}
     out: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -554,6 +558,8 @@ def planned_provider_import_violations(
                         "exports or consume an existing export"
                     )
                     continue
+                if owner and alias.name in providers[owner]:
+                    direct_bindings[alias.asname or alias.name] = (owner, alias.name)
                 candidate = f"{module}.{alias.name}".lstrip(".")
                 if candidate_owner := provider_for(candidate):
                     module_bindings[alias.asname or alias.name] = candidate_owner
@@ -562,6 +568,19 @@ def planned_provider_import_violations(
                 if owner := provider_for(alias.name):
                     module_bindings[alias.asname or alias.name.split(".")[0]] = owner
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in direct_bindings
+        ):
+            owner, symbol = direct_bindings[node.value.id]
+            members = set(provider_specs[owner][symbol].get("members", []))
+            if node.attr in providers[owner] and node.attr not in members:
+                out.append(
+                    f"{path}:{node.lineno}: reads provider export `{node.attr}` as a "
+                    f"member of direct export `{symbol}` from {owner}; import the "
+                    "sibling export directly"
+                )
         if not (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)
@@ -685,7 +704,7 @@ def planned_capability_consumer_violations(
         ):
             constructed_names = {
                 target.id
-                for statement in function.body
+                for statement in ast.walk(function)
                 if isinstance(statement, (ast.Assign, ast.AnnAssign))
                 and is_constructor(statement.value)
                 for target in (
@@ -894,11 +913,48 @@ def framework_seam_violations(
     }
     out: list[str] = []
 
+    for call in (
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update" and len(node.args) == 1
+        and isinstance(node.args[0], ast.Dict)
+    ):
+        receiver = ast.dump(call.func.value)
+        earlier_keys: set[str | int] = set()
+        for key, value in zip(call.args[0].keys, call.args[0].values, strict=True):
+            reads = {
+                node.slice.value for node in ast.walk(value)
+                if isinstance(node, ast.Subscript)
+                and ast.dump(node.value) == receiver
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, (str, int))
+            }
+            if reads & earlier_keys:
+                out.append(
+                    f"{path}:{call.lineno}: mapping update reads a key written earlier "
+                    "in the same call; preserve the source's sequential assignments"
+                )
+                break
+            if isinstance(key, ast.Constant) and isinstance(key.value, (str, int)):
+                earlier_keys.add(key.value)
+
     for decision in (
         item for item in relevant
         if item.get("kind") == "provider_protocol"
         and item.get("provider") == path
     ):
+        if not any(
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == decision["symbol"]
+                for target in (
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+            )
+            for statement in tree.body
+        ):
+            continue
         missing = (
             set(decision.get("decorator_members", []))
             | set(decision.get("callable_members", []))
@@ -956,6 +1012,52 @@ def framework_seam_violations(
             node for node in tree.body
             if isinstance(node, ast.ClassDef) and node.name == provider_class_name
         ), None)
+        if (
+            provider_assignment is not None
+            and isinstance(provider_assignment.value, ast.Constant)
+            and provider_assignment.value.value is None
+        ):
+            out.append(
+                f"{path}: provider `{decision['symbol']}` cannot be a None placeholder"
+            )
+        methods = {
+            node.name: node for node in (provider_class.body if provider_class else [])
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for member in decision.get("callable_members", []):
+            method = methods.get(member)
+            if method is None:
+                continue
+            if all(
+                isinstance(statement, ast.Pass)
+                or isinstance(statement, ast.Return)
+                and (
+                    statement.value is None
+                    or isinstance(statement.value, ast.Constant)
+                    and statement.value.value is None
+                )
+                for statement in method.body
+            ):
+                out.append(
+                    f"{path}: provider `{decision['symbol']}.{member}` cannot be a stub"
+                )
+            if member == "init_app" and not (
+                len([*method.args.posonlyargs, *method.args.args]) >= 2
+                or method.args.vararg is not None
+            ):
+                out.append(
+                    f"{path}: provider `{decision['symbol']}.init_app` must accept the app"
+                )
+            if member in decision.get("context_manager_members", []) and not any(
+                ast.unparse(decorator).split(".")[-1] in {
+                    "contextmanager", "asynccontextmanager",
+                }
+                for decorator in method.decorator_list
+            ):
+                out.append(
+                    f"{path}: provider `{decision['symbol']}.{member}` must return a "
+                    "real context manager"
+                )
         for statement in provider_class.body if provider_class else []:
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = (
@@ -1249,11 +1351,13 @@ def framework_seam_violations(
         if item.get("kind") == "application_factory"
         and item.get("factory") == path and item.get("config_from_objects")
     ):
+        object_sources = set(_decision["config_from_objects"])
         for node in ast.walk(tree):
             copied = None
             if (
                 isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "vars" and node.args
+                and ast.unparse(node.args[0]) in object_sources
             ):
                 copied = "vars()"
             elif isinstance(node, ast.Attribute) and node.attr == "__dict__":
@@ -1703,11 +1807,33 @@ def framework_seam_violations(
         keys: set[str] = set()
         writes: list[int] = []
         updates: dict[str, list[int]] = {}
+        local_config_keys: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    local_config_keys.setdefault(target.id, set()).update(
+                        key.value for key in node.value.keys
+                        if isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)
+                    )
         local_configs = {
-            node.value.id
+            source.id
             for node in ast.walk(tree)
             if isinstance(node, (ast.Assign, ast.AnnAssign))
-            and isinstance(node.value, ast.Name)
+            for source in (
+                [node.value] if isinstance(node.value, ast.Name)
+                else node.value.args
+                if isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "dict" and len(node.value.args) == 1
+                else []
+            )
+            if isinstance(source, ast.Name)
             and any(
                 _is_state_config(target)
                 for target in (
@@ -1715,6 +1841,19 @@ def framework_seam_violations(
                 )
             )
         }
+        local_configs.update({
+            name.id
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                _is_state_config(target)
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+            for name in ast.walk(node.value)
+            if isinstance(name, ast.Name) and name.id in local_config_keys
+        })
         for node in ast.walk(tree):
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -1728,6 +1867,19 @@ def framework_seam_violations(
                                 if isinstance(key, ast.Constant)
                                 and isinstance(key.value, str)
                             )
+                        elif isinstance(value, ast.Name):
+                            keys.update(local_config_keys.get(value.id, set()))
+                        elif (
+                            isinstance(value, ast.Call)
+                            and isinstance(value.func, ast.Name)
+                            and value.func.id == "dict" and len(value.args) == 1
+                            and isinstance(value.args[0], ast.Name)
+                        ):
+                            keys.update(local_config_keys.get(value.args[0].id, set()))
+                        else:
+                            for name in ast.walk(value):
+                                if isinstance(name, ast.Name):
+                                    keys.update(local_config_keys.get(name.id, set()))
                     elif isinstance(target, ast.Name) and target.id in local_configs:
                         if isinstance(value, ast.Dict):
                             keys.update(
@@ -1802,10 +1954,15 @@ def framework_seam_violations(
             and node.name == "create_app"
         ), None)
         for contract in decision.get("local_imports", []):
+            submodule = f"{contract['module']}.{contract['symbol']}".lstrip(".")
             top_level = any(
                 isinstance(node, ast.ImportFrom)
-                and _resolve_module(node.module, node.level, path) == contract["module"]
-                and any(alias.name == contract["symbol"] for alias in node.names)
+                and (
+                    _resolve_module(node.module, node.level, path) == submodule
+                    or _resolve_module(node.module, node.level, path)
+                    == contract["module"]
+                    and any(alias.name == contract["symbol"] for alias in node.names)
+                )
                 for node in tree.body
             )
             if top_level:
@@ -1865,6 +2022,10 @@ def framework_seam_violations(
             refs = _imported_callable_refs(
                 initializer["provider"], initializer["symbol"], application_factory,
             )
+            original_call = ast.parse(
+                initializer["original_call"], mode="eval",
+            ).body
+            refs.add(ast.unparse(original_call.func))
             calls = [
                 node.lineno for node in ast.walk(application_factory or tree)
                 if isinstance(node, ast.Call) and ast.unparse(node.func) in refs
@@ -1998,11 +2159,23 @@ def framework_seam_violations(
                 for node in ast.walk(tree)
             )
             has_package_path = any(
-                isinstance(node, ast.Name) and node.id == "__file__"
-                for node in ast.walk(tree)
-            ) and any(
-                isinstance(node, ast.Constant)
-                and node.value == PurePosixPath(static_mount["directory"]).name
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func).split(".")[-1] == "StaticFiles"
+                and any(
+                    keyword.arg == "directory"
+                    and any(
+                        isinstance(part, ast.Name) and part.id == "__file__"
+                        for part in ast.walk(keyword.value)
+                    )
+                    and any(
+                        isinstance(part, ast.Constant)
+                        and part.value == PurePosixPath(
+                            static_mount["directory"]
+                        ).name
+                        for part in ast.walk(keyword.value)
+                    )
+                    for keyword in node.keywords
+                )
                 for node in ast.walk(tree)
             )
             if not mounted or not has_package_path:
@@ -2212,13 +2385,22 @@ def framework_seam_violations(
         item for item in relevant if item.get("kind") == "view_decorators"
     ):
         for contract in decision.get("decorators", []):
-            function = module_defs.get(contract["function"])
-            nested = [
+            function = next((
+                node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == contract["function"]
+            ), None)
+            container = next((
                 node for node in (function.body if function else [])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == contract.get("container")
+            ), None) if contract.get("container") else function
+            nested = [
+                node for node in (container.body if container else [])
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             ]
             returned = {
-                node.value.id for node in (ast.walk(function) if function else ())
+                node.value.id for node in (ast.walk(container) if container else ())
                 if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
             }
             wrapper = next(
@@ -2375,22 +2557,68 @@ def framework_seam_violations(
                 and node.func.id in loop_callbacks
                 for node in context_nodes
             )
-            stores_callbacks = bool(stored_attrs and stored_attrs & used_attrs)
+            helper_names = {
+                node.value.func.id
+                for node in context_nodes
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and any(
+                    isinstance(argument, ast.Name) and argument.id == "self"
+                    for argument in node.value.args
+                )
+            }
+            delegated_cleanup = False
+            for helper in (
+                cls for cls in provider_classes if cls.name in helper_names
+            ):
+                for exit_method in (
+                    child for child in helper.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name in {"pop", "__exit__"}
+                ):
+                    helper_nodes = _direct_body_nodes(exit_method)
+                    callbacks = {
+                        node.target.id
+                        for node in helper_nodes
+                        if isinstance(node, (ast.For, ast.AsyncFor))
+                        and isinstance(node.target, ast.Name)
+                        and any(
+                            isinstance(part, ast.Attribute)
+                            and part.attr in stored_attrs
+                            and isinstance(part.value, ast.Attribute)
+                            and isinstance(part.value.value, ast.Name)
+                            and part.value.value.id == "self"
+                            and part.value.attr == "_app"
+                            for part in ast.walk(node.iter)
+                        )
+                    }
+                    delegated_cleanup = delegated_cleanup or any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id in callbacks
+                        for node in helper_nodes
+                    )
+            invokes_cleanup = invokes_cleanup or delegated_cleanup
+            stores_callbacks = bool(
+                stored_attrs and (stored_attrs & used_attrs or delegated_cleanup)
+            )
             if not stores_callbacks or not invokes_cleanup:
                 out.append(
                     f"{path}: app_context must store `cleanup_callbacks` supplied by the "
                     "factory and invoke each callback when the context exits. Required "
                     "shape: `__init__(..., cleanup_callbacks=())` stores "
-                    "`self._cleanup_callbacks = tuple(cleanup_callbacks)`; a "
-                    "`@contextmanager app_context(self)` finally-loop calls each stored "
-                    "callback. Do not put callbacks on app_context itself or a nested "
-                    "context-manager receiver"
+                    "`self._cleanup_callbacks = tuple(cleanup_callbacks)`; "
+                    "`app_context(self)` or its returned helper calls each callback from "
+                    "that app-owned collection on exit. Do not store callbacks only on "
+                    "the returned context-manager receiver"
                 )
 
     for decision in (
         item for item in relevant
         if item.get("kind") == "planned_test_surface"
-        and item.get("provider") != path and path in item.get("files", [])
+        and item.get("provider") != path
+        and path in item.get("factory_consumers", [])
     ):
         classes = decision.get("classes", [])
         if len(classes) != 1:
@@ -2412,10 +2640,7 @@ def framework_seam_violations(
         }
         constructed = {
             target.id
-            for scope in [tree, *(function for function in tree.body
-                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and function.name == "create_app")]
-            for statement in scope.body
+            for statement in tree.body
             if isinstance(statement, (ast.Assign, ast.AnnAssign))
             and isinstance(statement.value, ast.Call)
             and isinstance(statement.value.func, ast.Name)
@@ -2425,8 +2650,23 @@ def framework_seam_violations(
                 else [statement.target]
             )
             if isinstance(target, ast.Name)
-            and (scope is tree or target.id in returned)
         }
+        constructed.update(
+            target.id
+            for function in tree.body
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and function.name == "create_app"
+            for statement in ast.walk(function)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id in refs
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if isinstance(target, ast.Name) and target.id in returned
+        )
         if not refs or not constructed:
             out.append(
                 f"{path}: public application must construct planned facade "
@@ -2443,6 +2683,11 @@ def framework_seam_violations(
         forbidden_attrs -= {
             "app_context", "test_client", "test_cli_runner", "instance_path",
         }
+    if any(
+        "instance_path" in decision.get("app_state_members", [])
+        for decision in relevant
+    ):
+        forbidden_attrs.discard("instance_path")
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Attribute)
@@ -2521,6 +2766,15 @@ def framework_seam_violations(
         in ambient_runtime_modules
         for alias in statement.names
         if alias.name == "g"
+    }
+    planned_ambient_context_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and _resolve_module(statement.module, statement.level, path)
+        in ambient_runtime_modules
+        for alias in statement.names
+        if alias.name in {"current_app", "g"}
     }
     for decision in (
         item for item in relevant
@@ -2786,7 +3040,7 @@ def framework_seam_violations(
         for node in ast.walk(function):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in {
                 "app", "application", "request", "current_app", "g",
-            } and node.id not in planned_ambient_g_names:
+            } and node.id not in planned_ambient_context_names:
                 out.append(
                     f"{decision['symbol']}:{getattr(node, 'lineno', '?')}: direct resource "
                     f"helper reads `{node.id}`; pinned helpers must use module-owned or "
@@ -3087,47 +3341,49 @@ def framework_seam_violations(
                 f"the pinned direct helper `{decision['symbol']}`"
             )
 
+    imported_names: set[str] = set()
+    imported_modules: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == (
+            "starlette.middleware.sessions"
+        ):
+            imported_names.update(
+                alias.asname or alias.name
+                for alias in node.names if alias.name == "SessionMiddleware"
+            )
+        elif isinstance(node, ast.Import):
+            imported_modules.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "starlette.middleware.sessions"
+            )
+
+    def _session_middleware_ref(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Name) and node.id in imported_names
+        ) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "SessionMiddleware"
+            and ast.unparse(node.value) in imported_modules
+        )
+
+    for node in (
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _session_middleware_ref(node.func)
+        and not node.args
+        and not any(keyword.arg == "app" for keyword in node.keywords)
+    ):
+        out.append(
+            f"{path}:{node.lineno}: SessionMiddleware is ASGI middleware, not a "
+            "session/proxy object; install the class with app.add_middleware(...) "
+            "and expose request-backed session access separately"
+        )
+
     session_decisions = [
         decision for decision in relevant if decision.get("kind") == "session_runtime"
     ]
     if session_decisions:
-        imported_names: set[str] = set()
-        imported_modules: set[str] = set()
-        for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and node.module == (
-                "starlette.middleware.sessions"
-            ):
-                imported_names.update(
-                    alias.asname or alias.name
-                    for alias in node.names if alias.name == "SessionMiddleware"
-                )
-            elif isinstance(node, ast.Import):
-                imported_modules.update(
-                    alias.asname or alias.name
-                    for alias in node.names
-                    if alias.name == "starlette.middleware.sessions"
-                )
-
-        def _session_middleware_ref(node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Name) and node.id in imported_names
-            ) or (
-                isinstance(node, ast.Attribute)
-                and node.attr == "SessionMiddleware"
-                and ast.unparse(node.value) in imported_modules
-            )
-
-        direct_instances = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _session_middleware_ref(node.func)
-        ]
-        for node in direct_instances:
-            out.append(
-                f"{path}:{node.lineno}: SessionMiddleware is ASGI middleware, not a "
-                "session/proxy object; install the class with app.add_middleware(...) "
-                "and expose request-backed session access separately"
-            )
-
         factory_files = {
             factory
             for decision in session_decisions
@@ -3773,6 +4029,25 @@ def all_generation_violations(
     return out
 
 
+def _candidate_generation_violations(
+    content: str,
+    manifest: dict[str, dict],
+    path: str,
+    seam_plan: dict,
+    oracle_entry: dict | None,
+    original_files: dict[str, str],
+    migrated_files: dict[str, str],
+) -> list[str]:
+    return [
+        *all_generation_violations(
+            content, manifest, path, seam_plan, oracle_entry,
+        ),
+        *new_import_cycle_violations(
+            original_files, {**migrated_files, path: content},
+        ),
+    ]
+
+
 def _validated_deterministic_artifacts(
     planned: dict[str, PlannedFile], renderer, worktree: str,
     manifest: dict[str, dict], seam_plan: dict, oracle_manifest: dict,
@@ -3992,7 +4267,8 @@ async def _migrate_cluster(
 
 def _cluster_violations(
     contents: dict[str, str], manifest: dict[str, dict], seam_plan: dict,
-    oracle_manifest: dict,
+    oracle_manifest: dict, original_files: dict[str, str] | None = None,
+    migrated_files: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     broken = {
         path: broken for path, content in contents.items()
@@ -4000,6 +4276,14 @@ def _cluster_violations(
             content, manifest, path, seam_plan, oracle_manifest.get(path),
         ))
     }
+    if original_files is not None and migrated_files is not None:
+        for violation in new_import_cycle_violations(
+            original_files, {**migrated_files, **contents},
+        ):
+            owners = [path for path in contents if path in violation]
+            broken.setdefault(owners[0] if owners else sorted(contents)[0], []).append(
+                violation,
+            )
     trees = {}
     for path, content in contents.items():
         try:
@@ -4076,10 +4360,13 @@ def _cluster_violations(
 def _choose_cluster_draft(
     first: dict[str, str], first_broken: dict[str, list[str]],
     repair: dict[str, str], manifest: dict[str, dict], seam_plan: dict,
-    oracle_manifest: dict,
+    oracle_manifest: dict, original_files: dict[str, str] | None = None,
+    migrated_files: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     """All parsed members or nothing; fewer aggregate violations wins, repair on tie."""
-    repair_broken = _cluster_violations(repair, manifest, seam_plan, oracle_manifest)
+    repair_broken = _cluster_violations(
+        repair, manifest, seam_plan, oracle_manifest, original_files, migrated_files,
+    )
     if sum(map(len, repair_broken.values())) <= sum(map(len, first_broken.values())):
         return repair, repair_broken
     return first, first_broken
@@ -4206,6 +4493,8 @@ async def _execute_initial_cluster(
         sources = {
             path: scrub(read_file(worktree, path, limit=20000) or "") for path in paths
         }
+        original_tree = iter_py_files(binding_root)
+        migrated_tree = iter_py_files(worktree)
         context = _gather_cluster_context(
             worktree, cluster_paths=set(paths), target_paths=target_paths,
             done_paths=done_paths,
@@ -4257,7 +4546,10 @@ async def _execute_initial_cluster(
                 ),
             )
             call_cost += usage.get("cost_usd", 0.0)
-        broken = _cluster_violations(contents, manifest, seam_plan, oracle_manifest)
+        broken = _cluster_violations(
+            contents, manifest, seam_plan, oracle_manifest,
+            original_tree, migrated_tree,
+        )
         if broken:
             await task_store.update_task(coordinator.id, amend_last_attempt=usage)
             flattened = [
@@ -4293,6 +4585,7 @@ async def _execute_initial_cluster(
                 )
                 contents, remaining = _choose_cluster_draft(
                     contents, broken, repaired, manifest, seam_plan, oracle_manifest,
+                    original_tree, migrated_tree,
                 )
             except ValueError:
                 log.warning("cluster repair output invalid for %s — keeping first draft",
@@ -4368,7 +4661,7 @@ async def _execute_initial_cluster(
                         )
                     contents, _ = _choose_cluster_draft(
                         contents, remaining, repaired, manifest, seam_plan,
-                        oracle_manifest,
+                        oracle_manifest, original_tree, migrated_tree,
                     )
                 except ValueError:
                     log.warning(
@@ -4386,6 +4679,7 @@ async def _execute_initial_cluster(
 
         final_broken = _cluster_violations(
             contents, manifest, seam_plan, oracle_manifest,
+            original_tree, migrated_tree,
         )
         if final_broken:
             message = "; ".join(
@@ -4883,8 +5177,10 @@ async def execute_node(state: GraphState) -> GraphState:
                 seam_plan=seam_plan, planned_file=planned_file,
             )
             call_cost = usage.get("cost_usd", 0.0)
-            broken = all_generation_violations(
+            migrated_files = iter_py_files(worktree)
+            broken = _candidate_generation_violations(
                 content, manifest, path, seam_plan, oracle_manifest.get(path),
+                original_files, migrated_files,
             )
             if broken:
                 # First-class accounting: close out the migrate attempt's usage FIRST,
@@ -4959,8 +5255,9 @@ async def execute_node(state: GraphState) -> GraphState:
                 usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
                 # both calls' usage is already amended onto their own log entries; the
                 # done-update below must not double-amend (zeroed usage = no-op amend)
-            final_broken = all_generation_violations(
+            final_broken = _candidate_generation_violations(
                 content, manifest, path, seam_plan, oracle_manifest.get(path),
+                original_files, migrated_files,
             )
             if final_broken:
                 await task_store.update_task(
@@ -5017,7 +5314,7 @@ async def execute_node(state: GraphState) -> GraphState:
     batch_oracle_results = []
     for path in batch_paths:
         if entry := oracle_manifest.get(path):
-            generated = read_file(worktree, path) or ""
+            generated = read_file(worktree, path, limit=None) or ""
             batch_oracle_results.append({
                 "path": path,
                 "strategy": test_strategy.get(path, "unchanged"),

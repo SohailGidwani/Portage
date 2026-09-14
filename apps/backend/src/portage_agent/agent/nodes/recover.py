@@ -5,10 +5,10 @@ The plan-§8 taxonomy, made concrete for a file-level migration:
   1. **Replan** — a *not-planned* source file still contains framework code the recipe
      should have migrated (e.g. the planner missed a file): route back to Plan, which
      appends the missing task(s).
-  2. **Batch rollback + regenerate** — a crash or behavioral failure rolls back the
-     current verified batch, which is now the precise unit of blame. Coupled seam members
-     stay coherent; completed earlier batches remain in place. Once attempts pass
-     `escalate_after_attempts`, Execute switches to the escalation tier.
+  2. **Targeted repair** — a uniquely attributed failure repairs its owning artifact.
+     Explicit injected-fault scenarios retain their bounded batch retry behavior.
+  3. **Ambiguous failure** — retain the current draft and evidence, then report failure.
+     Uncertain attribution does not authorize a paid whole-batch regeneration.
   4. **Skip-and-continue / give up** — a task at `max_task_attempts` is rolled back to its
      original source and marked `skipped`; when nothing is left to retry (or the global
      `max_recover_visits` budget is spent), route to Integrate so the report stays honest.
@@ -43,6 +43,7 @@ from .common import (
     restore_cut_checkpoint,
     run_git,
     unplanned_recipe_paths,
+    worktree_diff,
 )
 
 log = logging.getLogger("portage.agent")
@@ -566,6 +567,37 @@ async def recover_node(state: GraphState) -> GraphState:
                 if t.status != TaskStatus.skipped.value
                 and (not current_batch or t.target_path in current_batch)
             ]
+
+    if (
+        not owner and not injected_generation_fault
+        and (state.get("config") or {}).get("inject_fault") != "integration_only"
+    ):
+        # Stop before rollback, task mutation, or diagnostic/model calls. Keep the
+        # lossless diff and checkpoint for inspection, including a failed local repair.
+        return {
+            "recover_visits": visits,
+            "recover_budget_used": budget_used,
+            "recover_route": "report",
+            "contract_repair_owner": "",
+            "diagnostic_repair_requested": False,
+            "diff": await worktree_diff(worktree),
+            # A prior integration result must not mask this newer Verify failure.
+            "integrate_summary": (
+                state.get("integrate_summary") or {} if integration_failure else {}
+            ),
+            "recovery_actions": [{
+                "visit": visits,
+                "classification": "ambiguous_failure",
+                "action": "stop_preserve_evidence",
+                "source": "integrate" if integration_failure else "verify",
+                "targets": sorted(current_batch or planned_paths),
+                "fingerprint": fingerprint,
+                "budget_charged": False,
+                "budget_used": budget_used,
+                "at": _now(),
+            }],
+            "step_log": ["recover"],
+        }
 
     diagnostic_repair = not integration_failure and repeat == 2
     force_skip = not integration_failure and repeat >= 3

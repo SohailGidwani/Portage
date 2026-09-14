@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from portage_agent.agent.graph import _after_integrate, _after_plan, _after_verify
+from portage_agent.agent.graph import (
+    _after_integrate,
+    _after_plan,
+    _after_recover,
+    _after_verify,
+    build_graph,
+)
 from portage_agent.agent.nodes.common import create_cut_checkpoint
 from portage_agent.agent.nodes.recover import (
     _rollback_file,
@@ -28,6 +34,98 @@ from portage_agent.sandbox import parse_junit_xml
 
 verify_module = importlib.import_module("portage_agent.agent.nodes.verify")
 recover_module = importlib.import_module("portage_agent.agent.nodes.recover")
+report_module = importlib.import_module("portage_agent.agent.nodes.report")
+
+
+@pytest.mark.parametrize("source", ["verify", "integrate"])
+async def test_ambiguous_failure_stops_with_draft_and_evidence_intact(
+    tmp_path, monkeypatch, source,
+):
+    import json
+
+    paths = ["provider.py", "consumer.py"]
+    for path in paths:
+        (tmp_path / path).write_text("VALUE = 'retained draft'\n")
+    tasks = [
+        SimpleNamespace(
+            id=uuid.uuid4(), target_path=path, type="support", status="done",
+            attempts=1, attempts_log=[], verify_spec={},
+            to_state_dict=lambda path=path: {
+                "target_path": path, "status": "done", "attempts_log": [],
+            },
+        )
+        for path in paths
+    ]
+    output = (
+        "tests.py:23: AttributeError\n"
+        "E AttributeError: 'Session' object has no attribute 'remove'\n"
+        "E sqlite3.IntegrityError: UNIQUE constraint failed: account.name\n"
+    )
+    failed = {"total": 4, "passed": 0, "failed": 4, "errors": 1}
+    update, rollback = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(recover_module.task_store, "load_tasks", AsyncMock(return_value=tasks))
+    monkeypatch.setattr(recover_module.task_store, "update_task", update)
+    monkeypatch.setattr(recover_module, "_rollback_file", rollback)
+    monkeypatch.setattr(recover_module, "worktree_diff", AsyncMock(return_value="retained diff"))
+    state = {
+        "job_id": str(uuid.uuid4()), "worktree": str(tmp_path), "migrate": True,
+        "recover_source": source, "current_batch_paths": paths,
+        "last_verify_errors": output, "last_integrate_errors": output,
+        "last_failure_fingerprint": "saved-failure", "recovery_actions": [],
+        "test_summary": failed,
+        "integrate_summary": failed if source == "integrate" else {
+            "total": 4, "passed": 4, "failed": 0, "errors": 0,
+        },
+        "integration_passed": source != "integrate",
+    }
+    result = await recover_module.recover_node(state)
+
+    assert _after_recover(result) == "report"
+    assert any(
+        edge.source == "recover" and edge.target == "report"
+        for edge in build_graph(None).get_graph().edges
+    )
+    assert result["recovery_actions"][0]["action"] == "stop_preserve_evidence"
+    assert result["diff"] == "retained diff"
+    update.assert_not_awaited()
+    rollback.assert_not_awaited()
+    assert all((tmp_path / path).read_text() == "VALUE = 'retained draft'\n" for path in paths)
+
+    put = AsyncMock(return_value="report.json")
+    monkeypatch.setattr(report_module, "LocalStorage", lambda: SimpleNamespace(put=put))
+    await report_module.report_node({**state, **result})
+    report = json.loads(put.await_args.args[1])
+    assert report["migration_outcome"] == "failed"
+    assert report["test_summary"]["passed"] == 0
+    assert report["test_summary"]["scope"] == (
+        "integration" if source == "integrate" else "verification_subset"
+    )
+    assert report["diff"] == "retained diff"
+    assert report["tasks_done"] == 2  # generation completion is not migration success
+
+
+@pytest.mark.parametrize("node", ["verify_node", "integrate_node"])
+async def test_nonzero_sandbox_exit_cannot_pass_with_green_xml(tmp_path, monkeypatch, node):
+    summary = {"total": 1, "passed": 1, "failed": 0, "errors": 0}
+    monkeypatch.setattr(verify_module, "_run_tests", AsyncMock(return_value=(
+        summary, SimpleNamespace(exit_code=2, stdout="", stderr="teardown failed"),
+    )))
+    monkeypatch.setattr(verify_module, "worktree_diff", AsyncMock(return_value="diff"))
+    state = {
+        "job_id": str(uuid.uuid4()), "worktree": str(tmp_path), "workspace": str(tmp_path),
+        "migrate": True,
+    }
+    result = await getattr(verify_module, node)(state)
+    assert result["verify_passed" if node == "verify_node" else "integration_passed"] is False
+    if node == "integrate_node":
+        import json
+
+        task = SimpleNamespace(to_state_dict=lambda: {"status": "done", "attempts_log": []})
+        monkeypatch.setattr(report_module.task_store, "load_tasks", AsyncMock(return_value=[task]))
+        put = AsyncMock(return_value="report.json")
+        monkeypatch.setattr(report_module, "LocalStorage", lambda: SimpleNamespace(put=put))
+        await report_module.report_node({**state, **result})
+        assert json.loads(put.await_args.args[1])["migration_outcome"] == "failed"
 
 
 def test_failure_fingerprint_ignores_line_numbers_timings_and_ansi():
@@ -472,7 +570,7 @@ async def test_successful_restored_cut_reverification_clears_checkpoint_without_
     }
     monkeypatch.setattr(
         verify_module, "_run_tests",
-        AsyncMock(return_value=(summary, SimpleNamespace(stdout="", stderr=""))),
+        AsyncMock(return_value=(summary, SimpleNamespace(stdout="", stderr="", exit_code=0))),
     )
 
     result = await verify_module.verify_node({

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from base64 import b64decode, b64encode
 from contextlib import contextmanager
+from html import escape
 
 import itsdangerous
 from click.testing import CliRunner
@@ -30,13 +31,24 @@ class FlaskResponseAdapter:
 
     @property
     def data(self):
+        if not self._response.content and self.location:
+            location = escape(self.location, quote=True)
+            return f'<a href="{location}">{location}</a>'.encode()
         return self._response.content
+
+    @property
+    def location(self):
+        return self._response.headers.get("location")
+
+    @property
+    def mimetype(self):
+        return self._response.headers.get("content-type", "").split(";", 1)[0]
 
     def get_json(self):
         return self._response.json()
 
     def get_data(self, as_text=False):
-        return self._response.text if as_text else self._response.content
+        return self.data.decode() if as_text else self.data
 
 
 class FlaskCliRunnerAdapter:
@@ -56,7 +68,9 @@ class FlaskCliRunnerAdapter:
 class FlaskClientAdapter:
     def __init__(self, app):
         self._app = app
-        self._client = TestClient(app, follow_redirects=False)
+        self._client = TestClient(
+            app, base_url="http://localhost", follow_redirects=False
+        )
 
     def __enter__(self):
         self._client.__enter__()
@@ -67,6 +81,10 @@ class FlaskClientAdapter:
 
     def __getattr__(self, name):
         return getattr(self._client, name)
+
+    @property
+    def application(self):
+        return self._app
 
     def request(self, *args, **kwargs):
         return FlaskResponseAdapter(self._client.request(*args, **kwargs))

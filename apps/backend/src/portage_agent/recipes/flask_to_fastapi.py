@@ -49,11 +49,13 @@ from ._flask_analysis import (
     _factory_static_mount,
     _flask_babel_literal_bindings,
     _flask_current_app_consumers,
+    _flask_form_contracts,
     _flask_login_consumer_contracts,
     _initializer_contracts,
     _instance_export_contracts,
     _is_test_file,
     _mixed_form_routes,
+    _module_flask_app_exports,
     _parsed,
     _plain_string_routes,
     _render_alias,
@@ -62,6 +64,7 @@ from ._flask_analysis import (
     _returned_lifecycle_contracts,
     _route_functions_without_local_handlers,
     _route_name_contracts,
+    _route_response_status_contracts,
     _sqlalchemy_provider_contracts,
     _template_context_processor_contracts,
     _template_framework_globals,
@@ -69,36 +72,50 @@ from ._flask_analysis import (
     _view_decorator_contracts,
 )
 from ._flask_runtime import (
+    _normalize_invalid_signature_order,
     _normalize_project_import_levels,
     _realize_ambient_request_binding,
+    _realize_binding_closure,
     _realize_cli_factory,
     _realize_decorated_provider_protocols,
     _realize_dynamic_instance_exports,
     _realize_extension_provider_facade,
     _realize_extension_provider_order,
     _realize_factory_contracts,
+    _realize_factory_static_mount,
+    _realize_flask_form_consumers,
+    _realize_flask_form_provider,
     _realize_implicit_sqlalchemy_tables,
+    _realize_provider_export_topology,
     _realize_resource_consumers,
     _realize_resource_contracts,
+    _realize_test_adapter_instance_path,
 )
 from ._flask_web import (
+    _normalize_async_request_dependencies,
     _normalize_exception_handler_status,
     _normalize_fastapi_mail_import,
+    _normalize_flask_string_responses,
     _normalize_mutated_fetchone_rows,
     _normalize_redirect_urls,
     _normalize_session_middleware_import,
+    _normalize_template_directory,
     _normalize_template_response,
     _normalize_translation_literals,
+    _normalize_url_string_methods,
     _normalize_werkzeug_abort,
     _realize_authentication_consumers,
+    _realize_basic_auth_decoding,
     _realize_blueprint_error_handlers,
     _realize_error_handler_ownership,
     _realize_request_hook_names,
     _realize_route_contracts,
+    _realize_route_response_statuses,
     _realize_template_consumers,
     _realize_template_context_processors,
     _realize_template_provider_globals,
     _realize_view_decorator_contracts,
+    _template_filter_contracts,
 )
 from .base import MAX_CREATED_ARTIFACTS, PinRule, PlannedFile, Subtask, register
 from .flask_test_compat import render_flask_test_compat
@@ -123,30 +140,43 @@ class FlaskToFastAPIRecipe:
     def normalize_generated(
         path: str, content: str, seam_plan: dict | None = None,
     ) -> str:
+        content = _normalize_invalid_signature_order(content)
+        content = _normalize_async_request_dependencies(content)
         content = _normalize_project_import_levels(path, content, seam_plan)
+        content = _realize_binding_closure(path, content, seam_plan)
+        content = _realize_provider_export_topology(path, content, seam_plan)
+        content = _realize_test_adapter_instance_path(content, seam_plan)
         content = _normalize_translation_literals(path, content, seam_plan)
         content = _normalize_fastapi_mail_import(content)
         content = _normalize_session_middleware_import(content)
         content = _normalize_template_response(content)
+        content = _normalize_template_directory(content)
         content = _normalize_exception_handler_status(content)
         content = _normalize_redirect_urls(content)
+        content = _normalize_url_string_methods(content)
         content = _normalize_werkzeug_abort(content)
         content = _normalize_mutated_fetchone_rows(content)
+        content = _realize_basic_auth_decoding(path, content, seam_plan)
         content = _realize_ambient_request_binding(path, content, seam_plan)
         content = _realize_template_consumers(path, content, seam_plan)
         content = _realize_authentication_consumers(path, content, seam_plan)
+        content = _realize_flask_form_consumers(path, content, seam_plan)
         content = _realize_template_provider_globals(path, content, seam_plan)
         content = _realize_error_handler_ownership(path, content, seam_plan)
         content = _realize_blueprint_error_handlers(path, content, seam_plan)
         content = _realize_view_decorator_contracts(path, content, seam_plan)
         content = _realize_route_contracts(path, content, seam_plan)
+        content = _realize_route_response_statuses(path, content, seam_plan)
+        content = _normalize_flask_string_responses(content)
         content = _realize_request_hook_names(path, content, seam_plan)
         content = _realize_resource_consumers(path, content, seam_plan)
         content = _realize_resource_contracts(path, content, seam_plan)
         content = _realize_factory_contracts(path, content, seam_plan)
+        content = _realize_factory_static_mount(path, content, seam_plan)
         content = _realize_template_context_processors(path, content, seam_plan)
         content = _realize_implicit_sqlalchemy_tables(path, content, seam_plan)
         content = _realize_extension_provider_facade(path, content, seam_plan)
+        content = _realize_flask_form_provider(path, content, seam_plan)
         content = _realize_dynamic_instance_exports(path, content, seam_plan)
         content = _realize_decorated_provider_protocols(path, content, seam_plan)
         content = _realize_extension_provider_order(path, content, seam_plan)
@@ -175,7 +205,10 @@ class FlaskToFastAPIRecipe:
                 if not class_name.isidentifier():
                     return None
                 runtime_module = dependencies[0].removesuffix(".py").replace("/", ".")
-                registrars = _click_registrar_contracts(iter_py_files(worktree))
+                registrars = (
+                    _click_registrar_contracts(iter_py_files(worktree))
+                    if "test_cli_runner" in members else []
+                )
                 registrar_imports = "\n".join(
                     f"from {item['module'].removesuffix('.py').replace('/', '.')} "
                     f"import {item['function']} as _register_cli_{index}"
@@ -209,6 +242,10 @@ class FlaskToFastAPIRecipe:
                         @property
                         def data(self):
                             return self._response.content
+
+                        @property
+                        def mimetype(self):
+                            return self._response.headers.get("content-type", "").split(";", 1)[0]
 
                         def get_json(self):
                             return self._response.json()
@@ -310,10 +347,12 @@ class FlaskToFastAPIRecipe:
                             super().__init__(*args, **kwargs)
                             self.state.config = {{}}
                             if config is not None:
-                                self.state.config.update({{
-                                    name: getattr(config, name) for name in dir(config)
-                                    if name.isupper()
-                                }})
+                                self.state.config.update(
+                                    dict(config) if hasattr(config, "items") else {{
+                                        name: getattr(config, name) for name in dir(config)
+                                        if name.isupper()
+                                    }}
+                                )
                             if testing:
                                 self.state.config["TESTING"] = True
                             self._cleanup_callbacks = tuple(cleanup_callbacks)
@@ -352,6 +391,7 @@ class FlaskToFastAPIRecipe:
             runtime = textwrap.dedent(f'''\
                 from __future__ import annotations
 
+                import logging
                 from collections.abc import Iterator, MutableMapping
                 from contextvars import ContextVar, Token
                 from typing import Any
@@ -401,9 +441,17 @@ class FlaskToFastAPIRecipe:
                 class _CurrentAppProxy:
                     def __getattr__(self, name: str):
                         try:
-                            return getattr(_current()["app"], name)
+                            app = _current()["app"]
                         except KeyError as exc:
                             raise RuntimeError("no active application context") from exc
+                        if name == "logger":
+                            return logging.getLogger(
+                                getattr(app, "title", app.__class__.__name__)
+                            )
+                        try:
+                            return getattr(app, name)
+                        except AttributeError:
+                            return getattr(app.state, name)
 
                     def __bool__(self):
                         return "app" in _current()
@@ -435,12 +483,19 @@ class FlaskToFastAPIRecipe:
                 session = _SessionProxy()
 
 
-                def flash(message) -> None:
-                    session.setdefault("_flashes", []).append(message)
+                def flash(message, category="message") -> None:
+                    session.setdefault("_flashes", []).append((category, message))
 
 
-                def get_flashed_messages() -> list:
-                    return session.pop("_flashes", [])
+                def get_flashed_messages(
+                    with_categories=False, category_filter=()
+                ) -> list:
+                    flashes = session.pop("_flashes", [])
+                    if category_filter:
+                        flashes = [
+                            item for item in flashes if item[0] in category_filter
+                        ]
+                    return flashes if with_categories else [item[1] for item in flashes]
 
 
                 def get_request_context() -> dict[str, Any]:
@@ -646,6 +701,7 @@ class FlaskToFastAPIRecipe:
                             return RedirectResponse(_login_location(), status_code=302)
                         result = view(**kwargs)
                         return await result if inspect.isawaitable(result) else result
+                    wrapped_view.__signature__ = inspect.signature(view, eval_str=True)
                     return wrapped_view
                 ''')
 
@@ -731,12 +787,17 @@ class FlaskToFastAPIRecipe:
             class_name = classes[0]["name"]
             return textwrap.dedent(f'''\
                 from fastapi import FastAPI
-                from fastapi.testclient import TestClient as _FastAPITestClient
+
+                from _portage_fastapi_test_compat import FlaskClientAdapter
 
 
                 class {class_name}(FastAPI):
+                    @property
+                    def config(self):
+                        return self.state.config
+
                     def test_client(self):
-                        return _FastAPITestClient(self)
+                        return FlaskClientAdapter(self)
                 ''')
 
         if capabilities == {"direct_test_surface", "test_context_surface"}:
@@ -808,7 +869,8 @@ class FlaskToFastAPIRecipe:
             url_for_function = (
                 "\n\n                def url_for(name: str, **path_params):\n"
                 "                    return _TemplateRequest(g.request).url_for("
-                "name, **path_params)\n"
+                "name, **path_params)\n\n\n"
+                "                templates.env.globals['url_for'] = url_for\n"
                 if "url_for" in function_names else ""
             )
             return textwrap.dedent(f'''\
@@ -817,12 +879,16 @@ class FlaskToFastAPIRecipe:
                 from pathlib import Path
 
                 from fastapi.templating import Jinja2Templates
+                from jinja2 import Environment, FileSystemLoader, select_autoescape
                 from starlette.requests import Request
 
                 {runtime_import}
-                templates = Jinja2Templates(
-                    directory=str(Path(__file__).resolve().parent / "templates")
-                )
+                templates = Jinja2Templates(env=Environment(
+                    loader=FileSystemLoader(
+                        str(Path(__file__).resolve().parent / "templates")
+                    ),
+                    autoescape=select_autoescape(("html", "htm", "xml", "xhtml", "svg")),
+                ))
 
 
                 class _TemplateRequest:
@@ -836,18 +902,25 @@ class FlaskToFastAPIRecipe:
                     def url_for(self, name: str, **path_params):
                         if name.rsplit(".", 1)[-1] == "static" and "filename" in path_params:
                             path_params.setdefault("path", path_params.pop("filename"))
-                        return self._request.url_for(name, **path_params).path
+                        external = bool(path_params.pop("_external", False))
+                        url = self._request.url_for(name, **path_params)
+                        return str(url) if external else url.path
 
                     def __getattr__(self, name):
                         return getattr(self._request, name)
 
 
-                def render_template(request: Request, template_name: str, **context):
+                def render_template(
+                    request: Request, template_name: str, *, status_code=200, **context
+                ):
                     values = {{
                         **vars(request.state).get("_state", {{}}),
-                        {runtime_context}"request": _TemplateRequest(request), **context,
+                        {runtime_context}"config": getattr(request.app.state, "config", {{}}),
+                        "request": _TemplateRequest(request), **context,
                     }}
-                    return templates.TemplateResponse(request, template_name, values)
+                    return templates.TemplateResponse(
+                        request, template_name, values, status_code=status_code
+                    )
                 {url_for_function}
                 ''')
         return None
@@ -962,6 +1035,9 @@ class FlaskToFastAPIRecipe:
             "must own both because they expose one request-scoped runtime state. "
             "Test-context exports and direct test surfaces may "
             "share an owner when their runtime state is the same. A `direct_test_surface` "
+            "must NOT share an owner with `request_context` or `session_and_flash`: the "
+            "former is the FastAPI application facade while the latter is request "
+            "middleware, so they are different constructed receivers. A `direct_test_surface` "
             "class is the target app wrapper/subclass returned by an application factory; "
             "do not place its app-facing members on an authentication/service helper, and "
             "combine it only with capabilities that the same app runtime can coherently "
@@ -1100,6 +1176,36 @@ class FlaskToFastAPIRecipe:
             item for item in completed
             if "template_rendering" in item.get("capabilities", [])
         ]
+        if len(direct_owners) == 1:
+            direct_owner = direct_owners[0]
+            direct_capabilities = set(direct_owner.get("capabilities", []))
+            direct_exports = direct_owner.get("exports", [])
+            if (
+                direct_capabilities <= {
+                    "direct_test_surface", "test_context_surface",
+                }
+                and any(export.get("kind") == "class" for export in direct_exports)
+            ):
+                removed = [
+                    export for export in direct_exports
+                    if export.get("kind") == "function"
+                ]
+                if removed:
+                    direct_owner["exports"] = [
+                        export for export in direct_exports
+                        if export.get("kind") != "function"
+                    ]
+                    audit = audit_by_path.setdefault(direct_owner["path"], {
+                        "path": direct_owner["path"],
+                        "capabilities": [],
+                        "added_consumers": [],
+                        "added_exports": [],
+                        "added_class_members": [],
+                    })
+                    audit["removed_exports"] = [
+                        {"name": export["name"], "kind": export["kind"]}
+                        for export in removed
+                    ]
         if len(auth_owners) == 1:
             auth_owner = auth_owners[0]
             bindings = _flask_login_consumer_contracts(files)
@@ -1149,9 +1255,19 @@ class FlaskToFastAPIRecipe:
                 }
                 for name in template_names
             ]
+            if requirements.get("template_rendering", {}).get(
+                "required_export_kinds", {},
+            ).get("templates") == "variable":
+                template_exports.append({
+                    "name": "templates", "kind": "variable",
+                    "signature": "", "members": [],
+                })
             previous = template_owner.get("exports", [])
             standalone_template = set(template_owner.get("capabilities", [])) == {
                 "template_rendering",
+            }
+            expected_template_exports = {
+                export["name"]: export["kind"] for export in template_exports
             }
             existing = {export.get("name") for export in previous}
             completed_exports = template_exports if standalone_template else [
@@ -1167,19 +1283,19 @@ class FlaskToFastAPIRecipe:
                     "added_exports": [],
                     "added_class_members": [],
                 })
-                previous_functions = {
-                    export.get("name") for export in previous
-                    if export.get("kind") == "function"
+                previous_exports = {
+                    export.get("name"): export.get("kind") for export in previous
                 }
                 audit["added_exports"].extend(
-                    {"name": name, "kind": "function"}
-                    for name in template_names if name not in previous_functions
+                    {"name": export["name"], "kind": export["kind"]}
+                    for export in template_exports
+                    if previous_exports.get(export["name"]) != export["kind"]
                 )
                 removed = [
                     export for export in previous
                     if standalone_template and (
-                        export.get("name") not in template_names
-                        or export.get("kind") != "function"
+                        expected_template_exports.get(export.get("name"))
+                        != export.get("kind")
                     )
                 ]
                 if removed:
@@ -1280,8 +1396,10 @@ class FlaskToFastAPIRecipe:
             runtime_signatures = {
                 "_push_context": "def _push_context(state=None)",
                 "_pop_context": "def _pop_context(token)",
-                "flash": "def flash(message)",
-                "get_flashed_messages": "def get_flashed_messages()",
+                "flash": "def flash(message, category='message')",
+                "get_flashed_messages": (
+                    "def get_flashed_messages(with_categories=False, category_filter=())"
+                ),
                 "get_request_context": "def get_request_context()",
                 "manage_session": "def manage_session(request)",
             }
@@ -1383,7 +1501,14 @@ class FlaskToFastAPIRecipe:
                 })
                 audit["instruction_completed"] = True
 
-            if len(direct_owners) == 1 and returned_lifecycles:
+            direct_context_owner = (
+                direct_owners[0] if len(direct_owners) == 1 and any(
+                    export.get("kind") == "class"
+                    and "app_context" in export.get("members", [])
+                    for export in direct_owners[0].get("exports", [])
+                ) else None
+            )
+            if len(direct_owners) == 1 and (returned_lifecycles or direct_context_owner):
                 direct_owner = direct_owners[0]
                 if runtime_owner["path"] != direct_owner["path"]:
                     dependencies = set(direct_owner.get("depends_on", []))
@@ -1420,37 +1545,6 @@ class FlaskToFastAPIRecipe:
             if len(test_owners) == 1:
                 test_owner = test_owners[0]
                 test_capabilities = set(test_owner.get("capabilities", []))
-                previous_exports = test_owner.get("exports", [])
-                if (
-                    test_capabilities
-                    and test_capabilities <= {
-                        "direct_test_surface", "test_context_surface",
-                    }
-                    and any(
-                        export.get("kind") == "class"
-                        for export in previous_exports
-                    )
-                ):
-                    removed = [
-                        export for export in previous_exports
-                        if export.get("kind") == "function"
-                    ]
-                    if removed:
-                        test_owner["exports"] = [
-                            export for export in previous_exports
-                            if export.get("kind") != "function"
-                        ]
-                        audit = audit_by_path.setdefault(test_owner["path"], {
-                            "path": test_owner["path"],
-                            "capabilities": [],
-                            "added_consumers": [],
-                            "added_exports": [],
-                            "added_class_members": [],
-                        })
-                        audit["removed_exports"] = [
-                            {"name": export["name"], "kind": export["kind"]}
-                            for export in removed
-                        ]
                 required_test_members = set(
                     requirements.get("direct_test_surface", {}).get(
                         "required_class_members", []
@@ -1508,9 +1602,12 @@ class FlaskToFastAPIRecipe:
                     and len(test_classes) == 1 and required_test_members
                 ):
                     previous_members = set(test_classes[0].get("members", []))
-                    missing_members = sorted(required_test_members - previous_members)
-                    removed_members = sorted(previous_members - required_test_members)
-                    test_classes[0]["members"] = sorted(required_test_members)
+                    completed_members = set(required_test_members)
+                    if combined_test_owner:
+                        completed_members.update(runtime_members)
+                    missing_members = sorted(completed_members - previous_members)
+                    removed_members = sorted(previous_members - completed_members)
+                    test_classes[0]["members"] = sorted(completed_members)
                     if missing_members or removed_members:
                         audit = audit_by_path.setdefault(test_owner["path"], {
                             "path": test_owner["path"],
@@ -1615,6 +1712,67 @@ class FlaskToFastAPIRecipe:
                             auth_owner["path"]
                         )
 
+        # Direct-test members belong to the application facade, not to the object
+        # returned by app.test_client(). Canonicalize this even when no request-runtime
+        # artifact exists; nesting it under runtime completion let client.get/post/patch
+        # shadow FastAPI's route decorators. When both capabilities share one owner, keep
+        # the union instead of letting runtime canonicalization erase app_context.
+        if len(direct_owners) == 1:
+            owner = direct_owners[0]
+            classes = [
+                export for export in owner.get("exports", [])
+                if export.get("kind") == "class"
+            ]
+            required = set(
+                requirements.get("direct_test_surface", {}).get(
+                    "required_class_members", []
+                )
+            )
+            if set(owner.get("capabilities", [])) & {
+                "request_context", "session_and_flash",
+            }:
+                required.update({"get_request_context", "manage_session"})
+            if len(classes) == 1 and required:
+                facade = classes[0]
+                renamed = None
+                if facade["name"] in required:
+                    names = {export["name"] for export in owner.get("exports", [])}
+                    replacement = next(
+                        (name for name in ("FastAPIApp", "AppFacade", "TestApp")
+                         if name not in names),
+                        "PortageFastAPIApp",
+                    )
+                    renamed = {"from": facade["name"], "to": replacement}
+                    facade["name"] = replacement
+                previous = set(facade.get("members", []))
+                facade["members"] = sorted(required)
+                added = sorted(required - previous)
+                removed = sorted(previous - required)
+                if added or removed or renamed:
+                    audit = audit_by_path.setdefault(owner["path"], {
+                        "path": owner["path"],
+                        "capabilities": [],
+                        "added_consumers": [],
+                        "added_exports": [],
+                        "added_class_members": [],
+                    })
+                    if renamed:
+                        audit.setdefault("renamed_exports", []).append(renamed)
+                    recorded = {
+                        member
+                        for item in audit["added_class_members"]
+                        if item.get("export") == facade["name"]
+                        for member in item.get("members", [])
+                    }
+                    if unrecorded := sorted(set(added) - recorded):
+                        audit["added_class_members"].append({
+                            "export": facade["name"], "members": unrecorded,
+                        })
+                    if removed:
+                        audit["removed_class_members"] = [{
+                            "export": facade["name"], "members": removed,
+                        }]
+
         return completed, [audit_by_path[path] for path in sorted(audit_by_path)]
 
     @staticmethod
@@ -1635,6 +1793,14 @@ class FlaskToFastAPIRecipe:
                 )
                 continue
             capabilities = set(item.get("capabilities", []))
+            if (
+                "direct_test_surface" in capabilities
+                and capabilities & {"request_context", "session_and_flash"}
+            ):
+                out.append(
+                    f"artifact {path} combines the FastAPI application facade with "
+                    "request middleware; assign direct_test_surface to a separate owner"
+                )
             if (
                 "template_rendering" in capabilities
                 and len(capabilities) > 1
@@ -1921,12 +2087,41 @@ class FlaskToFastAPIRecipe:
         (`app_context`, fake `app.state` helpers, attached CLI runners). Rules are based
         only on recipe roles/subtasks and source idioms — never corpus names or tests.
         """
-        by_path = {pf.path: pf for pf in planned}
         unit_for = {
             path: unit for unit in units for path in unit.get("paths", [])
         }
         decisions: dict[str, dict] = {}
         factory_paths = [pf.path for pf in planned if pf.role == "app_factory"]
+        for pf in planned:
+            contract = pf.artifact_contract or {}
+            if pf.action != "create" or not contract.get("exports"):
+                continue
+            decisions[f"planned_provider_exports:{pf.path}"] = {
+                "kind": "planned_provider_exports",
+                "provider": pf.path,
+                "exports": {
+                    export["name"]: {
+                        "kind": export.get("kind", ""),
+                        "members": export.get("members", []),
+                    }
+                    for export in contract["exports"]
+                },
+                "files": sorted({pf.path, *contract.get("consumers", [])}),
+                "instruction": (
+                    "Consume each frozen provider export directly. A function, class, or "
+                    "variable export is not a namespace for sibling exports from the same "
+                    "module."
+                ),
+            }
+        app_state_members = sorted({
+            "instance_path"
+            for source in files.values()
+            if (tree := _parsed(source)) is not None
+            and any(
+                isinstance(node, ast.Attribute) and node.attr == "instance_path"
+                for node in ast.walk(tree)
+            )
+        })
         resource_contracts = {
             key: {
                 **_resource_facts(files.get(pin["module"], ""), pin["symbol"]),
@@ -1946,6 +2141,9 @@ class FlaskToFastAPIRecipe:
         }
 
         provider_protocols = _decorated_provider_protocols(files)
+        form_contracts = _flask_form_contracts(files)
+        sqlalchemy_contracts = _sqlalchemy_provider_contracts(files, planned)
+        cli_registrars = _click_registrar_contracts(files)
         for protocol in provider_protocols:
             provider = protocol["provider"]
             symbol = protocol["symbol"]
@@ -1963,6 +2161,164 @@ class FlaskToFastAPIRecipe:
                     "that lacks those members."
                 ),
             }
+
+        runtime_provider = next((
+            pf.path for pf in planned if pf.action == "create"
+            and set((pf.artifact_contract or {}).get("capabilities", []))
+            & {"request_context", "session_and_flash"}
+        ), "")
+        for contract in form_contracts:
+            decisions[f"form_provider:{contract['provider']}"] = {
+                "kind": "form_provider",
+                **contract,
+                "runtime_provider": runtime_provider,
+                "files": sorted({contract["provider"], *contract["consumers"]}),
+                "instruction": (
+                    "Preserve each source FlaskForm as a real WTForms form. Bind POST "
+                    "request data before validate_on_submit and retain template-used "
+                    "hidden_tag/field rendering without importing Flask-WTF at runtime."
+                ),
+            }
+
+        for pf in planned:
+            tree = _parsed(files.get(pf.path, ""))
+            if tree is None:
+                continue
+            flask_names = {
+                alias.asname or alias.name
+                for statement in tree.body
+                if isinstance(statement, (ast.Import, ast.ImportFrom))
+                and (
+                    isinstance(statement, ast.Import)
+                    and any(alias.name.startswith("flask") for alias in statement.names)
+                    or isinstance(statement, ast.ImportFrom)
+                    and (statement.module or "").startswith("flask")
+                )
+                for alias in statement.names
+            }
+            initializer_callbacks = {
+                node.id
+                for call in ast.walk(tree)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "init_app"
+                for value in [
+                    *call.args[1:],
+                    *(keyword.value for keyword in call.keywords),
+                ]
+                for node in ast.walk(value)
+                if isinstance(node, ast.Name)
+            }
+            request_names = {
+                alias.asname or alias.name
+                for statement in tree.body
+                if isinstance(statement, ast.ImportFrom)
+                and statement.module == "flask"
+                for alias in statement.names if alias.name == "request"
+            }
+            request_helpers = {
+                function.name: sorted(
+                    request_names & {
+                        node.id for node in ast.walk(function)
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                    }
+                )
+                for function in tree.body
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and function.name in initializer_callbacks
+            }
+            request_helpers = {
+                name: bindings for name, bindings in request_helpers.items() if bindings
+            }
+            imports = []
+            for statement in tree.body:
+                if not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    continue
+                modules = (
+                    [alias.name for alias in statement.names]
+                    if isinstance(statement, ast.Import)
+                    else [(statement.module or "")]
+                )
+                if any(module.startswith("flask") for module in modules):
+                    continue
+                imports.append({
+                    "source": ast.unparse(statement),
+                    "bindings": [
+                        alias.asname or (
+                            alias.name.split(".")[0]
+                            if isinstance(statement, ast.Import) else alias.name
+                        )
+                        for alias in statement.names
+                    ],
+                })
+            helpers = {
+                function.name: ast.unparse(function)
+                for function in tree.body
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not function.decorator_list
+                and len(ast.unparse(function)) <= 2000
+                and (
+                    function.name in initializer_callbacks
+                    or function.name.startswith("_")
+                    and not any(
+                        isinstance(node, ast.Name) and node.id in flask_names
+                        for node in ast.walk(function)
+                    )
+                )
+            }
+            module_member_calls = []
+            for target in files:
+                for binding in imported_bindings_from_sources(files, target):
+                    if binding.importer != pf.path or binding.symbol is not None:
+                        continue
+                    for member in sorted({
+                        call.func.attr for function in tree.body
+                        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        for call in ast.walk(function)
+                        if isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and ast.unparse(call.func.value) == binding.local
+                    }):
+                        owners = sorted({
+                            function.name for function in tree.body
+                            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and any(
+                                isinstance(call, ast.Call)
+                                and isinstance(call.func, ast.Attribute)
+                                and ast.unparse(call.func.value) == binding.local
+                                and call.func.attr == member
+                                for call in ast.walk(function)
+                            )
+                        })
+                        module_member_calls.append({
+                            "target": target, "member": member, "functions": owners,
+                        })
+            if imports or helpers or module_member_calls:
+                decisions[f"binding_closure:{pf.path}"] = {
+                    "kind": "binding_closure",
+                    "path": pf.path,
+                    "files": [pf.path],
+                    "imports": imports,
+                    "helpers": helpers,
+                    "request_helpers": request_helpers,
+                    "runtime_provider": runtime_provider,
+                    "module_member_calls": module_member_calls,
+                    "instruction": (
+                        "Keep any source-safe import, private undecorated helper, or "
+                        "source-local callback passed to an extension initializer that "
+                        "the generated module still references. Do not invent a local "
+                        "replacement or leave a referenced global undefined."
+                    ),
+                }
+            if "request.authorization" in files.get(pf.path, ""):
+                decisions[f"basic_auth:{pf.path}"] = {
+                    "kind": "basic_auth", "path": pf.path, "files": [pf.path],
+                    "instruction": (
+                        "Preserve source HTTP Basic authorization with the active "
+                        "request headers. Decode the Basic token with the stdlib; do not "
+                        "leave an invented decoder helper undefined."
+                    ),
+                }
 
         for pf in planned:
             bindings = _flask_babel_literal_bindings(files.get(pf.path, ""))
@@ -2077,6 +2433,13 @@ class FlaskToFastAPIRecipe:
             if pf.role != "app_factory":
                 continue
             members = unit_for.get(pf.path, {}).get("paths", [pf.path])
+            factory_tree = _parsed(files.get(pf.path, ""))
+            instance_path_expression = next((
+                ast.unparse(keyword.value)
+                for node in ast.walk(factory_tree) if isinstance(node, ast.Call)
+                and ast.unparse(node.func).split(".")[-1] == "Flask"
+                for keyword in node.keywords if keyword.arg == "instance_path"
+            ), "") if factory_tree is not None else ""
             config = _factory_config_facts(files.get(pf.path, ""))
             endpoint_aliases = _factory_endpoint_aliases(files.get(pf.path, ""))
             static_mount = _factory_static_mount(files, pf.path)
@@ -2086,13 +2449,50 @@ class FlaskToFastAPIRecipe:
                 for initializer in contract["factory_initializers"]
                 if initializer["factory"] == pf.path
             ]
-            cleanup_callbacks = [
-                {"provider": contract["owner"], "functions": contract["cleanup_functions"]}
-                for contract in resource_contracts.values()
+            initializers.extend(
+                initializer
+                for protocol in provider_protocols
+                if "init_app" in protocol.get("callable_members", [])
+                for initializer in _initializer_contracts(
+                    files, planned, protocol["provider"], protocol["symbol"],
+                    "init_app",
+                )
+                if initializer["factory"] == pf.path
+            )
+            initializers.extend(
+                initializer
+                for contract in sqlalchemy_contracts
+                if "init_app" in contract.get("members", [])
+                for initializer in _initializer_contracts(
+                    files, planned, contract["provider"], contract["symbol"],
+                    "init_app",
+                )
+                if initializer["factory"] == pf.path
+            )
+            cleanup_by_provider: dict[str, set[str]] = {}
+            for contract in resource_contracts.values():
                 if contract["cleanup_functions"] and any(
                     initializer["factory"] == pf.path
                     for initializer in contract["factory_initializers"]
-                )
+                ):
+                    cleanup_by_provider.setdefault(contract["owner"], set()).update(
+                        contract["cleanup_functions"]
+                    )
+            for registrar in cli_registrars:
+                if not any(
+                    initializer["factory"] == pf.path
+                    for initializer in _initializer_contracts(
+                        files, planned, registrar["module"], registrar["function"],
+                    )
+                ):
+                    continue
+                for callback in registrar.get("cleanup_callbacks", []):
+                    cleanup_by_provider.setdefault(callback["provider"], set()).add(
+                        callback["function"]
+                    )
+            cleanup_callbacks = [
+                {"provider": provider, "functions": sorted(functions)}
+                for provider, functions in sorted(cleanup_by_provider.items())
             ]
             decisions[f"application_factory:{pf.path}"] = {
                 "kind": "application_factory",
@@ -2140,6 +2540,8 @@ class FlaskToFastAPIRecipe:
                 "optional_parameters": config["optional_parameters"],
                 "config_from_objects": config["from_objects"],
                 "instance_exports": _instance_export_contracts(manifest, pf.path),
+                "app_state_members": app_state_members,
+                "instance_path_expression": instance_path_expression,
                 "local_imports": _factory_local_imports(files.get(pf.path, ""), pf.path),
                 "initializers": initializers,
                 "cleanup_callbacks": cleanup_callbacks,
@@ -2214,7 +2616,7 @@ class FlaskToFastAPIRecipe:
                 ),
             }
 
-        for contract in _sqlalchemy_provider_contracts(files, planned):
+        for contract in sqlalchemy_contracts:
             provider = contract["provider"]
             symbol = contract["symbol"]
             decisions[f"extension_provider:{provider}:{symbol}"] = {
@@ -2260,6 +2662,18 @@ class FlaskToFastAPIRecipe:
                     "instruction": (
                         "Preserve these exact Flask reverse-URL endpoint names on the "
                         f"corresponding FastAPI route decorators: {routes}."
+                    ),
+                }
+
+        for pf in planned:
+            responses = _route_response_status_contracts(files.get(pf.path, ""))
+            if responses:
+                decisions[f"route_response_statuses:{pf.path}"] = {
+                    "kind": "route_response_statuses", "path": pf.path,
+                    "files": [pf.path], "routes": responses,
+                    "instruction": (
+                        "Preserve these source response statuses when translating Flask "
+                        f"response tuples to FastAPI responses: {responses}."
                     ),
                 }
 
@@ -2334,6 +2748,12 @@ class FlaskToFastAPIRecipe:
                 "provider": pf.path,
                 "classes": classes,
                 "files": sorted({pf.path, *consumers}),
+                "factory_consumers": sorted(set(consumers) & set(factory_paths)),
+                "module_app_exports": {
+                    consumer: exports
+                    for consumer in consumers
+                    if (exports := _module_flask_app_exports(files.get(consumer, "")))
+                },
                 "instruction": (
                     f"The application-owned test surface is `{pf.path}`: {owned}. Its "
                     "class is the target application facade/wrapper returned or publicly "
@@ -2456,6 +2876,7 @@ class FlaskToFastAPIRecipe:
                 "test_providers": test_context_providers,
                 "factory_files": sorted(factory_paths),
                 "current_app_consumers": current_app_consumers,
+                "app_state_members": app_state_members,
                 "instruction": (
                     "Use one ambient request-state implementation, never parallel "
                     "ContextVars. The runtime provider owns the live ContextVar-backed "
@@ -2506,6 +2927,7 @@ class FlaskToFastAPIRecipe:
                     if consumer not in template_provider_paths
                 },
                 "context_globals": _template_framework_globals(files),
+                "filters": _template_filter_contracts(files),
                 "authentication_provider": (
                     auth_owners[0].path if len(auth_owners) == 1 else ""
                 ),
@@ -2619,10 +3041,10 @@ class FlaskToFastAPIRecipe:
                 ),
             }
 
-        cli_paths = [p for p, src in files.items() if p in by_path and _CLI_SEAM.search(src)]
+        cli_paths = [p for p, src in files.items() if _CLI_SEAM.search(src)]
         if cli_paths:
             command_bindings = _click_command_contracts(files)
-            registrars = _click_registrar_contracts(files)
+            registrars = cli_registrars
             commands = {
                 item["function"]: item["name"] for item in command_bindings
             }
@@ -2730,6 +3152,9 @@ class FlaskToFastAPIRecipe:
             "a view and returns a local wrapper, keep that shape with `functools.wraps`; "
             "the wrapper reads the planned ambient context and calls/awaits the view. Do "
             "not reinterpret the decorated view argument as a FastAPI Request or dependency.\n"
+            "15. Preserve ordered mapping mutations as sequential assignments. Never collapse "
+            "them into one `mapping.update({...})` when a later value reads a key assigned "
+            "earlier in that same mapping; dict values are evaluated before `update`.\n"
             "8. Do NOT add try/except around calls to the project's own modules and do NOT "
             "raise `HTTPException`. Let those exceptions propagate to the app's registered "
             "`@app.exception_handler(...)`s, and keep each handler's EXACT status code and JSON "
