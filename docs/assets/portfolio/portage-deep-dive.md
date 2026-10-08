@@ -1,5 +1,18 @@
 # Portage: Technical Deep Dive
 
+> **Project status, October 8, 2026: active development is closed for now.** The code,
+> evaluation evidence, and local demonstration are preserved. Work will resume only if
+> a substantial new idea or evidence-backed approach makes it worth revisiting, not for
+> another round of the same tuning. This is a deliberate stopping point, not a claim
+> that general migration reliability is solved.
+
+> **October 8 local closeout:** 357 backend tests, Ruff, and the frontend production build
+> passed. Real MCP checks accepted a passing patch (4/4) and rejected a broken patch (3/4)
+> without modifying the caller's repository. API/CLI reports matched for four retained
+> runs; browser checks confirmed the green and red verdicts, plans, diffs, and recovery
+> evidence. No new paid migration evaluation was run. The original remediation goal
+> remains stopped with incomplete preservation, and frozen R5 remains 0/9.
+
 > **Standing, September 13, 2026:** this document retains historical architecture and
 > evaluation evidence. The [project page](./portage.md) and repository README hold the
 > current standing: three later autonomous development K1 greens, frozen R5 v1 at 0/9,
@@ -14,7 +27,7 @@
 |---|---|
 | **Source** | [github.com/SohailGidwani/Portage](https://github.com/SohailGidwani/Portage) |
 | **Project page** | [portage.md](./portage.md) |
-| **Live demo** | `LIVE_DEMO_URL` *(fill after deploy)* |
+| **Demonstration** | Retained historical runs and recordings; public deployment is parked |
 
 **At a glance**
 

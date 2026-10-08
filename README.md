@@ -147,6 +147,11 @@ docker compose --profile tools build sandbox
 docker compose up -d
 ```
 
+For an existing installation, `docker compose up -d` reuses its images; it does not
+load newly pulled source. After updating the checkout, use
+`docker compose up -d --build api worker frontend`. Rebuild the sandbox only when its
+Dockerfile or dependencies change. Keep database and workspace volumes intact.
+
 Services:
 
 - Web workbench: <http://localhost:3000>
@@ -305,6 +310,18 @@ MCP verification needs Docker and the sandbox image. Graph operations additional
 for the stdio MCP server.
 
 ## Measured results
+
+**Project status, October 8, 2026: active development is closed for now.** The code,
+evaluation evidence, and local demonstration are preserved. Work will resume only if
+a substantial new idea or evidence-backed approach makes it worth revisiting, not for
+another round of the same tuning. This is a deliberate stopping point, not a claim
+that general migration reliability is solved.
+
+Local closeout checks on **2026-10-08** passed: 357 backend tests, full backend Ruff,
+and the frontend production build. Real stdio MCP verification accepted a passing patch
+(4/4) and rejected a deliberately broken patch (3/4), without modifying the caller's
+repository. These are implementation and local-tool checks, not new migration results.
+No paid migration evaluation was run during this closeout.
 
 Standing reviewed **2026-09-13**. The remediation goal is **stopped with incomplete
 preservation**, not completed. The demonstration is frozen around retained historical

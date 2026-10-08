@@ -1,9 +1,20 @@
 # Portage — Autonomous Code-Migration Agent
 
+> **Project status, October 8, 2026: active development is closed for now.** The code,
+> evaluation evidence, and local demonstration are preserved. Work will resume only if
+> a substantial new idea or evidence-backed approach makes it worth revisiting, not for
+> another round of the same tuning. This is a deliberate stopping point, not a claim
+> that general migration reliability is solved.
+
 > **September 13, 2026: experimental system, demonstration frozen.** All three former R5
 > repositories later achieved one strict autonomous development K1 green. The latest
 > Microblog preservation replay is red. The remediation goal is **stopped with incomplete
 > preservation**, not complete. Historical gates below span different code versions.
+
+> **October 8 local closeout:** 357 backend tests, Ruff, and the frontend production build
+> passed. Real MCP patch checks accepted 4/4 and rejected a deliberately broken 3/4 result
+> while preserving the caller's repository. No new paid migration results or generalization
+> claims were added; the September stopping decision is unchanged.
 
 > Portfolio project page. Pair with [`portage-deep-dive.md`](./portage-deep-dive.md) for the full technical write-up. Asset paths are relative to this file (`../…`).
 
